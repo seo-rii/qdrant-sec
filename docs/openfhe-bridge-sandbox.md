@@ -5,7 +5,10 @@ receives plaintext embeddings before producing CKKS ciphertext. The in-process
 backend hardening verifies the executable path, owner, permissions, SHA-256 pin,
 and optional Ed25519 signature; checked Linux workers also use `no_new_privs`,
 core/file-size limits, stripped inherited environment, `/` as cwd, and optional
-Landlock write-deny plus network namespace egress-deny rules.
+Landlock write-deny plus network namespace egress-deny rules. The strict
+Landlock kinds add a read/execute allow-list (system roots, device files, the
+program descriptor and configured `landlock_read_allow_roots`), so a
+compromised bridge cannot read storage, configuration or key material.
 
 For production deployments, run the bridge behind an additional host or
 container sandbox. The exact profile depends on the bridge binary and OpenFHE
@@ -77,12 +80,20 @@ the runtime profile.
 - Checked OpenFHE bridge backends require Linux fd-backed `/proc/self/fd`
   execution; non-Linux builds fail closed instead of using a path-based
   validation/hash/exec sequence.
-- Prefer `process_landlock_netns` or `process_pool_landlock_netns` backend
-  kinds on Linux when the bridge has no legitimate host-network dependency;
-  these add Qdrant-managed network namespace isolation to the Landlock
-  write-deny policy. Use `process_landlock` or `process_pool_landlock` when the
-  host does not permit network namespace creation and provide egress denial
-  through AppArmor/seccomp/container policy instead.
+- Prefer `process_landlock_strict_netns` or `process_pool_landlock_strict_netns`
+  backend kinds on Linux when the bridge has no legitimate host-network
+  dependency; these add Qdrant-managed network namespace isolation to a
+  Landlock policy that denies writes and allows reads and execution only under
+  `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, the `/dev/null`,
+  `/dev/urandom` and `/dev/random` devices, the bridge program itself and the
+  roots listed in `landlock_read_allow_roots`. List only what the bridge needs
+  (for example an OpenFHE data directory); a listed root that does not exist
+  fails the worker spawn closed. Fall back to `process_landlock_netns` /
+  `process_pool_landlock_netns` only when the bridge needs reads outside a
+  fixed allow-list, and to `process_landlock` / `process_pool_landlock` (or
+  their `_strict` variants) when the host does not permit network namespace
+  creation; provide egress denial through AppArmor/seccomp/container policy in
+  that case.
 - Do not pass Qdrant secrets to the bridge environment. Checked qdrant-sec
   workers strip inherited service environment by default; container launchers
   should do the same.

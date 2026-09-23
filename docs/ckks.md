@@ -3648,9 +3648,14 @@ crypto:
       env: QDRANT_VECTOR_METADATA_KEY_B64
   backends:
     openfhe_local:
-      kind: process_pool_landlock_netns
+      kind: process_pool_landlock_strict_netns
       program: /usr/local/bin/openfhe-bridge
       sha256_b64: base64url-no-pad-sha256-of-bridge
+      # Only for *_landlock_strict* kinds: extra read-only roots the bridge may
+      # open, for example an OpenFHE data directory. Never list storage,
+      # snapshot, configuration or key material locations.
+      landlock_read_allow_roots:
+        - /opt/openfhe/data
 ```
 
 Generic OpenFHE backends currently accept `process`, `process_pool`, and on
@@ -3658,8 +3663,20 @@ Linux the Landlock-enforcing `process_landlock` / `process_pool_landlock`
 variants. Linux also supports
 `process_landlock_netns` / `process_pool_landlock_netns`, which add a bridge
 child network-namespace split before `exec` for deployments that can run the
-bridge without host network access. Any other backend `kind` is rejected during
-runtime settings validation.
+bridge without host network access, and the strict variants
+`process_landlock_strict` / `process_pool_landlock_strict` /
+`process_landlock_strict_netns` / `process_pool_landlock_strict_netns`, which
+keep the write-deny rules and additionally handle the Landlock read and execute
+access bits: the bridge can read and execute only `/usr`, `/lib`, `/lib64`,
+`/bin`, `/sbin` and `/etc`, read `/dev/null`, `/dev/urandom` and `/dev/random`,
+read and execute its own program (granted through the validated descriptor, so
+the exec path and a shebang interpreter's re-read keep working), and read the
+roots listed in `landlock_read_allow_roots` (absolute normalized paths other
+than `/`, at most 64, only accepted for the strict kinds; a listed root that
+does not exist fails the worker spawn closed). A compromised strict-sandboxed
+bridge therefore cannot read the storage directory, configuration or key
+material. Any other backend `kind` is rejected during runtime settings
+validation.
 On Linux, Qdrant sets `no_new_privs`, a parent-death `SIGKILL`, `RLIMIT_CORE=0`,
 and, for checked bridge binaries, `RLIMIT_FSIZE=0` immediately before spawning
 the configured bridge process. This is not a complete sandbox, but it prevents
@@ -4232,10 +4249,11 @@ so env-backed Qdrant settings, crypto material, `LD_PRELOAD`, `PYTHONPATH`, and
 other service environment values are not handed to the bridge process by
 default. Test-only unchecked bridge workers still remove `QDRANT`/`QDRANT_*`
 and explicitly configured sensitive env names.
-If the backend kind is `process_landlock_netns` or
-`process_pool_landlock_netns`, Qdrant also asks Linux to place the bridge child
-in a fresh network namespace before `exec`. This is the only Qdrant-managed
-bridge egress-deny mode; plain `process_*` and `process_*_landlock` kinds keep
+If the backend kind is `process_landlock_netns`, `process_pool_landlock_netns`,
+`process_landlock_strict_netns` or `process_pool_landlock_strict_netns`, Qdrant
+also asks Linux to place the bridge child in a fresh network namespace before
+`exec`. This is the only Qdrant-managed bridge egress-deny mode; plain
+`process_*`, `process_*_landlock` and `process_*_landlock_strict` kinds keep
 the host network namespace and rely on external firewall, AppArmor, seccomp, or
 container policy for network confinement.
 
@@ -4832,14 +4850,92 @@ semantics, request zeroization; on the HNSW side the fixed read shape and
 full write-back, uniform leaf sampling, atomic path loads, the verified
 Merkle chain, decoder bounds, snapshot AEAD binding and Debug redaction.
 
+### Eighth pass: AEAD, control plane, payload and vector audits; strict bridge sandbox
+
+This pass audited the AEAD envelope module, the control-plane envelope types,
+the payload encryptor and the CKKS vector module, and closed the Landlock gap
+recorded by the seventh pass. Fixed:
+
+- The AES-GCM random-nonce budget lived in the `AeadCipher` instance, and the
+  server builds a fresh cipher for every write request, so on the server
+  payload and vector paths the counter restarted at zero per request and the
+  2^32 limit was never enforced (only the long-lived ORAM and HNSW client
+  structs were bounded). Budgets are now process-wide per key: every cipher
+  built from the same key bytes shares one counter, keyed by a
+  domain-separated SHA-256 of the key, so a rebuilt cipher for an exhausted
+  key is refused too. The local master key provider's resource-key wrapping,
+  which is also random-nonce AES-GCM, now draws from the same kind of budget.
+- Error `Display` no longer echoes unbounded attacker-controlled strings:
+  unsupported envelope algorithms and kinds, client algorithms and signature
+  algorithms, and control-plane identifiers are rendered through a bounded,
+  control-character-escaped 32-character prefix, and the CKKS sidecar marker
+  parsers report a fixed message instead of serde's text (which quotes the
+  offending value verbatim).
+- Server payload decryption checks the schema version and encryption epoch
+  before decrypting, so stale envelopes read during a rotation no longer
+  materialize plaintext that is then discarded, and the decrypted buffer is
+  zeroized on every error path.
+- The 1 MiB server payload ciphertext cap is enforced before the generic
+  envelope validator, which decodes up to the 16 MiB envelope bound; an
+  oversized marker no longer costs sixteen times its rejection.
+- Query ciphertexts (client-submitted pre-encrypted queries and bridge-returned
+  encrypted queries) are capped at the stored-ciphertext maximum inside the
+  crate rather than relying on the caller's request-size cap.
+- Client CKKS `context_digest` is length-checked before decoding, matching
+  `ciphertext_sha256`; a dead signature-presence check was removed.
+- `SecretKey::from_bytes` scrubs its by-value argument after copying it.
+- The Linux server binary did not compile since the first pass: the CKKS
+  sidecar HNSW cache pruning path called a metadata validator that was gated
+  on `cfg(test)`, and neither CI (crypto crate only) nor Windows checks (the
+  call site is `cfg(unix)`) exercised it. The validator is built in every
+  configuration again.
+- New strict bridge sandbox kinds (`process_landlock_strict`,
+  `process_pool_landlock_strict` and their `_netns` variants) handle the
+  Landlock read and execute bits with an allow-list of the system roots, the
+  device files, the validated program descriptor and the configured
+  `landlock_read_allow_roots`; the roots are validated at startup, at
+  collection runtime validation and at backend construction, keyed into the
+  backend cache and the runtime capability fingerprint, and a missing root
+  fails the spawn closed.
+
+Tests: shared-budget tests (two ciphers from one key share the counter, a
+rebuilt cipher for an exhausted key is refused, the master key wrap observes
+the budget, exhausting tests own unique key bytes), bounded-echo rendering,
+strict-sandbox rule construction and root validation (unit), Linux bridge
+probes proving the strict sandbox denies reads and directory listings outside
+the allow-list and file creation everywhere, allows a configured root, and
+fails closed for a missing root, plus server kind/root validation, factory
+and fingerprint tests.
+
+Checked and left as is: the AAD construction (length-prefixed, tagged,
+covers purpose, identifiers, algorithm, key metadata, nonce and suffix), the
+v1/v2 resource-key metadata binding, nonce and ciphertext caps before decode,
+the HKDF domain separation, blind-index constant-time comparison, the client
+payload and CKKS signature messages, signature-verified proof gating, replay
+keys, Debug redaction and `deny_unknown_fields` everywhere.
+
 Known remaining limitations:
 
-- The Landlock sandbox kinds deny writes only: a compromised bridge running
-  as the Qdrant user can still read the storage directory, configuration
-  and TLS keys and execute anything on the fixed PATH, and the non-namespace
-  kind keeps network egress. Handling the read and execute access bits with
-  allow rules for the interpreter, libraries and the program fd is the
-  missing step.
+- The AES-GCM invocation budget is per process: it is not persisted, so a
+  restart starts a fresh count for every key. Operators should rotate resource
+  keys on a schedule rather than rely on the in-process limit alone.
+- The strict Landlock sandbox kinds allow reading and executing everything
+  under `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin` and `/etc`; a bridge host
+  that stores secrets under those roots must move them. The non-namespace
+  strict kinds keep network egress, and the write-deny (non-strict) kinds
+  still allow reads everywhere.
+- `EncryptionContext` encodes an absent optional field and an empty one
+  identically; the three constructors never produce an empty field, and
+  changing the AAD encoding would invalidate stored envelopes, so this is
+  documented rather than changed.
+- The `ReencryptIfStale` migration path treats an envelope whose key metadata,
+  schema and epoch already match as fresh without decrypting it, so a
+  corrupted stored envelope survives migration unnoticed until it is read.
+- The client CKKS runtime validation decodes the ciphertext up to three
+  times; it is bounded by the request size but is not the cheapest shape.
+- `CiphertextEnvelope` (control plane) has no production consumer; its
+  `headers` and `capability` fields are not cross-validated and
+  `add_vector_rule` overwrites a duplicate vector rule silently.
 - Padding and deleted steps of an HNSW search skip the distance and
   candidate bookkeeping, so per-step latency differs slightly from real
   steps; computing the distance regardless would make the work
