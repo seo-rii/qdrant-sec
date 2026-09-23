@@ -1428,9 +1428,11 @@ fn payload_outer_metadata_tampering_fails_authentication() {
         .as_object_mut()
         .unwrap()
         .insert("schema_version".to_string(), json!(2));
+    // The schema version is checked before any decryption is attempted, so a foreign schema is
+    // rejected without materializing plaintext; the AAD still binds it for the decrypt path.
     assert_eq!(
         encryptor.decrypt_selected_fields("point-1", &mut payload, &policy),
-        Err(PayloadEncryptionError::Crypto(EncryptionError::OpenFailed)),
+        Err(PayloadEncryptionError::UnsupportedSchemaVersion(2)),
     );
 
     payload
@@ -1455,7 +1457,7 @@ fn payload_outer_metadata_tampering_fails_authentication() {
         .insert("encryption_epoch".to_string(), json!(1));
     assert_eq!(
         encryptor.decrypt_selected_fields("point-1", &mut payload, &policy),
-        Err(PayloadEncryptionError::Crypto(EncryptionError::OpenFailed)),
+        Err(PayloadEncryptionError::EncryptionEpochMismatch),
     );
 
     payload

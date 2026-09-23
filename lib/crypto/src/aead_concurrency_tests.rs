@@ -28,7 +28,8 @@ fn invocation_budget_is_exact_under_contention() {
     const THREADS: usize = 16;
     const ATTEMPTS_PER_THREAD: usize = 16;
 
-    let cipher = Arc::new(test_cipher(7));
+    // Budgets are shared by key bytes process-wide, so this test owns key byte 0xE2.
+    let cipher = Arc::new(test_cipher(0xE2));
     cipher.set_invocations_for_test(AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT - REMAINING);
     let barrier = Arc::new(Barrier::new(THREADS));
     let successes = Arc::new(AtomicU64::new(0));

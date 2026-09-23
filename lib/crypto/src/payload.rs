@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use crate::aead::{
     AeadCipher, AeadKeyring, EncryptedEnvelope, EncryptionContext, EncryptionError,
     EncryptionPurpose, METADATA_VALUE_KEY_DOMAIN, PAYLOAD_TEXT_KEY_DOMAIN, SecretKey,
-    validate_encrypted_envelope_metadata, validate_resource_key_id,
+    bounded_untrusted_text, validate_encrypted_envelope_metadata, validate_resource_key_id,
 };
 
 pub const ENCRYPTED_PAYLOAD_MARKER: &str = "$qdrant_sec";
@@ -958,9 +958,7 @@ impl PayloadTextEncryptor {
                 envelope.schema_version,
                 envelope.encryption_epoch,
             );
-            let plaintext =
-                self.keyring
-                    .decrypt_with_aad_suffix(&envelope.envelope, context, &aad_suffix)?;
+            // Stale or foreign envelopes are rejected before any plaintext is materialized.
             if envelope.schema_version != self.crypto_schema_version {
                 return Err(PayloadEncryptionError::UnsupportedSchemaVersion(
                     envelope.schema_version,
@@ -969,8 +967,14 @@ impl PayloadTextEncryptor {
             if envelope.encryption_epoch != self.encryption_epoch {
                 return Err(PayloadEncryptionError::EncryptionEpochMismatch);
             }
-            let plaintext = String::from_utf8(plaintext)
-                .map_err(|err| PayloadEncryptionError::InvalidUtf8(err.to_string()))?;
+            let plaintext = Zeroizing::new(self.keyring.decrypt_with_aad_suffix(
+                &envelope.envelope,
+                context,
+                &aad_suffix,
+            )?);
+            let plaintext = std::str::from_utf8(&plaintext)
+                .map_err(|err| PayloadEncryptionError::InvalidUtf8(err.to_string()))?
+                .to_owned();
 
             *value = Value::String(plaintext);
             decrypted += 1;
@@ -1005,9 +1009,7 @@ impl PayloadTextEncryptor {
                 envelope.schema_version,
                 envelope.encryption_epoch,
             );
-            let plaintext =
-                self.keyring
-                    .decrypt_with_aad_suffix(&envelope.envelope, context, &aad_suffix)?;
+            // Stale or foreign envelopes are rejected before any plaintext is materialized.
             if envelope.schema_version != self.crypto_schema_version {
                 return Err(PayloadEncryptionError::UnsupportedSchemaVersion(
                     envelope.schema_version,
@@ -1016,8 +1018,14 @@ impl PayloadTextEncryptor {
             if envelope.encryption_epoch != self.encryption_epoch {
                 return Err(PayloadEncryptionError::EncryptionEpochMismatch);
             }
-            let plaintext = String::from_utf8(plaintext)
-                .map_err(|err| PayloadEncryptionError::InvalidUtf8(err.to_string()))?;
+            let plaintext = Zeroizing::new(self.keyring.decrypt_with_aad_suffix(
+                &envelope.envelope,
+                context,
+                &aad_suffix,
+            )?);
+            let plaintext = std::str::from_utf8(&plaintext)
+                .map_err(|err| PayloadEncryptionError::InvalidUtf8(err.to_string()))?
+                .to_owned();
 
             *value = Value::String(plaintext);
             decrypted += 1;
@@ -1083,7 +1091,12 @@ pub fn validate_server_payload_value_metadata(
         && envelope.kind != expected_kind
     {
         return Err(PayloadEncryptionError::UnsupportedEnvelopeKind(
-            envelope.kind,
+            bounded_untrusted_text(&envelope.kind),
+        ));
+    }
+    if envelope.envelope.ciphertext.len() > SERVER_PAYLOAD_CIPHERTEXT_MAX_B64_LEN {
+        return Err(PayloadEncryptionError::ServerCiphertextTooLarge(
+            context.field_path.to_string(),
         ));
     }
     validate_encrypted_envelope_metadata(&envelope.envelope)?;
@@ -1190,12 +1203,12 @@ fn validate_client_payload_value_inner(
     }
     if envelope.kind != PAYLOAD_TEXT_ENVELOPE_KIND {
         return Err(PayloadEncryptionError::UnsupportedEnvelopeKind(
-            envelope.kind,
+            bounded_untrusted_text(&envelope.kind),
         ));
     }
     if envelope.algorithm != CLIENT_PAYLOAD_ALGORITHM {
         return Err(PayloadEncryptionError::UnsupportedClientAlgorithm(
-            envelope.algorithm,
+            bounded_untrusted_text(&envelope.algorithm),
         ));
     }
     if context.key_id_required && envelope.key_id.as_deref().is_none_or(str::is_empty) {
@@ -1514,12 +1527,14 @@ pub fn server_payload_envelope_key(
     let Some(envelope) = extract_envelope(value, field_path)? else {
         return Ok(None);
     };
-    validate_encrypted_envelope_metadata(&envelope.envelope)?;
+    // The 1 MiB server cap comes first: the generic metadata validator decodes up to the 16 MiB
+    // envelope bound, which would let an oversized marker cost sixteen times its rejection.
     if envelope.envelope.ciphertext.len() > SERVER_PAYLOAD_CIPHERTEXT_MAX_B64_LEN {
         return Err(PayloadEncryptionError::ServerCiphertextTooLarge(
             field_path.to_string(),
         ));
     }
+    validate_encrypted_envelope_metadata(&envelope.envelope)?;
     let ciphertext = BASE64URL_NOPAD
         .decode(envelope.envelope.ciphertext.as_bytes())
         .map_err(|_| PayloadEncryptionError::MalformedEnvelope(field_path.to_string()))?;
@@ -1774,7 +1789,7 @@ fn validate_client_payload_signature(
 
     if signature.alg != CLIENT_PAYLOAD_SIGNATURE_ALGORITHM {
         return Err(PayloadEncryptionError::UnsupportedClientSignatureAlgorithm(
-            signature.alg.clone(),
+            bounded_untrusted_text(&signature.alg),
         ));
     }
     if signature.key_id.is_empty() {
@@ -1976,7 +1991,7 @@ fn extract_envelope(
     if envelope.kind != PAYLOAD_TEXT_ENVELOPE_KIND && envelope.kind != METADATA_VALUE_ENVELOPE_KIND
     {
         return Err(PayloadEncryptionError::UnsupportedEnvelopeKind(
-            envelope.kind,
+            bounded_untrusted_text(&envelope.kind),
         ));
     }
 

@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use data_encoding::BASE64URL_NOPAD;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -131,10 +133,12 @@ impl SecretKey {
         Ok(Self { bytes })
     }
 
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-        Self {
+    pub fn from_bytes(mut bytes: [u8; KEY_LEN]) -> Self {
+        let key = Self {
             bytes: Zeroizing::new(bytes),
-        }
+        };
+        bytes.zeroize();
+        key
     }
 
     pub fn try_from_slice(bytes: &[u8]) -> Result<Self, EncryptionError> {
@@ -377,7 +381,7 @@ pub(crate) fn validate_encrypted_envelope_metadata(
     }
     if envelope.algorithm != ALGORITHM {
         return Err(EncryptionError::UnsupportedAlgorithm(
-            envelope.algorithm.clone(),
+            bounded_untrusted_text(&envelope.algorithm),
         ));
     }
     validate_key_id(&envelope.key_id)?;
@@ -417,8 +421,8 @@ pub(crate) fn validate_encrypted_envelope_metadata(
 }
 
 /// Random 96-bit nonces stay collision-safe for at most 2^32 AES-GCM invocations per key
-/// (NIST SP 800-38D, section 8.3). The budget is tracked per cipher instance, so it bounds a
-/// single process lifetime; rotating the resource key resets it.
+/// (NIST SP 800-38D, section 8.3). The budget is tracked per key for the lifetime of the process
+/// (see [`shared_aead_invocation_budget`]); rotating the resource key starts a fresh budget.
 pub const AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT: u64 = 1 << 32;
 /// First invocation at which the cipher logs that the key is approaching its budget.
 const AES_GCM_RANDOM_NONCE_INVOCATION_WARNING: u64 = AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT / 2;
@@ -482,14 +486,54 @@ impl Debug for AeadInvocationBudget {
     }
 }
 
+/// Process-wide random-nonce budgets, one per distinct AES-GCM key.
+///
+/// The server write paths build a fresh [`AeadCipher`] for every request, so a budget stored in
+/// the cipher instance would restart at zero on each request and never enforce the limit. Keys
+/// are identified by a domain-separated SHA-256 of the key bytes; the map only ever holds one
+/// counter per key the process has used.
+static AEAD_INVOCATION_BUDGETS: OnceLock<Mutex<HashMap<[u8; 32], Arc<AeadInvocationBudget>>>> =
+    OnceLock::new();
+const AEAD_INVOCATION_BUDGET_KEY_DOMAIN: &[u8] = b"qdrant-sec/aead-invocation-budget/v1";
+
+/// The process-wide random-nonce budget of `key`: every cipher built from the same key bytes
+/// shares one counter.
+pub(crate) fn shared_aead_invocation_budget(key: &SecretKey) -> Arc<AeadInvocationBudget> {
+    let mut hasher = Sha256::new();
+    hasher.update(AEAD_INVOCATION_BUDGET_KEY_DOMAIN);
+    hasher.update(key.as_bytes());
+    let key_identity: [u8; 32] = hasher.finalize().into();
+    let mut budgets = AEAD_INVOCATION_BUDGETS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(budgets.entry(key_identity).or_default())
+}
+
+/// Bounded, printable rendering of an untrusted envelope field for error messages: at most 32
+/// characters with control characters escaped, so a stored or submitted envelope cannot inject
+/// unbounded or multi-line text into logs and error bodies.
+pub(crate) fn bounded_untrusted_text(value: &str) -> String {
+    const MAX_CHARS: usize = 32;
+    let mut rendered: String = value
+        .chars()
+        .take(MAX_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if value.chars().count() > MAX_CHARS {
+        rendered.push_str("...");
+    }
+    rendered
+}
+
 pub struct AeadCipher {
     key_id: String,
     material_fingerprint: String,
     rk_id: String,
     rk_epoch: Option<u64>,
     key: SecretKey,
-    /// Number of encryptions performed with `key` by this instance.
-    invocations: AeadInvocationBudget,
+    /// Random-nonce budget of `key`, shared with every other cipher built from the same key.
+    invocations: Arc<AeadInvocationBudget>,
 }
 
 impl Drop for AeadCipher {
@@ -616,6 +660,8 @@ pub fn rewrap_resource_key(
 pub struct LocalMasterKeyProvider {
     mk_id: String,
     key: SecretKey,
+    /// Random-nonce budget of the master key; wrapping is AES-GCM with a random nonce too.
+    wraps: Arc<AeadInvocationBudget>,
 }
 
 impl Debug for LocalMasterKeyProvider {
@@ -631,7 +677,8 @@ impl LocalMasterKeyProvider {
     pub fn new(mk_id: impl Into<String>, key: SecretKey) -> Result<Self, EncryptionError> {
         let mk_id = mk_id.into();
         validate_material_fingerprint_id(&mk_id)?;
-        Ok(Self { mk_id, key })
+        let wraps = shared_aead_invocation_budget(&key);
+        Ok(Self { mk_id, key, wraps })
     }
 }
 
@@ -645,6 +692,7 @@ impl MasterKeyProvider for LocalMasterKeyProvider {
         rk_plaintext: &SecretKey,
         aad: &[u8],
     ) -> Result<WrappedKeyBlob, EncryptionError> {
+        self.wraps.reserve("master key")?;
         let rng = SystemRandom::new();
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rng.fill(&mut nonce_bytes)
@@ -680,7 +728,7 @@ impl MasterKeyProvider for LocalMasterKeyProvider {
         }
         if wrapped.algorithm != RESOURCE_KEY_WRAP_ALGORITHM {
             return Err(EncryptionError::UnsupportedAlgorithm(
-                wrapped.algorithm.clone(),
+                bounded_untrusted_text(&wrapped.algorithm),
             ));
         }
         if wrapped.mk_id != self.mk_id {
@@ -731,13 +779,14 @@ impl AeadCipher {
         validate_key_id(&key_id)?;
         let material_fingerprint = material_fingerprint.into();
         validate_material_fingerprint_id(&material_fingerprint)?;
+        let invocations = shared_aead_invocation_budget(&key);
         Ok(Self {
             key_id,
             material_fingerprint,
             rk_id: String::new(),
             rk_epoch: None,
             key,
-            invocations: AeadInvocationBudget::new(),
+            invocations,
         })
     }
 
@@ -804,7 +853,8 @@ impl AeadCipher {
         self.encrypt_with_aad_suffix(plaintext, context, &[])
     }
 
-    /// Number of encryptions this cipher instance has performed.
+    /// Number of random-nonce encryptions performed with this cipher's key in this process,
+    /// across every cipher built from the same key.
     pub fn invocations(&self) -> u64 {
         self.invocations.invocations()
     }
@@ -1112,7 +1162,8 @@ mod tests {
 
     #[test]
     fn cipher_refuses_encryption_once_the_random_nonce_budget_is_spent() {
-        let cipher = cipher(0x41, "tenant-a:key", "tenant-a/material", "tenant-a/rk", 7);
+        // The budget is shared by key bytes process-wide, so this test owns key byte 0xE1.
+        let cipher = cipher(0xE1, "tenant-a:key", "tenant-a/material", "tenant-a/rk", 7);
         let context = EncryptionContext {
             purpose: EncryptionPurpose::PayloadText,
             collection: "docs",
@@ -1136,6 +1187,80 @@ mod tests {
         // never moves past the limit.
         assert_eq!(cipher.decrypt(&envelope, context).unwrap(), b"last");
         assert_eq!(cipher.invocations(), AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT);
+    }
+
+    #[test]
+    fn ciphers_built_from_the_same_key_share_one_invocation_budget() {
+        // Owns key bytes 0xE3 and 0xE5.
+        let context = EncryptionContext::payload_text("docs", "1", "body");
+        let first = cipher(0xE3, "tenant-a:key", "tenant-a/material", "tenant-a/rk", 1);
+        let second = cipher(0xE3, "tenant-b:key", "tenant-b/material", "tenant-b/rk", 9);
+        let other_key = cipher(0xE5, "tenant-a:key", "tenant-a/material", "tenant-a/rk", 1);
+        assert_eq!(first.invocations(), 0);
+
+        first.encrypt(b"one", context).unwrap();
+        second.encrypt(b"two", context).unwrap();
+        assert_eq!(
+            (first.invocations(), second.invocations()),
+            (2, 2),
+            "the counter belongs to the key, not to the cipher instance"
+        );
+        assert_eq!(other_key.invocations(), 0);
+
+        // A fresh instance for an exhausted key is refused too: per-request cipher
+        // construction on the server cannot reset the budget.
+        first.set_invocations_for_test(AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT);
+        let rebuilt = cipher(0xE3, "tenant-c:key", "tenant-c/material", "tenant-c/rk", 3);
+        assert!(matches!(
+            rebuilt.encrypt(b"three", context),
+            Err(EncryptionError::KeyUsageExhausted)
+        ));
+        other_key.encrypt(b"still fine", context).unwrap();
+    }
+
+    #[test]
+    fn master_key_wrap_observes_the_random_nonce_budget() {
+        // Owns key byte 0xE4.
+        let provider =
+            LocalMasterKeyProvider::new("mk/local", SecretKey::from_bytes([0xE4; KEY_LEN]))
+                .unwrap();
+        let resource_key = SecretKey::from_bytes([0x11; KEY_LEN]);
+        let wrapped = provider.wrap_resource_key(&resource_key, b"aad").unwrap();
+        assert_eq!(provider.wraps.invocations(), 1);
+
+        provider
+            .wraps
+            .set_for_test(AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT);
+        assert!(matches!(
+            provider.wrap_resource_key(&resource_key, b"aad"),
+            Err(EncryptionError::KeyUsageExhausted)
+        ));
+        // Unwrapping is unaffected by the encryption budget.
+        assert_eq!(
+            provider
+                .unwrap_resource_key(&wrapped, b"aad")
+                .unwrap()
+                .as_bytes(),
+            resource_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn bounded_untrusted_text_truncates_and_escapes() {
+        assert_eq!(bounded_untrusted_text("AES-256-GCM"), "AES-256-GCM");
+        assert_eq!(
+            bounded_untrusted_text("line\nbreak\u{7}"),
+            "line\\nbreak\\u{7}"
+        );
+        let long = "a".repeat(100);
+        let rendered = bounded_untrusted_text(&long);
+        assert_eq!(rendered, format!("{}...", "a".repeat(32)));
+        assert!(
+            EncryptionError::UnsupportedAlgorithm(bounded_untrusted_text(&"\n".repeat(4096)))
+                .to_string()
+                .len()
+                < 128
+        );
     }
 
     #[test]

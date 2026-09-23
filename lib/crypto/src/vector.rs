@@ -885,8 +885,9 @@ pub fn ckks_vector_sidecar_envelope_key(
             "encrypted CKKS vector marker must be the only key of the sidecar value".to_string(),
         ));
     }
-    let encrypted: EncryptedCkksVector = serde_json::from_value(marker.clone())
-        .map_err(|err| CkksError::MalformedEnvelope(err.to_string()))?;
+    let encrypted: EncryptedCkksVector = serde_json::from_value(marker.clone()).map_err(|_| {
+        CkksError::MalformedEnvelope("CKKS sidecar marker is malformed".to_string())
+    })?;
     if encrypted.version != VERSION {
         return Err(CkksError::UnsupportedEnvelopeVersion(encrypted.version));
     }
@@ -969,7 +970,7 @@ pub fn client_ckks_vector_sidecar_envelope_key(
             "client CKKS vector ciphertext hash does not match ciphertext".to_string(),
         ));
     }
-    let signature_bytes = decode_client_ckks_vector_signature(&envelope, signature)?;
+    let signature_bytes = decode_client_ckks_vector_signature(signature)?;
     let signature_sha256_b64 = BASE64URL_NOPAD.encode(Sha256::digest(&signature_bytes).as_ref());
 
     Ok(Some(ClientCkksVectorSidecarEnvelopeKey {
@@ -1046,7 +1047,7 @@ pub fn validate_client_ckks_vector_payload_value_for_runtime(
             "client CKKS vector signature public key must be 32 bytes".to_string(),
         ));
     }
-    let signature_bytes = decode_client_ckks_vector_signature(&envelope, signature)?;
+    let signature_bytes = decode_client_ckks_vector_signature(signature)?;
     let message = client_ckks_vector_signature_message_for_envelope(&envelope);
     UnparsedPublicKey::new(&ED25519, context.signature_verification.public_key)
         .verify(&message, &signature_bytes)
@@ -1081,7 +1082,7 @@ fn optional_client_ckks_vector_envelope(
     }
     serde_json::from_value(marker.clone())
         .map(Some)
-        .map_err(|err| CkksError::MalformedEnvelope(err.to_string()))
+        .map_err(|_| CkksError::MalformedEnvelope("CKKS sidecar marker is malformed".to_string()))
 }
 
 fn client_ckks_vector_envelope(value: &Value) -> Result<ClientCkksVectorEnvelope, CkksError> {
@@ -1129,6 +1130,11 @@ fn validate_client_ckks_vector_common(
     validate_resource_key_id(&envelope.rk_id).map_err(|_| {
         CkksError::MalformedEnvelope("client CKKS vector rk_id is invalid".to_string())
     })?;
+    if envelope.context_digest.len() != SHA256_B64_LEN {
+        return Err(CkksError::MalformedEnvelope(
+            "client CKKS vector context_digest has invalid length".to_string(),
+        ));
+    }
     let digest = BASE64URL_NOPAD
         .decode(envelope.context_digest.as_bytes())
         .map_err(|_| {
@@ -1161,7 +1167,6 @@ fn validate_client_ckks_vector_common(
 }
 
 fn decode_client_ckks_vector_signature(
-    envelope: &ClientCkksVectorEnvelope,
     signature: &ClientCkksVectorSignature,
 ) -> Result<Vec<u8>, CkksError> {
     if signature.alg != CLIENT_CKKS_VECTOR_SIGNATURE_ALGORITHM {
@@ -1182,11 +1187,6 @@ fn decode_client_ckks_vector_signature(
     if signature_bytes.len() != 64 {
         return Err(CkksError::MalformedEnvelope(
             "client CKKS vector signature must decode to 64 bytes".to_string(),
-        ));
-    }
-    if envelope.signature.is_none() {
-        return Err(CkksError::MalformedEnvelope(
-            "client CKKS vector signature is missing".to_string(),
         ));
     }
     Ok(signature_bytes)
@@ -1615,8 +1615,10 @@ where
                     .to_string(),
             ));
         }
-        let encrypted: EncryptedCkksVector = serde_json::from_value(marker.clone())
-            .map_err(|err| CkksError::MalformedEnvelope(err.to_string()))?;
+        let encrypted: EncryptedCkksVector =
+            serde_json::from_value(marker.clone()).map_err(|_| {
+                CkksError::MalformedEnvelope("CKKS sidecar marker is malformed".to_string())
+            })?;
         self.open(collection, point_id, public_material, &encrypted)?;
         let collection_context = self.collection_context(collection)?;
         ckks_vector_verified_sidecar_key(value, collection_context, point_id, &self.vector_name)
@@ -1853,6 +1855,7 @@ where
         if ciphertext.is_empty() {
             return Err(CkksError::EmptyCiphertext);
         }
+        validate_raw_ciphertext_size(&ciphertext)?;
 
         Ok(ciphertext)
     }
@@ -1869,6 +1872,7 @@ where
         if encrypted_query.is_empty() {
             return Err(CkksError::EmptyCiphertext);
         }
+        validate_raw_ciphertext_size(encrypted_query)?;
         if slots == 0 {
             return Err(CkksError::EmptyVector);
         }

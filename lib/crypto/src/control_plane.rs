@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::aead::validate_key_id;
+use crate::aead::{bounded_untrusted_text, validate_key_id};
 
 pub const GENERIC_CIPHERTEXT_MARKER: &str = "$qdrant_ciphertext";
 pub const PAYLOAD_AES_GCM_PROVIDER: &str = "payload/aes-256-gcm@v1";
@@ -216,7 +216,7 @@ fn validate_envelope_fields(
     validate_identifier(provider)?;
     validate_identifier(instance_fingerprint)?;
     validate_key_id(key_id)
-        .map_err(|_| ControlPlaneError::InvalidEnvelopeKeyId(key_id.to_string()))?;
+        .map_err(|_| ControlPlaneError::InvalidEnvelopeKeyId(bounded_untrusted_text(key_id)))?;
     if let Some(binding) = binding {
         validate_identifier(binding)?;
     }
@@ -387,7 +387,9 @@ fn validate_identifier(value: &str) -> Result<(), ControlPlaneError> {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-' | b'/' | b'@')
         })
     {
-        return Err(ControlPlaneError::InvalidIdentifier(value.to_string()));
+        return Err(ControlPlaneError::InvalidIdentifier(
+            bounded_untrusted_text(value),
+        ));
     }
 
     Ok(())
