@@ -2710,7 +2710,6 @@ fn ckks_sidecar_hnsw_existing_cache_directory_is_safe(
 }
 
 #[cfg(unix)]
-#[cfg(test)]
 fn ckks_sidecar_hnsw_validate_cache_file_unix_metadata(
     _path: &Path,
     metadata: &fs::Metadata,
