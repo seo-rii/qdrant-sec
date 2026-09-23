@@ -455,6 +455,11 @@ pub struct CryptoBackendConfig {
     /// Largest bridge response line (and total stderr) accepted per worker, in bytes.
     #[serde(default)]
     pub max_output_bytes: Option<usize>,
+    /// Extra directories or files the `*_landlock_strict*` bridge sandbox kinds let the bridge
+    /// read, as absolute normalized paths (for example an OpenFHE data directory). Never list
+    /// the storage, snapshot, configuration or key material locations here.
+    #[serde(default)]
+    pub landlock_read_allow_roots: Vec<String>,
 }
 
 impl fmt::Debug for CryptoBackendConfig {
@@ -477,6 +482,10 @@ impl fmt::Debug for CryptoBackendConfig {
             .field("size", &self.size)
             .field("timeout_ms", &self.timeout_ms)
             .field("max_output_bytes", &self.max_output_bytes)
+            .field(
+                "landlock_read_allow_roots_count",
+                &self.landlock_read_allow_roots.len(),
+            )
             .finish()
     }
 }
@@ -985,6 +994,7 @@ mod tests {
             size: Some(2),
             timeout_ms: Some(5_000),
             max_output_bytes: None,
+            landlock_read_allow_roots: Vec::new(),
         };
         let mut settings = Config::builder()
             .add_source(File::from_str(DEFAULT_CONFIG, FileFormat::Yaml))

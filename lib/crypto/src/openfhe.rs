@@ -43,6 +43,10 @@ enum BridgeSandbox {
     ProcessHardening,
     LinuxLandlockWriteDeny,
     LinuxLandlockWriteDenyNetworkNamespace,
+    /// Write-deny plus a read/execute allow-list: the system roots, the program itself and the
+    /// configured read roots are the only paths the bridge can read or execute.
+    LinuxLandlockStrict,
+    LinuxLandlockStrictNetworkNamespace,
 }
 
 #[derive(Clone)]
@@ -55,6 +59,8 @@ pub struct CommandOpenFheBackend {
     checked_program: bool,
     expected_sha256_b64: Option<String>,
     sandbox: BridgeSandbox,
+    /// Extra paths the strict Landlock sandbox lets the bridge read (Linux only).
+    landlock_read_allow_roots: Vec<PathBuf>,
     sensitive_env_names: Vec<String>,
     workers: Arc<Mutex<Vec<Arc<WorkerProcess>>>>,
     /// Workers being spawned outside the `workers` lock; counted against `pool_size`.
@@ -75,6 +81,10 @@ impl std::fmt::Debug for CommandOpenFheBackend {
                 &self.expected_sha256_b64.as_ref().map(|_| "<configured>"),
             )
             .field("sandbox", &self.sandbox)
+            .field(
+                "landlock_read_allow_roots_count",
+                &self.landlock_read_allow_roots.len(),
+            )
             .field("sensitive_env_names_count", &self.sensitive_env_names.len())
             .finish()
     }
@@ -90,6 +100,7 @@ impl PartialEq for CommandOpenFheBackend {
             && self.checked_program == other.checked_program
             && self.expected_sha256_b64 == other.expected_sha256_b64
             && self.sandbox == other.sandbox
+            && self.landlock_read_allow_roots == other.landlock_read_allow_roots
             && self.sensitive_env_names == other.sensitive_env_names
     }
 }
@@ -243,6 +254,7 @@ impl CommandOpenFheBackend {
             checked_program: false,
             expected_sha256_b64: None,
             sandbox: BridgeSandbox::ProcessHardening,
+            landlock_read_allow_roots: Vec::new(),
             sensitive_env_names: Vec::new(),
             workers: Arc::new(Mutex::new(Vec::new())),
             spawning: Arc::new(AtomicUsize::new(0)),
@@ -313,6 +325,51 @@ impl CommandOpenFheBackend {
         self.sandbox = BridgeSandbox::LinuxLandlockWriteDenyNetworkNamespace;
         self.reset_worker_pool_after_policy_change();
         self
+    }
+
+    /// Landlock write-deny plus a read/execute allow-list (Linux). The bridge can read and
+    /// execute only the system roots (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`), read
+    /// `/dev/null`, `/dev/urandom` and `/dev/random`, read and execute the program itself, and
+    /// read the roots configured with [`Self::with_linux_landlock_read_allow_roots`]. Storage,
+    /// configuration and key material stay unreadable even if the bridge is compromised.
+    pub fn with_linux_landlock_strict_sandbox(mut self) -> Self {
+        self.sandbox = BridgeSandbox::LinuxLandlockStrict;
+        self.reset_worker_pool_after_policy_change();
+        self
+    }
+
+    /// [`Self::with_linux_landlock_strict_sandbox`] plus a private network namespace.
+    pub fn with_linux_landlock_strict_network_namespace_sandbox(mut self) -> Self {
+        self.sandbox = BridgeSandbox::LinuxLandlockStrictNetworkNamespace;
+        self.reset_worker_pool_after_policy_change();
+        self
+    }
+
+    /// Directories or files the strict Landlock sandbox additionally lets the bridge read, for
+    /// example an OpenFHE data directory outside the system roots. Every root must be an
+    /// absolute, normalized path other than `/`; a root that cannot be opened when a worker
+    /// starts fails the spawn instead of silently narrowing the policy.
+    pub fn with_linux_landlock_read_allow_roots<I, P>(mut self, roots: I) -> Result<Self, CkksError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let mut validated: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            let root = root.into();
+            validate_landlock_read_allow_root(&root)?;
+            if !validated.contains(&root) {
+                validated.push(root);
+            }
+        }
+        if validated.len() > MAX_LANDLOCK_READ_ALLOW_ROOTS {
+            return Err(CkksError::Backend(format!(
+                "at most {MAX_LANDLOCK_READ_ALLOW_ROOTS} Landlock read-allow roots are supported"
+            )));
+        }
+        self.landlock_read_allow_roots = validated;
+        self.reset_worker_pool_after_policy_change();
+        Ok(self)
     }
 
     pub fn with_sensitive_env_names<I, S>(mut self, env_names: I) -> Self
@@ -1408,12 +1465,21 @@ impl CommandOpenFheBackend {
         let (keep_fd, inherit_fd) = (spawn_program.keep_fd(), spawn_program.inherit_fd());
         #[cfg(not(target_os = "linux"))]
         let (keep_fd, inherit_fd) = (None, None);
+        #[cfg(target_os = "linux")]
+        let landlock_strict_rules = bridge_sandbox_uses_landlock_read_allow_list(self.sandbox)
+            .then(|| {
+                linux_landlock_strict_rules(&self.landlock_read_allow_roots, &self.program, keep_fd)
+            })
+            .transpose()?;
+        #[cfg(not(target_os = "linux"))]
+        let landlock_strict_rules: Option<LinuxLandlockStrictRules> = None;
         configure_bridge_command_sandbox(
             &mut command,
             self.checked_program,
             self.sandbox,
             keep_fd,
             inherit_fd,
+            landlock_strict_rules,
         );
 
         let mut child = spawn_bridge_child(command)
@@ -1692,6 +1758,266 @@ const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+/// Access rights Landlock accepts in a rule whose parent is a non-directory.
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_FILE_COMPATIBLE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_TRUNCATE;
+#[cfg(target_os = "linux")]
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+
+#[cfg(target_os = "linux")]
+#[repr(C, packed)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+/// Upper bound on configured strict-sandbox read roots; every root becomes one Landlock rule.
+pub const MAX_LANDLOCK_READ_ALLOW_ROOTS: usize = 64;
+
+/// System roots the strict sandbox lets the bridge read and execute: interpreters, shared
+/// libraries, the loader cache and locale data live here. Roots a distribution lacks are skipped.
+#[cfg(target_os = "linux")]
+const LANDLOCK_STRICT_SYSTEM_ROOTS: [&str; 6] = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
+
+/// Device files the strict sandbox lets the bridge open; `/dev/null` may also be written.
+#[cfg(target_os = "linux")]
+const LANDLOCK_STRICT_DEVICE_FILES: [(&str, u64); 3] = [
+    (
+        "/dev/null",
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+    ),
+    ("/dev/urandom", LANDLOCK_ACCESS_FS_READ_FILE),
+    ("/dev/random", LANDLOCK_ACCESS_FS_READ_FILE),
+];
+
+/// One `path_beneath` Landlock rule, resolved in the parent so the forked child allocates nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LinuxLandlockPathRule {
+    path: std::ffi::CString,
+    allowed_access: u64,
+    /// Configured roots and the program must exist; system roots a distribution lacks are skipped.
+    required: bool,
+}
+
+/// The strict sandbox's allow-list, prepared before the fork.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LinuxLandlockStrictRules {
+    paths: Vec<LinuxLandlockPathRule>,
+    /// The already-open checked program descriptor; it is granted read and execute so the
+    /// `/proc/self/fd/<fd>` exec path and the interpreter's re-read of a shebang script work.
+    program_fd: Option<i32>,
+}
+
+/// Checks one strict-sandbox read root: absolute, normalized (no `.`, `..`, empty or trailing
+/// segments), not `/` and free of NUL bytes. Existence is checked when a worker starts.
+pub fn validate_landlock_read_allow_root(root: &Path) -> Result<(), CkksError> {
+    let raw = root.as_os_str().as_encoded_bytes();
+    if raw.first() != Some(&b'/') {
+        return Err(CkksError::Backend(
+            "Landlock read-allow roots must be absolute paths".to_string(),
+        ));
+    }
+    if raw.contains(&0) {
+        return Err(CkksError::Backend(
+            "Landlock read-allow roots must not contain NUL bytes".to_string(),
+        ));
+    }
+    if raw.len() == 1 {
+        return Err(CkksError::Backend(
+            "Landlock read-allow roots must not be the filesystem root".to_string(),
+        ));
+    }
+    if raw[1..]
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment.is_empty() || segment == b"." || segment == b"..")
+    {
+        return Err(CkksError::Backend(
+            "Landlock read-allow roots must be normalized paths without `.`, `..`, empty or              trailing segments"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_strict_rules(
+    read_allow_roots: &[PathBuf],
+    program: &Path,
+    program_fd: Option<i32>,
+) -> Result<LinuxLandlockStrictRules, CkksError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn rule(
+        path: &Path,
+        allowed_access: u64,
+        required: bool,
+    ) -> Result<LinuxLandlockPathRule, CkksError> {
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            CkksError::Backend("Landlock rule paths must not contain NUL bytes".to_string())
+        })?;
+        Ok(LinuxLandlockPathRule {
+            path,
+            allowed_access,
+            required,
+        })
+    }
+
+    let read_exec =
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_EXECUTE;
+    let mut paths = Vec::new();
+    for root in LANDLOCK_STRICT_SYSTEM_ROOTS {
+        paths.push(rule(Path::new(root), read_exec, false)?);
+    }
+    for (device, allowed_access) in LANDLOCK_STRICT_DEVICE_FILES {
+        paths.push(rule(Path::new(device), allowed_access, false)?);
+    }
+    for root in read_allow_roots {
+        validate_landlock_read_allow_root(root)?;
+        paths.push(rule(
+            root,
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+            true,
+        )?);
+    }
+    if program_fd.is_none() {
+        // Unchecked (test-only) programs are executed by path, so the path itself is allowed.
+        paths.push(rule(
+            program,
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE,
+            true,
+        )?);
+    }
+    Ok(LinuxLandlockStrictRules { paths, program_fd })
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_strict_handled_access_for_abi(abi_version: i64) -> u64 {
+    landlock_write_deny_access_for_abi(abi_version)
+        | LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_READ_DIR
+}
+
+/// Adds one `path_beneath` rule; directory-only rights are dropped for non-directory parents
+/// because Landlock rejects them with `EINVAL`. Runs in the forked child, so it allocates nothing.
+#[cfg(target_os = "linux")]
+fn landlock_add_path_rule(
+    ruleset_fd: nix::libc::c_long,
+    parent_fd: i32,
+    allowed_access: u64,
+) -> io::Result<()> {
+    // SAFETY: `stat` is plain old data; `fstat` fills it for an open descriptor.
+    let mut metadata: nix::libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { nix::libc::fstat(parent_fd, &mut metadata) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let allowed_access = if metadata.st_mode & nix::libc::S_IFMT == nix::libc::S_IFDIR {
+        allowed_access
+    } else {
+        allowed_access & LANDLOCK_ACCESS_FS_FILE_COMPATIBLE
+    };
+    let attr = LandlockPathBeneathAttr {
+        allowed_access,
+        parent_fd,
+    };
+    // SAFETY: the attribute struct matches the kernel ABI layout and outlives the call.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &attr as *const LandlockPathBeneathAttr,
+            0u32,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Installs the strict ruleset: every write access bit plus read and execute are handled, and
+/// only the prepared allow-list is granted. Runs in the forked child.
+#[cfg(target_os = "linux")]
+fn apply_linux_landlock_strict(rules: &LinuxLandlockStrictRules) -> io::Result<()> {
+    let abi_version = linux_landlock_abi_version()?;
+    if abi_version < 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux Landlock ABI is unavailable",
+        ));
+    }
+
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: landlock_strict_handled_access_for_abi(abi_version),
+    };
+    // SAFETY: the attribute struct matches the kernel ABI layout and outlives the call.
+    let ruleset_fd = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_landlock_create_ruleset,
+            &attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let populate_and_restrict = || -> io::Result<()> {
+        for rule in &rules.paths {
+            // SAFETY: the path is a valid NUL-terminated string prepared in the parent.
+            let fd = unsafe {
+                nix::libc::open(rule.path.as_ptr(), nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if !rule.required && err.raw_os_error() == Some(nix::libc::ENOENT) {
+                    continue;
+                }
+                return Err(err);
+            }
+            let added = landlock_add_path_rule(ruleset_fd, fd, rule.allowed_access);
+            // SAFETY: closing the descriptor opened above.
+            unsafe {
+                nix::libc::close(fd);
+            }
+            added?;
+        }
+        if let Some(program_fd) = rules.program_fd {
+            landlock_add_path_rule(
+                ruleset_fd,
+                program_fd,
+                LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE,
+            )?;
+        }
+        // SAFETY: restricting the calling thread with the populated ruleset descriptor.
+        let restricted =
+            unsafe { nix::libc::syscall(nix::libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
+        if restricted != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    let outcome = populate_and_restrict();
+    // SAFETY: closing the ruleset descriptor created above.
+    let close_result = unsafe { nix::libc::close(ruleset_fd as nix::libc::c_int) };
+    outcome?;
+    if close_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn linux_landlock_abi_version() -> io::Result<i64> {
@@ -1787,14 +2113,23 @@ fn bridge_sandbox_uses_landlock(sandbox: BridgeSandbox) -> bool {
         sandbox,
         BridgeSandbox::LinuxLandlockWriteDeny
             | BridgeSandbox::LinuxLandlockWriteDenyNetworkNamespace
+    ) || bridge_sandbox_uses_landlock_read_allow_list(sandbox)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bridge_sandbox_uses_landlock_read_allow_list(sandbox: BridgeSandbox) -> bool {
+    matches!(
+        sandbox,
+        BridgeSandbox::LinuxLandlockStrict | BridgeSandbox::LinuxLandlockStrictNetworkNamespace
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn bridge_sandbox_uses_network_namespace(sandbox: BridgeSandbox) -> bool {
     matches!(
         sandbox,
         BridgeSandbox::LinuxLandlockWriteDenyNetworkNamespace
+            | BridgeSandbox::LinuxLandlockStrictNetworkNamespace
     )
 }
 
@@ -1853,6 +2188,7 @@ fn configure_bridge_command_sandbox(
     sandbox: BridgeSandbox,
     keep_fd: Option<i32>,
     inherit_fd: Option<i32>,
+    landlock_strict_rules: Option<LinuxLandlockStrictRules>,
 ) {
     // This is not a full sandbox, but it prevents the bridge process from
     // gaining privileges through setuid binaries or file capabilities after
@@ -1906,7 +2242,9 @@ fn configure_bridge_command_sandbox(
                     return Err(io::Error::last_os_error());
                 }
             }
-            if bridge_sandbox_uses_landlock(sandbox) {
+            if let Some(rules) = &landlock_strict_rules {
+                apply_linux_landlock_strict(rules)?;
+            } else if bridge_sandbox_uses_landlock(sandbox) {
                 apply_linux_landlock_write_deny()?;
             }
             nix::libc::umask(0o077);
@@ -1922,6 +2260,7 @@ fn configure_bridge_command_sandbox(
     _sandbox: BridgeSandbox,
     _keep_fd: Option<i32>,
     _inherit_fd: Option<i32>,
+    _landlock_strict_rules: Option<LinuxLandlockStrictRules>,
 ) {
 }
 
@@ -2415,6 +2754,189 @@ mod tests {
         let err = decode_single_bridge_response(response.as_bytes(), expected_profile)
             .expect_err("empty bridge ciphertext must fail closed");
         assert!(format!("{err}").contains("empty ciphertext"));
+    }
+
+    #[test]
+    fn landlock_read_allow_roots_must_be_absolute_normalized_and_not_the_filesystem_root() {
+        let backend = CommandOpenFheBackend::new_unchecked("/usr/bin/true");
+        for rejected in [
+            "relative/dir",
+            "/var/../etc",
+            "/",
+            "/opt/./openfhe",
+            "/opt/",
+            "//opt",
+            "",
+        ] {
+            assert!(
+                backend
+                    .clone()
+                    .with_linux_landlock_read_allow_roots([rejected])
+                    .is_err(),
+                "{rejected:?} must be rejected"
+            );
+        }
+        assert!(
+            backend
+                .clone()
+                .with_linux_landlock_read_allow_roots(
+                    (0..=MAX_LANDLOCK_READ_ALLOW_ROOTS).map(|index| format!("/opt/root-{index}"))
+                )
+                .is_err(),
+            "more than the maximum number of roots must be rejected"
+        );
+
+        let sentinel = "openfhe-read-root-sentinel";
+        let backend = backend
+            .with_linux_landlock_read_allow_roots([
+                format!("/opt/{sentinel}"),
+                format!("/opt/{sentinel}"),
+                "/usr/share/openfhe".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(
+            backend.landlock_read_allow_roots,
+            vec![
+                PathBuf::from(format!("/opt/{sentinel}")),
+                PathBuf::from("/usr/share/openfhe"),
+            ]
+        );
+        let rendered = format!("{backend:?}");
+        assert!(
+            rendered.contains("landlock_read_allow_roots_count: 2"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(sentinel), "{rendered}");
+    }
+
+    #[test]
+    fn landlock_strict_sandbox_kinds_are_distinct_policies() {
+        let base = CommandOpenFheBackend::new_unchecked("/usr/bin/true");
+        let strict = base.clone().with_linux_landlock_strict_sandbox();
+        let strict_netns = base
+            .clone()
+            .with_linux_landlock_strict_network_namespace_sandbox();
+        let write_deny = base.clone().with_linux_landlock_write_deny_sandbox();
+        assert_ne!(strict, base);
+        assert_ne!(strict, write_deny);
+        assert_ne!(strict, strict_netns);
+        assert_ne!(
+            strict.clone(),
+            strict
+                .clone()
+                .with_linux_landlock_read_allow_roots(["/opt/openfhe"])
+                .unwrap(),
+            "read roots are part of the sandbox policy"
+        );
+        assert!(format!("{strict:?}").contains("sandbox: LinuxLandlockStrict"));
+        assert!(format!("{strict_netns:?}").contains("LinuxLandlockStrictNetworkNamespace"));
+
+        for sandbox in [
+            BridgeSandbox::LinuxLandlockStrict,
+            BridgeSandbox::LinuxLandlockStrictNetworkNamespace,
+        ] {
+            assert!(bridge_sandbox_uses_landlock_read_allow_list(sandbox));
+        }
+        for sandbox in [
+            BridgeSandbox::ProcessHardening,
+            BridgeSandbox::LinuxLandlockWriteDeny,
+            BridgeSandbox::LinuxLandlockWriteDenyNetworkNamespace,
+        ] {
+            assert!(!bridge_sandbox_uses_landlock_read_allow_list(sandbox));
+        }
+        assert!(bridge_sandbox_uses_network_namespace(
+            BridgeSandbox::LinuxLandlockStrictNetworkNamespace
+        ));
+        assert!(!bridge_sandbox_uses_network_namespace(
+            BridgeSandbox::LinuxLandlockStrict
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_strict_rules_cover_system_roots_devices_program_and_configured_roots() {
+        let rules = linux_landlock_strict_rules(
+            &[PathBuf::from("/opt/openfhe")],
+            Path::new("/opt/bridge/openfhe-bridge"),
+            None,
+        )
+        .unwrap();
+        assert!(rules.program_fd.is_none());
+        let paths: Vec<&str> = rules
+            .paths
+            .iter()
+            .map(|rule| rule.path.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/bin",
+                "/sbin",
+                "/etc",
+                "/dev/null",
+                "/dev/urandom",
+                "/dev/random",
+                "/opt/openfhe",
+                "/opt/bridge/openfhe-bridge",
+            ]
+        );
+        let by_path = |path: &str| {
+            rules
+                .paths
+                .iter()
+                .find(|rule| rule.path.to_str().ok() == Some(path))
+                .unwrap()
+        };
+        assert!(!by_path("/lib64").required);
+        assert!(by_path("/opt/openfhe").required);
+        assert_eq!(
+            by_path("/opt/openfhe").allowed_access,
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+            "configured roots are readable but never executable"
+        );
+        assert_eq!(
+            by_path("/opt/bridge/openfhe-bridge").allowed_access,
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE
+        );
+        assert_eq!(
+            by_path("/dev/null").allowed_access,
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE
+        );
+        assert!(
+            rules
+                .paths
+                .iter()
+                .all(|rule| rule.allowed_access & LANDLOCK_ACCESS_FS_MAKE_REG == 0),
+            "no rule may grant file creation"
+        );
+
+        let checked =
+            linux_landlock_strict_rules(&[], Path::new("/opt/bridge/openfhe-bridge"), Some(7))
+                .unwrap();
+        assert_eq!(checked.program_fd, Some(7));
+        assert!(
+            checked
+                .paths
+                .iter()
+                .all(|rule| rule.path.to_str().ok() != Some("/opt/bridge/openfhe-bridge")),
+            "checked programs are granted through their descriptor, not their path"
+        );
+
+        let handled = landlock_strict_handled_access_for_abi(3);
+        assert_eq!(
+            handled
+                & (LANDLOCK_ACCESS_FS_EXECUTE
+                    | LANDLOCK_ACCESS_FS_READ_FILE
+                    | LANDLOCK_ACCESS_FS_READ_DIR),
+            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
+        );
+        assert_eq!(
+            handled & landlock_write_deny_access_for_abi(3),
+            landlock_write_deny_access_for_abi(3)
+        );
     }
 
     #[test]

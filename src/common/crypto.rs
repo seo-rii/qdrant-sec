@@ -26,17 +26,17 @@ use qdrant_sec::{
     ExistingPayloadMode, LOCAL_RESOURCE_KEY_WRAP_CIPHERTEXT_B64_LEN,
     LOCAL_RESOURCE_KEY_WRAP_CIPHERTEXT_LEN, LocalMasterKeyProvider, METADATA_AES_GCM_PROVIDER,
     METADATA_BLIND_INDEX_PROVIDER, METADATA_EXACT_MATCH_TOKEN_BINDING, METADATA_VALUE_BINDING,
-    MasterKeyProvider, PAYLOAD_AES_GCM_PROVIDER, PAYLOAD_CLIENT_AEAD_PROVIDER,
-    PAYLOAD_FIELD_BINDING, PAYLOAD_PRIVATE_RESULT_ORAM_PROVIDER, PRIVATE_HNSW_ORAM_BINDING,
-    PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION, PRIVATE_RESULT_ORAM_BINDING,
-    PayloadEncryptionError, PayloadEncryptionPolicy, PayloadTextEncryptor,
-    RESOURCE_KEY_WRAP_ALGORITHM, SecretKey, ServerPayloadVerifiedEnvelopeKey,
+    MasterKeyProvider, OPENFHE_MAX_LANDLOCK_READ_ALLOW_ROOTS, PAYLOAD_AES_GCM_PROVIDER,
+    PAYLOAD_CLIENT_AEAD_PROVIDER, PAYLOAD_FIELD_BINDING, PAYLOAD_PRIVATE_RESULT_ORAM_PROVIDER,
+    PRIVATE_HNSW_ORAM_BINDING, PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+    PRIVATE_RESULT_ORAM_BINDING, PayloadEncryptionError, PayloadEncryptionPolicy,
+    PayloadTextEncryptor, RESOURCE_KEY_WRAP_ALGORITHM, SecretKey, ServerPayloadVerifiedEnvelopeKey,
     VECTOR_CLIENT_CKKS_PROVIDER, VECTOR_ENVELOPE_BINDING, VECTOR_OPENFHE_CKKS_PROVIDER,
     VECTOR_PRIVATE_HNSW_ORAM_PROVIDER, VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER, WrappedKeyBlob,
     client_ckks_vector_sidecar_envelope_key, client_payload_nonce_replay_key,
     client_payload_signature_key_id, private_hnsw_min_f32_node_block_bytes, rewrap_resource_key,
     validate_client_ckks_vector_payload_value_for_runtime,
-    validate_client_payload_value_for_runtime,
+    validate_client_payload_value_for_runtime, validate_openfhe_landlock_read_allow_root,
 };
 use ring::hmac;
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -402,6 +402,11 @@ const OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK: &str = "process_landlock";
 const OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK: &str = "process_pool_landlock";
 const OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS: &str = "process_landlock_netns";
 const OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS: &str = "process_pool_landlock_netns";
+const OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT: &str = "process_landlock_strict";
+const OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT: &str = "process_pool_landlock_strict";
+const OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS: &str = "process_landlock_strict_netns";
+const OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS: &str =
+    "process_pool_landlock_strict_netns";
 const OPENFHE_BACKEND_CACHE_MAX_ENTRIES: usize = 64;
 const OPENFHE_BACKEND_SIGNATURE_DOMAIN: &[u8] = b"qdrant-sec/openfhe-bridge-binary-signature/v1\0";
 const BASE64URL_NOPAD_32_BYTE_LEN: usize = 43;
@@ -2481,10 +2486,14 @@ fn openfhe_backend_from_config(
     let pool_size = match backend.kind.as_str() {
         OPENFHE_BACKEND_KIND_PROCESS_POOL
         | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS => backend.size.unwrap_or(1),
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS => backend.size.unwrap_or(1),
         OPENFHE_BACKEND_KIND_PROCESS
         | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS => 1,
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS => 1,
         kind => {
             return Err(StorageError::bad_input(format!(
                 "crypto backend {backend_name} has unsupported kind {kind}",
@@ -2496,6 +2505,11 @@ fn openfhe_backend_from_config(
             "crypto backend {backend_name} size must be at least 1",
         )));
     };
+    validate_openfhe_backend_landlock_read_allow_roots(
+        &backend.kind,
+        &backend.landlock_read_allow_roots,
+    )
+    .map_err(|reason| StorageError::bad_input(format!("crypto backend {backend_name} {reason}")))?;
     let sensitive_env_names = crypto_secret_env_names(settings);
     let cache_key = OpenFheBackendCacheKey {
         backend_name: backend_name.to_string(),
@@ -2508,6 +2522,7 @@ fn openfhe_backend_from_config(
         timeout_ms: backend.timeout_ms,
         max_output_bytes: backend.max_output_bytes,
         sensitive_env_names: sensitive_env_names.clone(),
+        landlock_read_allow_roots: backend.landlock_read_allow_roots.clone(),
     };
     if let Some(cached) = cached_openfhe_backend(&cache_key) {
         return Ok(cached);
@@ -2528,7 +2543,20 @@ fn openfhe_backend_from_config(
         command_backend = command_backend.with_max_output_bytes(max_output_bytes);
     }
     command_backend = command_backend.with_sensitive_env_names(sensitive_env_names);
-    if openfhe_backend_kind_uses_network_namespace(&backend.kind) {
+    if openfhe_backend_kind_uses_landlock_read_allow_list(&backend.kind) {
+        command_backend = command_backend
+            .with_linux_landlock_read_allow_roots(backend.landlock_read_allow_roots.iter())
+            .map_err(|_| {
+                StorageError::bad_input(format!(
+                    "crypto backend {backend_name} landlock_read_allow_roots are invalid",
+                ))
+            })?;
+        command_backend = if openfhe_backend_kind_uses_network_namespace(&backend.kind) {
+            command_backend.with_linux_landlock_strict_network_namespace_sandbox()
+        } else {
+            command_backend.with_linux_landlock_strict_sandbox()
+        };
+    } else if openfhe_backend_kind_uses_network_namespace(&backend.kind) {
         command_backend =
             command_backend.with_linux_landlock_write_deny_network_namespace_sandbox();
     } else if openfhe_backend_kind_uses_landlock(&backend.kind) {
@@ -2554,6 +2582,7 @@ struct OpenFheBackendCacheKey {
     timeout_ms: Option<u64>,
     max_output_bytes: Option<usize>,
     sensitive_env_names: Vec<String>,
+    landlock_read_allow_roots: Vec<String>,
 }
 
 impl Debug for OpenFheBackendCacheKey {
@@ -2571,6 +2600,10 @@ impl Debug for OpenFheBackendCacheKey {
             .field("size", &self.size)
             .field("timeout_ms", &self.timeout_ms)
             .field("sensitive_env_names_count", &self.sensitive_env_names.len())
+            .field(
+                "landlock_read_allow_roots_count",
+                &self.landlock_read_allow_roots.len(),
+            )
             .finish()
     }
 }
@@ -2638,6 +2671,17 @@ fn openfhe_backend_kind_uses_landlock(kind: &str) -> bool {
             | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK
             | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS
             | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS
+    ) || openfhe_backend_kind_uses_landlock_read_allow_list(kind)
+}
+
+/// The `*_landlock_strict*` kinds: write-deny plus a Landlock read/execute allow-list.
+fn openfhe_backend_kind_uses_landlock_read_allow_list(kind: &str) -> bool {
+    matches!(
+        kind,
+        OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT
+            | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT
+            | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS
+            | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS
     )
 }
 
@@ -2646,7 +2690,40 @@ fn openfhe_backend_kind_uses_network_namespace(kind: &str) -> bool {
         kind,
         OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS
             | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS
+            | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS
+            | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS
     )
+}
+
+/// `landlock_read_allow_roots` is only meaningful for the strict kinds and every entry must be
+/// an absolute, normalized path other than `/`. Returns the reason to append to the backend name.
+fn validate_openfhe_backend_landlock_read_allow_roots(
+    kind: &str,
+    roots: &[String],
+) -> Result<(), String> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    if !openfhe_backend_kind_uses_landlock_read_allow_list(kind) {
+        return Err(
+            "landlock_read_allow_roots requires a process_landlock_strict, \
+             process_pool_landlock_strict, process_landlock_strict_netns or \
+             process_pool_landlock_strict_netns kind"
+                .to_string(),
+        );
+    }
+    if roots.len() > OPENFHE_MAX_LANDLOCK_READ_ALLOW_ROOTS {
+        return Err(format!(
+            "landlock_read_allow_roots supports at most {OPENFHE_MAX_LANDLOCK_READ_ALLOW_ROOTS} entries",
+        ));
+    }
+    for root in roots {
+        validate_openfhe_landlock_read_allow_root(Path::new(root)).map_err(|_| {
+            "landlock_read_allow_roots entries must be absolute normalized paths other than /"
+                .to_string()
+        })?;
+    }
+    Ok(())
 }
 
 fn openfhe_backend_kind_requires_linux_sandbox(kind: &str) -> bool {
@@ -3198,7 +3275,7 @@ fn public_material_b64_fingerprint(value: &serde_json::Value) -> serde_json::Val
 }
 
 fn sanitized_crypto_backend_policy(backend: &CryptoBackendConfig) -> serde_json::Value {
-    json!({
+    let mut policy = json!({
         "kind": backend.kind,
         "program": backend.program,
         "checked_spawn_hardening": openfhe_checked_spawn_hardening_level(),
@@ -3211,7 +3288,12 @@ fn sanitized_crypto_backend_policy(backend: &CryptoBackendConfig) -> serde_json:
         "signature_b64": fixed_base64url_policy_fingerprint(backend.signature_b64.as_deref()),
         "size": backend.size,
         "timeout_ms": backend.timeout_ms,
-    })
+    });
+    if openfhe_backend_kind_uses_landlock_read_allow_list(&backend.kind) {
+        policy["filesystem_read_policy"] = json!("linux_landlock_read_allow_list");
+        policy["landlock_read_allow_roots"] = json!(backend.landlock_read_allow_roots);
+    }
+    policy
 }
 
 fn openfhe_checked_spawn_hardening_level() -> &'static str {
@@ -6269,6 +6351,14 @@ fn validate_backend(
     backend_name: &str,
     backend: &CryptoBackendConfig,
 ) -> Result<(), CryptoSetupError> {
+    validate_openfhe_backend_landlock_read_allow_roots(
+        &backend.kind,
+        &backend.landlock_read_allow_roots,
+    )
+    .map_err(|reason| CryptoSetupError::InvalidBackendSandbox {
+        backend: backend_name.to_string(),
+        reason,
+    })?;
     if openfhe_backend_kind_requires_linux_sandbox(&backend.kind) && !cfg!(target_os = "linux") {
         return Err(CryptoSetupError::InvalidBackendSandbox {
             backend: backend_name.to_string(),
@@ -6280,7 +6370,9 @@ fn validate_backend(
     match backend.kind.as_str() {
         OPENFHE_BACKEND_KIND_PROCESS_POOL
         | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS => {
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS => {
             if backend.size == Some(0) {
                 return Err(CryptoSetupError::InvalidBackendSize {
                     backend: backend_name.to_string(),
@@ -6290,7 +6382,9 @@ fn validate_backend(
         }
         OPENFHE_BACKEND_KIND_PROCESS
         | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS => {
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS => {
             if backend.size.is_some_and(|size| size > 1) {
                 return Err(CryptoSetupError::InvalidBackendSize {
                     backend: backend_name.to_string(),
@@ -6341,6 +6435,15 @@ fn validate_collection_runtime_backend_metadata(
     backend_name: &str,
     backend: &CryptoBackendConfig,
 ) -> Result<(), StorageError> {
+    validate_openfhe_backend_landlock_read_allow_roots(
+        &backend.kind,
+        &backend.landlock_read_allow_roots,
+    )
+    .map_err(|reason| {
+        StorageError::bad_input(format!(
+            "collection {collection_name} vector crypto instance {instance_name} backend {backend_name} {reason}",
+        ))
+    })?;
     if openfhe_backend_kind_requires_linux_sandbox(&backend.kind) && !cfg!(target_os = "linux") {
         return Err(StorageError::bad_input(format!(
             "collection {collection_name} vector crypto instance {instance_name} backend {backend_name} kind {} requires Linux Landlock/network namespace support",
@@ -6351,7 +6454,9 @@ fn validate_collection_runtime_backend_metadata(
     match backend.kind.as_str() {
         OPENFHE_BACKEND_KIND_PROCESS_POOL
         | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS => {
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS => {
             if backend.size == Some(0) {
                 return Err(StorageError::bad_input(format!(
                     "collection {collection_name} vector crypto instance {instance_name} backend {backend_name} process_pool size must be at least 1",
@@ -6360,7 +6465,9 @@ fn validate_collection_runtime_backend_metadata(
         }
         OPENFHE_BACKEND_KIND_PROCESS
         | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK
-        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS => {
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_NETNS
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT
+        | OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS => {
             if backend.size.is_some_and(|size| size > 1) {
                 return Err(StorageError::bad_input(format!(
                     "collection {collection_name} vector crypto instance {instance_name} backend {backend_name} process size must be omitted or 1",
@@ -10692,6 +10799,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             )]),
         };
@@ -12159,6 +12267,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             )]),
         };
@@ -12913,6 +13022,7 @@ mod tests {
                 size: None,
                 timeout_ms: None,
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         );
         assert!(matches!(
@@ -13250,6 +13360,7 @@ mod tests {
                     size: None,
                     timeout_ms: Some(1000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             )]),
         };
@@ -13392,6 +13503,7 @@ mod tests {
                     size: None,
                     timeout_ms: Some(1000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             )]),
         };
@@ -14575,6 +14687,7 @@ mod tests {
                         size: Some(2),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
                 ..CryptoSettings::default()
@@ -14801,6 +14914,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
                 ..CryptoSettings::default()
@@ -17483,6 +17597,7 @@ mod tests {
                     size: Some(4),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::MissingBackendProgram {
@@ -17503,6 +17618,7 @@ mod tests {
                     size: Some(4),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendProgram {
@@ -17523,6 +17639,7 @@ mod tests {
                     size: None,
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::UnsupportedBackendKind {
@@ -17630,6 +17747,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Ok(()),
@@ -17647,6 +17765,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::MissingBackendSha256Pin {
@@ -17666,6 +17785,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendProgram { .. }),
@@ -17707,6 +17827,7 @@ mod tests {
                     size: Some(1),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendProgram { .. }),
@@ -17729,6 +17850,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         )
         .expect("matching Ed25519 bridge signature must validate");
@@ -17756,6 +17878,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         )
         .expect_err("bridge signature validation must not bypass the sha256 program pin");
@@ -17827,6 +17950,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         );
         let pool_result = validate_backend(
@@ -17840,6 +17964,7 @@ mod tests {
                 size: Some(2),
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         );
         let process_netns_result = validate_backend(
@@ -17853,6 +17978,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         );
         let pool_netns_result = validate_backend(
@@ -17866,6 +17992,7 @@ mod tests {
                 size: Some(2),
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         );
 
@@ -17894,6 +18021,203 @@ mod tests {
         }
     }
 
+    fn landlock_strict_backend_config(
+        kind: &str,
+        program: String,
+        sha256_b64: String,
+        size: Option<usize>,
+        roots: &[&str],
+    ) -> CryptoBackendConfig {
+        CryptoBackendConfig {
+            kind: kind.to_string(),
+            program: Some(program),
+            sha256_b64: Some(sha256_b64),
+            signature_public_key_b64: None,
+            signature_b64: None,
+            size,
+            timeout_ms: Some(5_000),
+            max_output_bytes: None,
+            landlock_read_allow_roots: roots.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_backend_accepts_landlock_strict_process_kinds() {
+        let (_dir, program, sha256_b64) = test_bridge_program();
+        for (kind, size) in [
+            (OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT, None),
+            (OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT, Some(2)),
+            (OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS, None),
+            (
+                OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS,
+                Some(2),
+            ),
+        ] {
+            let result = validate_backend(
+                "openfhe_local",
+                &landlock_strict_backend_config(
+                    kind,
+                    program.clone(),
+                    sha256_b64.clone(),
+                    size,
+                    &["/opt/openfhe", "/usr/share/openfhe-data"],
+                ),
+            );
+            if cfg!(target_os = "linux") {
+                assert_eq!(result, Ok(()), "{kind}");
+            } else {
+                assert!(
+                    matches!(result, Err(CryptoSetupError::InvalidBackendSandbox { .. })),
+                    "{kind}: {result:?}"
+                );
+            }
+            assert!(openfhe_backend_kind_uses_landlock(kind));
+            assert!(openfhe_backend_kind_uses_landlock_read_allow_list(kind));
+            assert_eq!(
+                openfhe_backend_kind_uses_network_namespace(kind),
+                kind.ends_with("_netns")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_backend_rejects_landlock_read_allow_roots_for_non_strict_kinds() {
+        let (_dir, program, sha256_b64) = test_bridge_program();
+        for kind in [
+            OPENFHE_BACKEND_KIND_PROCESS,
+            OPENFHE_BACKEND_KIND_PROCESS_POOL,
+            OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK,
+            OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS,
+        ] {
+            let result = validate_backend(
+                "openfhe_local",
+                &landlock_strict_backend_config(
+                    kind,
+                    program.clone(),
+                    sha256_b64.clone(),
+                    None,
+                    &["/opt/openfhe"],
+                ),
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(CryptoSetupError::InvalidBackendSandbox { reason, .. })
+                        if reason.contains("landlock_read_allow_roots requires")
+                ),
+                "{kind}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_backend_rejects_unnormalized_landlock_read_allow_roots() {
+        let (_dir, program, sha256_b64) = test_bridge_program();
+        for root in [
+            "relative/dir",
+            "/",
+            "/opt/../etc",
+            "/opt/",
+            "/opt/./openfhe",
+            "",
+        ] {
+            let result = validate_backend(
+                "openfhe_local",
+                &landlock_strict_backend_config(
+                    OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT,
+                    program.clone(),
+                    sha256_b64.clone(),
+                    None,
+                    &[root],
+                ),
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(CryptoSetupError::InvalidBackendSandbox { reason, .. })
+                        if reason.contains("landlock_read_allow_roots entries")
+                ),
+                "{root:?}: {result:?}"
+            );
+        }
+
+        let too_many: Vec<String> = (0..=OPENFHE_MAX_LANDLOCK_READ_ALLOW_ROOTS)
+            .map(|index| format!("/opt/openfhe-{index}"))
+            .collect();
+        let too_many_refs: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        let result = validate_backend(
+            "openfhe_local",
+            &landlock_strict_backend_config(
+                OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT,
+                program,
+                sha256_b64,
+                None,
+                &too_many_refs,
+            ),
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(CryptoSetupError::InvalidBackendSandbox { reason, .. })
+                    if reason.contains("at most")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn sanitized_backend_policy_fingerprints_landlock_read_allow_roots_for_strict_kinds() {
+        let strict = landlock_strict_backend_config(
+            OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS,
+            "/usr/local/bin/openfhe-bridge".to_string(),
+            "sha256".to_string(),
+            Some(2),
+            &["/opt/openfhe"],
+        );
+        let strict_policy = serde_json::to_string(&sanitized_crypto_backend_policy(&strict))
+            .expect("strict backend policy must serialize");
+        assert!(
+            strict_policy.contains("linux_landlock_read_allow_list"),
+            "{strict_policy}"
+        );
+        assert!(
+            strict_policy.contains("linux_landlock_write_deny"),
+            "{strict_policy}"
+        );
+        assert!(
+            strict_policy.contains("linux_network_namespace_isolated"),
+            "{strict_policy}"
+        );
+        assert!(strict_policy.contains("/opt/openfhe"), "{strict_policy}");
+
+        let mut other_roots = strict.clone();
+        other_roots.landlock_read_allow_roots = vec!["/opt/other".to_string()];
+        assert_ne!(
+            sanitized_crypto_backend_policy(&strict),
+            sanitized_crypto_backend_policy(&other_roots),
+            "read roots are part of the parity fingerprint"
+        );
+
+        let write_deny = landlock_strict_backend_config(
+            OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS,
+            "/usr/local/bin/openfhe-bridge".to_string(),
+            "sha256".to_string(),
+            Some(2),
+            &[],
+        );
+        let write_deny_policy =
+            serde_json::to_string(&sanitized_crypto_backend_policy(&write_deny))
+                .expect("write-deny backend policy must serialize");
+        assert!(
+            !write_deny_policy.contains("filesystem_read_policy"),
+            "non-strict kinds keep their existing fingerprint view: {write_deny_policy}"
+        );
+        assert!(
+            !write_deny_policy.contains("landlock_read_allow_roots"),
+            "{write_deny_policy}"
+        );
+    }
+
     #[test]
     fn openfhe_backend_factory_requires_bridge_sha256_pin() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -17909,6 +18233,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &CryptoSettings::default(),
         )
@@ -17936,6 +18261,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &CryptoSettings::default(),
         )
@@ -17966,6 +18292,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &CryptoSettings::default(),
         )
@@ -17999,6 +18326,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
         )
         .expect_err("collection runtime validation must reject invalid bridge signature policy");
@@ -18062,6 +18390,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &settings,
         )
@@ -18084,6 +18413,7 @@ mod tests {
             timeout_ms: Some(5_000),
             sensitive_env_names: vec![format!("ENV_{sentinel}")],
             max_output_bytes: None,
+            landlock_read_allow_roots: Vec::new(),
         };
         let rendered = format!("{cache_key:?}");
 
@@ -18112,6 +18442,7 @@ mod tests {
             size: Some(2),
             timeout_ms: Some(5_000),
             max_output_bytes: None,
+            landlock_read_allow_roots: Vec::new(),
         };
         let settings = CryptoSettings::default();
 
@@ -18167,6 +18498,7 @@ mod tests {
             size: Some(2),
             timeout_ms: Some(timeout_ms),
             max_output_bytes: None,
+            landlock_read_allow_roots: Vec::new(),
         };
 
         openfhe_backend_from_config("openfhe_backend_0", &backend_config(5_000), &settings)
@@ -18234,6 +18566,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &CryptoSettings::default(),
         );
@@ -18243,6 +18576,50 @@ mod tests {
             assert!(format!("{backend:?}").contains("LinuxLandlockWriteDeny"));
         } else {
             assert!(matches!(backend_result, Err(StorageError::BadInput { .. })));
+        }
+    }
+
+    #[test]
+    fn openfhe_backend_factory_enables_landlock_strict_sandbox_kinds() {
+        let _guard = openfhe_backend_factory_test_guard();
+        clear_openfhe_backend_cache_for_tests();
+        let (_dir, program, sha256_b64) = test_bridge_program();
+        for (kind, expected_sandbox) in [
+            (
+                OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT,
+                "sandbox: LinuxLandlockStrict,",
+            ),
+            (
+                OPENFHE_BACKEND_KIND_PROCESS_LANDLOCK_STRICT_NETNS,
+                "sandbox: LinuxLandlockStrictNetworkNamespace,",
+            ),
+        ] {
+            let backend_result = openfhe_backend_from_config(
+                "openfhe_local",
+                &landlock_strict_backend_config(
+                    kind,
+                    program.clone(),
+                    sha256_b64.clone(),
+                    None,
+                    &["/opt/openfhe"],
+                ),
+                &CryptoSettings::default(),
+            );
+
+            if cfg!(target_os = "linux") {
+                let backend = backend_result.unwrap();
+                let rendered = format!("{backend:?}");
+                assert!(rendered.contains(expected_sandbox), "{kind}: {rendered}");
+                assert!(
+                    rendered.contains("landlock_read_allow_roots_count: 1"),
+                    "{kind}: {rendered}"
+                );
+            } else {
+                assert!(
+                    matches!(backend_result, Err(StorageError::BadInput { .. })),
+                    "{kind}: {backend_result:?}"
+                );
+            }
         }
     }
 
@@ -18262,6 +18639,7 @@ mod tests {
                 size: None,
                 timeout_ms: Some(5_000),
                 max_output_bytes: None,
+                landlock_read_allow_roots: Vec::new(),
             },
             &CryptoSettings::default(),
         );
@@ -18288,6 +18666,7 @@ mod tests {
                     size: Some(0),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendSize {
@@ -18308,6 +18687,7 @@ mod tests {
                     size: Some(2),
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendSize {
@@ -18333,6 +18713,7 @@ mod tests {
                     size: None,
                     timeout_ms: Some(0),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             ),
             Err(CryptoSetupError::InvalidBackendTimeout {
@@ -20219,6 +20600,7 @@ mod tests {
                         size: None,
                         timeout_ms: None,
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
                 allow_inline_key_material: true,
@@ -21456,6 +21838,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -21879,6 +22262,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -22619,6 +23003,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -22799,6 +23184,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -22884,6 +23270,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -23310,6 +23697,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -25057,6 +25445,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -25138,6 +25527,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -25222,6 +25612,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -25306,6 +25697,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },
@@ -25376,6 +25768,7 @@ mod tests {
                         size: Some(1),
                         timeout_ms: Some(5_000),
                         max_output_bytes: None,
+                        landlock_read_allow_roots: Vec::new(),
                     },
                 )]),
             },

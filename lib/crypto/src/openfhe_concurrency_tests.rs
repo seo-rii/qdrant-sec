@@ -236,7 +236,9 @@ fn stalled_bridge_times_out_and_is_replaced_for_every_caller() {
     );
 
     let first = backend.worker_process().unwrap();
-    let first_ptr = Arc::as_ptr(first.worker());
+    // Keep the stalled worker alive so a replacement cannot reuse its address and alias the
+    // pointer comparison below.
+    let first_worker = Arc::clone(first.worker());
     drop(first);
 
     let started = Instant::now();
@@ -278,7 +280,7 @@ fn stalled_bridge_times_out_and_is_replaced_for_every_caller() {
     assert_eq!(backend.spawning.load(Ordering::SeqCst), 0);
     let replacement = backend.worker_process().unwrap();
     assert!(
-        !std::ptr::eq(Arc::as_ptr(replacement.worker()), first_ptr),
+        !Arc::ptr_eq(replacement.worker(), &first_worker),
         "the stalled worker must not be handed out again"
     );
     assert!(live_worker_count(&backend) <= 1);

@@ -1597,6 +1597,169 @@ print('{{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext
     );
 }
 
+/// Runs a python bridge under the strict Landlock sandbox that probes a secret file, a directory
+/// listing and file creation inside the test directory. With `allow_test_dir` the directory is a
+/// configured read root and the reads must succeed; otherwise every read must be denied. File
+/// creation must always be denied.
+#[cfg(target_os = "linux")]
+fn run_landlock_strict_probe(allow_test_dir: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::Builder::new()
+        .prefix("openfhe-landlock-strict")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let secret_path = dir.path().join("storage-secret");
+    fs::write(&secret_path, "resource-key-material").unwrap();
+    let denied_path = dir.path().join("bridge-created-file");
+    let script_path = dir.path().join("checked-openfhe-bridge.sh");
+    fs::write(
+        &script_path,
+        format!(
+            r#"#!/usr/bin/env python3
+import os
+import sys
+
+expect_allowed = {expect_allowed}
+
+def check(label, action):
+    try:
+        action()
+    except PermissionError:
+        if expect_allowed:
+            print(label + " was denied although the directory is an allowed read root", file=sys.stderr)
+            raise SystemExit(31)
+    else:
+        if not expect_allowed:
+            print(label + " was not denied by the strict Landlock sandbox", file=sys.stderr)
+            raise SystemExit(32)
+
+check("secret read", lambda: open({secret_path:?}, "r", encoding="utf-8").read())
+check("directory listing", lambda: os.listdir({dir_path:?}))
+try:
+    open({denied_path:?}, "w", encoding="utf-8").close()
+except PermissionError:
+    pass
+else:
+    print("file creation was not denied by the strict Landlock sandbox", file=sys.stderr)
+    raise SystemExit(33)
+
+sys.stdin.readline()
+print('{{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext":"b3BlbmZoZS1jaXBoZXI"}}', flush=True)
+"#,
+            expect_allowed = if allow_test_dir { "True" } else { "False" },
+            secret_path = secret_path.to_string_lossy(),
+            dir_path = dir.path().to_string_lossy(),
+            denied_path = denied_path.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let read_roots: Vec<PathBuf> = if allow_test_dir {
+        vec![dir.path().to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    let backend = CommandOpenFheBackend::new_checked(&script_path)
+        .unwrap()
+        .with_linux_landlock_read_allow_roots(read_roots)
+        .unwrap()
+        .with_linux_landlock_strict_sandbox();
+    let encryptor = test_ckks_encryptor(
+        "tenant-a:ckks",
+        "embedding",
+        CkksParameters::openfhe_default_128_bit(),
+        SecretKey::from_bytes([29u8; 32]),
+        backend,
+    )
+    .unwrap();
+
+    let encrypted = encryptor
+        .encrypt("docs", "point-1", &public_material(), &[1.0])
+        .unwrap_or_else(|err| {
+            panic!("strict Landlock bridge probe failed (allow_test_dir={allow_test_dir}): {err}")
+        });
+    assert_eq!(encrypted.version, 1);
+    assert!(
+        !denied_path.exists(),
+        "strict Landlock sandbox must prevent bridge-created files"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_openfhe_backend_landlock_strict_sandbox_denies_reads_outside_the_allow_list() {
+    if !linux_landlock_write_deny_supported_for_test() {
+        eprintln!("skipping strict Landlock bridge sandbox test: kernel does not support Landlock");
+        return;
+    }
+    run_landlock_strict_probe(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_openfhe_backend_landlock_strict_sandbox_allows_configured_read_roots() {
+    if !linux_landlock_write_deny_supported_for_test() {
+        eprintln!("skipping strict Landlock bridge sandbox test: kernel does not support Landlock");
+        return;
+    }
+    run_landlock_strict_probe(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_openfhe_backend_landlock_strict_sandbox_fails_closed_for_missing_read_roots() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !linux_landlock_write_deny_supported_for_test() {
+        eprintln!("skipping strict Landlock bridge sandbox test: kernel does not support Landlock");
+        return;
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix("openfhe-landlock-strict-missing")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let script_path = dir.path().join("checked-openfhe-bridge.sh");
+    fs::write(
+        &script_path,
+        r#"#!/usr/bin/env python3
+import sys
+sys.stdin.readline()
+print('{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext":"b3BlbmZoZS1jaXBoZXI"}', flush=True)
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let backend = CommandOpenFheBackend::new_checked(&script_path)
+        .unwrap()
+        .with_linux_landlock_read_allow_roots([dir.path().join("missing-read-root")])
+        .unwrap()
+        .with_linux_landlock_strict_sandbox();
+    let encryptor = test_ckks_encryptor(
+        "tenant-a:ckks",
+        "embedding",
+        CkksParameters::openfhe_default_128_bit(),
+        SecretKey::from_bytes([29u8; 32]),
+        backend,
+    )
+    .unwrap();
+
+    let err = encryptor
+        .encrypt("docs", "point-1", &public_material(), &[1.0])
+        .expect_err("a configured read root that does not exist must fail the spawn closed");
+    assert!(
+        err.to_string().contains("failed to start OpenFHE bridge"),
+        "{err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn command_openfhe_backend_uses_bridge_protocol() {

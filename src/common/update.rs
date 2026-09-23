@@ -3847,6 +3847,7 @@ esac
                     size: None,
                     timeout_ms: Some(5_000),
                     max_output_bytes: None,
+                    landlock_read_allow_roots: Vec::new(),
                 },
             )]),
         };

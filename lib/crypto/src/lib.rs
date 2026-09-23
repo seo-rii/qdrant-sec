@@ -50,7 +50,10 @@ pub use control_plane::{
     VECTOR_CLIENT_CKKS_PROVIDER, VECTOR_ENVELOPE_BINDING, VECTOR_OPENFHE_CKKS_PROVIDER,
     VECTOR_PRIVATE_HNSW_ORAM_PROVIDER, VectorProviderFactory,
 };
-pub use openfhe::CommandOpenFheBackend;
+pub use openfhe::{
+    CommandOpenFheBackend, MAX_LANDLOCK_READ_ALLOW_ROOTS as OPENFHE_MAX_LANDLOCK_READ_ALLOW_ROOTS,
+    validate_landlock_read_allow_root as validate_openfhe_landlock_read_allow_root,
+};
 pub use payload::{
     CLIENT_ENCRYPTED_PAYLOAD_MARKER, ClientPayloadEnvelopeKey, ClientPayloadNonceReplayKey,
     ClientPayloadSignatureVerification, ClientPayloadValidationContext,
