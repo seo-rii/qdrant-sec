@@ -1305,17 +1305,14 @@ fn validate_private_hnsw_oram_bucket_ciphertext_fixed_size(
     Ok(())
 }
 
+/// Pre-decode ceiling for uploaded and written-back bucket ciphertexts. Every bucket must have
+/// exactly the fixed size, so the ceiling is that size: the former `bucket_size * block_size +
+/// 4096` heuristic fell below the fixed size for `bucket_size > 4053` and rejected every
+/// well-formed bucket of such a layout.
 fn private_hnsw_oram_upload_max_ciphertext_bytes(
     manifest: &PrivateHnswOramManifest,
 ) -> Result<usize, PrivateHnswOramError> {
-    let block_size = usize::try_from(manifest.oram.block_size_bytes)
-        .map_err(|_| PrivateHnswOramError::InvalidManifestField("block_size_bytes"))?;
-    let bucket_size = usize::try_from(manifest.oram.bucket_size)
-        .map_err(|_| PrivateHnswOramError::InvalidManifestField("bucket_size"))?;
-    block_size
-        .checked_mul(bucket_size)
-        .and_then(|size| size.checked_add(4096))
-        .ok_or(PrivateHnswOramError::InvalidManifestField("oram"))
+    private_hnsw_oram_bucket_ciphertext_bytes(&manifest.oram)
 }
 
 pub fn private_hnsw_oram_bucket_commitment(
@@ -2206,6 +2203,25 @@ mod tests {
             private_hnsw_oram_bucket_ciphertext_bytes(&manifest.oram).unwrap(),
             1 + 12 + 16 + 4 + 2 + 4 + 4 + 4 * (1 + 8192)
         );
+    }
+
+    #[test]
+    fn upload_ciphertext_ceiling_is_the_fixed_bucket_size_for_every_layout() {
+        let mut manifest = fixture_manifest();
+        for bucket_size in [1u32, 4, 4053, 4054, 8192] {
+            manifest.oram.bucket_size = bucket_size;
+            let fixed = private_hnsw_oram_bucket_ciphertext_bytes(&manifest.oram).unwrap();
+            assert_eq!(
+                private_hnsw_oram_upload_max_ciphertext_bytes(&manifest).unwrap(),
+                fixed,
+                "bucket_size {bucket_size}"
+            );
+        }
+        // The former heuristic (`bucket_size * block_size + 4096`) undercut the fixed size for
+        // wide buckets and rejected every well-formed bucket of such a layout.
+        manifest.oram.bucket_size = 4054;
+        let fixed = private_hnsw_oram_bucket_ciphertext_bytes(&manifest.oram).unwrap();
+        assert!(fixed > 4054 * manifest.oram.block_size_bytes as usize + 4096);
     }
 
     #[test]

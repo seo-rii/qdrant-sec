@@ -3720,18 +3720,13 @@ fn ensure_private_hnsw_read_proof_matches_buckets(
     Ok(())
 }
 
+/// Pre-decode ceiling for bucket ciphertexts: buckets have exactly the fixed ciphertext size,
+/// so the ceiling is that size (the former `block_size * bucket_size + 4096` heuristic fell
+/// below it for `bucket_size > 4053`).
 pub(crate) fn max_bucket_ciphertext_bytes(
     manifest: &PrivateHnswOramManifest,
 ) -> StorageResult<usize> {
-    let block_size = usize::try_from(manifest.oram.block_size_bytes).map_err(|_| {
-        StorageError::bad_request("private HNSW ORAM block_size_bytes exceeds usize")
-    })?;
-    let bucket_size = usize::try_from(manifest.oram.bucket_size)
-        .map_err(|_| StorageError::bad_request("private HNSW ORAM bucket_size exceeds usize"))?;
-    block_size
-        .checked_mul(bucket_size)
-        .and_then(|size| size.checked_add(4096))
-        .ok_or_else(|| StorageError::bad_request("private HNSW ORAM bucket size overflows"))
+    expected_bucket_ciphertext_bytes(manifest)
 }
 
 fn expected_bucket_ciphertext_bytes(manifest: &PrivateHnswOramManifest) -> StorageResult<usize> {
