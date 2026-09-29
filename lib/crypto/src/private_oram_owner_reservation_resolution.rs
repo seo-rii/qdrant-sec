@@ -669,6 +669,12 @@ fn decode_base64_exact(
     expected_len: usize,
     field: &'static str,
 ) -> Result<Vec<u8>, PrivateOramOwnerReservationResolutionError> {
+    // Encoded length first, so an oversized field is refused before any decoding.
+    if value.len() != BASE64URL_NOPAD.encode_len(expected_len) {
+        return Err(PrivateOramOwnerReservationResolutionError::InvalidField(
+            field,
+        ));
+    }
     let decoded = BASE64URL_NOPAD
         .decode(value.as_bytes())
         .map_err(|_| PrivateOramOwnerReservationResolutionError::InvalidField(field))?;

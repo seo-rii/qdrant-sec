@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    PrivateOramConsensusConfigurationV1, PrivateOramPeerActivationChallengeV1,
-    PrivateOramPeerActivationSignedAckV1, VerifiedSignedPrivateOramActivationAuthorityManifestV1,
+    PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION, PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+    PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION_V2, PrivateOramConsensusConfigurationV1,
+    PrivateOramPeerActivationChallengeV1, PrivateOramPeerActivationSignedAckV1,
+    VerifiedSignedPrivateOramActivationAuthorityManifestV1,
     private_oram_activation_signer_from_signed_manifest_for_challenge_v1,
     private_oram_consensus_configuration_member_ids_v1,
     try_private_oram_consensus_configuration_digest_v1,
@@ -334,7 +336,12 @@ pub fn validate_private_oram_mixed_version_activation_proof_v1<'a>(
     let configuration_digest =
         try_private_oram_consensus_configuration_digest_v1(&proof.configuration)
             .map_err(|_| PrivateOramMixedVersionActivationError::InvalidProof)?;
+    // The wire-protocol floor a proof may install is bounded explicitly, so a legacy (V1)
+    // challenge set can never lower it to 0 even if the log-position invariants below change.
     if proof.configuration_digest != configuration_digest
+        || !(PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION
+            ..=PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION)
+            .contains(&proof.required_consensus_wire_protocol)
         || proof.activation_generation == 0
         || proof.membership_generation == 0
         || proof.coordinator_peer_id == 0
@@ -370,7 +377,8 @@ pub fn validate_private_oram_mixed_version_activation_proof_v1<'a>(
         let challenge = &item.challenge;
         validate_private_oram_peer_activation_challenge_v1_shape(challenge)
             .map_err(|_| PrivateOramMixedVersionActivationError::InvalidAcknowledgement)?;
-        if challenge.target_peer_id != *member
+        if challenge.protocol_version != PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION_V2
+            || challenge.target_peer_id != *member
             || challenge.activation_id != proof.activation_id
             || challenge.activation_generation != proof.activation_generation
             || challenge.membership_generation != proof.membership_generation
@@ -795,6 +803,26 @@ mod tests {
             validate_private_oram_mixed_version_activation_proof_v1(&missing, &authority, &uris,)
                 .unwrap_err(),
             PrivateOramMixedVersionActivationError::InvalidEvidenceSet
+        );
+
+        // A proof can never install a wire-protocol floor outside the supported range, and
+        // only V2 challenges (which carry that floor) may back a proof.
+        let mut downgraded = proof.clone();
+        downgraded.required_consensus_wire_protocol = 0;
+        assert!(
+            validate_private_oram_mixed_version_activation_proof_v1(&downgraded, &authority, &uris)
+                .is_err()
+        );
+        let mut legacy_challenge = proof.clone();
+        legacy_challenge.evidence[0].challenge.protocol_version =
+            crate::PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION_V1;
+        assert!(
+            validate_private_oram_mixed_version_activation_proof_v1(
+                &legacy_challenge,
+                &authority,
+                &uris
+            )
+            .is_err()
         );
     }
 

@@ -1115,25 +1115,15 @@ fn decode_base64url_exact<const N: usize>(
         .map_err(|_| PrivateOramPeerRecoveryError::InvalidField(field))
 }
 
+/// Public keys and signatures follow the same length-then-decode-then-re-encode rule as every
+/// other fixed-size field, so one canonical string maps to one byte string everywhere.
 fn decode_public_key(value: &str) -> Result<[u8; 32], PrivateOramPeerRecoveryError> {
-    if value.len() != BASE64URL_NOPAD_32_BYTE_LEN {
-        return Err(PrivateOramPeerRecoveryError::MalformedPublicKey);
-    }
-    BASE64URL_NOPAD
-        .decode(value.as_bytes())
-        .map_err(|_| PrivateOramPeerRecoveryError::MalformedPublicKey)?
-        .try_into()
+    decode_base64url_exact::<32>(value, BASE64URL_NOPAD_32_BYTE_LEN, "public_key")
         .map_err(|_| PrivateOramPeerRecoveryError::MalformedPublicKey)
 }
 
 fn decode_signature(value: &str) -> Result<[u8; 64], PrivateOramPeerRecoveryError> {
-    if value.len() != BASE64URL_NOPAD_64_BYTE_LEN {
-        return Err(PrivateOramPeerRecoveryError::MalformedSignature);
-    }
-    BASE64URL_NOPAD
-        .decode(value.as_bytes())
-        .map_err(|_| PrivateOramPeerRecoveryError::MalformedSignature)?
-        .try_into()
+    decode_base64url_exact::<64>(value, BASE64URL_NOPAD_64_BYTE_LEN, "signature")
         .map_err(|_| PrivateOramPeerRecoveryError::MalformedSignature)
 }
 

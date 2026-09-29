@@ -498,12 +498,15 @@ pub(crate) fn private_oram_activation_uri_digest(uri: &http::Uri) -> Result<Stri
     {
         return Err(());
     }
-    let host = uri.host().ok_or(())?;
+    // Host names are case-insensitive and `http::Uri` preserves the configured case, so the
+    // canonical (lowercase) form is what gets pinned; bracketed IPv6 literals are handled by
+    // the digest function.
+    let host = uri.host().ok_or(())?.to_ascii_lowercase();
     let port = uri.port_u16().unwrap_or(match scheme {
         PrivateOramActivationPeerUriSchemeV1::Http => 80,
         PrivateOramActivationPeerUriSchemeV1::Https => 443,
     });
-    try_private_oram_activation_peer_uri_digest_v1(scheme, host, port).map_err(|_| ())
+    try_private_oram_activation_peer_uri_digest_v1(scheme, &host, port).map_err(|_| ())
 }
 
 fn private_oram_activation_history_and_group_digests(

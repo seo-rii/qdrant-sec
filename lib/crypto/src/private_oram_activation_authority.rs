@@ -505,6 +505,27 @@ pub fn try_private_oram_activation_peer_uri_digest_v1(
     canonical_host: &str,
     port: u16,
 ) -> Result<String, PrivateOramActivationAuthorityError> {
+    // URI parsers present IPv6 literals in bracketed form (`[::1]`); the digest covers the bare
+    // canonical address so a pin does not depend on the parser's presentation. Brackets around
+    // anything but a canonical IPv6 address are refused.
+    let canonical_host = match canonical_host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(inner)
+            if inner
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|address| address.to_string() == inner) =>
+        {
+            inner
+        }
+        Some(_) => {
+            return Err(PrivateOramActivationAuthorityError::InvalidField(
+                "canonical_peer_host",
+            ));
+        }
+        None => canonical_host,
+    };
     if !is_canonical_peer_host(canonical_host) {
         return Err(PrivateOramActivationAuthorityError::InvalidField(
             "canonical_peer_host",
@@ -2041,14 +2062,40 @@ mod tests {
         .unwrap();
         assert_ne!(http, https);
         assert_ne!(http, other_port);
-        assert!(
+        let bare_ipv6 = try_private_oram_activation_peer_uri_digest_v1(
+            PrivateOramActivationPeerUriSchemeV1::Https,
+            "::1",
+            6335,
+        )
+        .unwrap();
+        // `http::Uri::host()` yields the bracketed form; it must pin the same digest.
+        assert_eq!(
             try_private_oram_activation_peer_uri_digest_v1(
                 PrivateOramActivationPeerUriSchemeV1::Https,
-                "::1",
+                "[::1]",
                 6335,
             )
-            .is_ok()
+            .unwrap(),
+            bare_ipv6
         );
+        for bracketed in [
+            "[127.0.0.1]",
+            "[::1",
+            "::1]",
+            "[::01]",
+            "[node.internal]",
+            "[]",
+        ] {
+            assert!(
+                try_private_oram_activation_peer_uri_digest_v1(
+                    PrivateOramActivationPeerUriSchemeV1::Https,
+                    bracketed,
+                    6335,
+                )
+                .is_err(),
+                "{bracketed}"
+            );
+        }
         for host in [
             "NODE.internal",
             "node name",
