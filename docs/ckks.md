@@ -4998,6 +4998,52 @@ Known remaining limitations added by this pass:
 - The install response path hashes the receipt before verifying the
   signature (receipt capped at 64 KiB); empty shard keywords are accepted by
   the staging validator; staged frames are re-encoded up to three times.
+
+### Tenth pass: activation authority, mixed-version activation, peer recovery and reservation audits
+
+This pass audited the signed activation registry and its transitions, the
+mixed-version activation proof, the peer recovery request/response/adoption
+flows and the owner reservation resolution receipts. No High or Medium
+findings. Fixed:
+
+- IPv6 clusters could never pin or activate: the peer URI digest accepted an
+  IPv6 literal only in bare form while the production URI parser presents
+  it bracketed (`[fd00::11]`), so every activation path failed closed for
+  such peers. Bracketed canonical IPv6 literals now hash to the same digest
+  as the bare form (other brackets are refused), and the storage caller
+  lowercases the configured host so DNS names keep their case-insensitive
+  meaning. Existing IPv4 and hostname pins are unchanged.
+- The mixed-version activation proof validator now checks explicitly that
+  every backing challenge is a V2 challenge and that the wire-protocol floor
+  it installs lies within the supported range, instead of relying on the
+  log-position equality invariants to exclude a legacy (V1) proof that
+  would install floor 0.
+- Peer recovery public keys and signatures, and reservation resolution
+  fixed-size fields, use the same length-then-decode-then-re-encode rule as
+  every other fixed-size field (previously two decoders skipped the
+  re-encode check and one decoded before checking the encoded length; both
+  fail-closed, aligned for consistency).
+
+Checked and left as is: manifest signature coverage and parent chaining,
+registry rollback rules (consecutive generations, immutable identity, peers
+never removed or re-keyed), peer pin uniqueness and ordering, challenge
+resolver context binding, proof unanimity and per-peer ack verification,
+key-id-to-key-bytes binding, role separation and peer id 0 rejection,
+terminal evidence and receipt digests covering every field, and the
+context comparisons the three receipt consumers perform.
+
+Known remaining limitations added by this pass:
+
+- The activation registry accepts only consecutive generation transitions
+  and the anchored check at load is self-referential by design, so a peer
+  that falls more than one generation behind must be stepped through each
+  generation by the operator.
+- The peer recovery terminal-evidence digest hashes its domain string
+  without a length prefix (a constant, so unambiguous); changing it is a
+  wire-format bump.
+- Reservation resolution receipts are checked against their context by
+  three callers with hand-written comparisons rather than one shared
+  validator.
 - Padding and deleted steps of an HNSW search skip the distance and
   candidate bookkeeping, so per-step latency differs slightly from real
   steps; computing the distance regardless would make the work
