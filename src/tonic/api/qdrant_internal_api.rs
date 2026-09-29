@@ -153,6 +153,13 @@ const PRIVATE_ORAM_RESUME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(6
 const PRIVATE_ORAM_ACTIVATION_ACK_MAX_JSON_BYTES: usize = 64 * 1024;
 const PRIVATE_ORAM_ACTIVATION_ACK_CACHE_MAX_ENTRIES: usize = 4096;
 const PRIVATE_ORAM_ACTIVATION_ACK_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Cached owner capsule install responses; each entry can hold a full receipt response, so the
+/// cache is kept small.
+const PRIVATE_ORAM_INSTALL_RECEIPT_CACHE_MAX_ENTRIES: usize = 64;
+const PRIVATE_ORAM_ACTIVATION_ACK_NONCE_REUSED: &str =
+    "private ORAM activation challenge nonce was reused";
+const PRIVATE_ORAM_INSTALL_NONCE_REUSED: &str =
+    "private ORAM owner capsule install challenge nonce was reused";
 const PRIVATE_ORAM_OWNER_RECOVERY_MAX_JSON_BYTES: usize = 64 * 1024;
 const PRIVATE_ORAM_OWNER_RESERVATION_PREPARE_MAX_JSON_BYTES: usize = 128 * 1024;
 
@@ -178,46 +185,51 @@ where
     Ok(decoded)
 }
 
-struct PrivateOramActivationAckCacheEntry {
-    challenge_digest: [u8; 32],
-    signed_ack_canonical_json: Vec<u8>,
+struct PrivateOramNonceResponseCacheEntry {
+    request_digest: [u8; 32],
+    response: Vec<u8>,
     expires_at: Instant,
 }
 
-#[derive(Default)]
-struct PrivateOramActivationAckCache {
-    entries: HashMap<String, PrivateOramActivationAckCacheEntry>,
+/// Bounded, expiring map from a request nonce to the response it produced. A repeated nonce with
+/// the same request digest is answered from the cache (idempotent retry); a repeated nonce with a
+/// different digest is refused, so a captured nonce cannot be attached to new content.
+struct PrivateOramNonceResponseCache {
+    entries: HashMap<String, PrivateOramNonceResponseCacheEntry>,
     order: VecDeque<String>,
+    max_entries: usize,
+    reused_message: &'static str,
 }
 
-impl PrivateOramActivationAckCache {
+impl PrivateOramNonceResponseCache {
+    fn new(max_entries: usize, reused_message: &'static str) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+            reused_message,
+        }
+    }
+
     fn lookup(
         &mut self,
         nonce: &str,
-        challenge_digest: [u8; 32],
+        request_digest: [u8; 32],
         now: Instant,
     ) -> Result<Option<Vec<u8>>, Status> {
         self.prune(now);
         let Some(entry) = self.entries.get(nonce) else {
             return Ok(None);
         };
-        if entry.challenge_digest != challenge_digest {
-            return Err(Status::invalid_argument(
-                "private ORAM activation challenge nonce was reused",
-            ));
+        if entry.request_digest != request_digest {
+            return Err(Status::invalid_argument(self.reused_message));
         }
-        Ok(Some(entry.signed_ack_canonical_json.clone()))
+        Ok(Some(entry.response.clone()))
     }
 
-    fn insert(
-        &mut self,
-        nonce: String,
-        challenge_digest: [u8; 32],
-        signed_ack_canonical_json: Vec<u8>,
-        now: Instant,
-    ) {
+    fn insert(&mut self, nonce: String, request_digest: [u8; 32], response: Vec<u8>, now: Instant) {
         self.prune(now);
-        while self.entries.len() >= PRIVATE_ORAM_ACTIVATION_ACK_CACHE_MAX_ENTRIES {
+        while self.entries.len() >= self.max_entries {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
@@ -226,9 +238,9 @@ impl PrivateOramActivationAckCache {
         self.order.push_back(nonce.clone());
         self.entries.insert(
             nonce,
-            PrivateOramActivationAckCacheEntry {
-                challenge_digest,
-                signed_ack_canonical_json,
+            PrivateOramNonceResponseCacheEntry {
+                request_digest,
+                response,
                 expires_at: now + PRIVATE_ORAM_ACTIVATION_ACK_CACHE_TTL,
             },
         );
@@ -451,7 +463,11 @@ pub struct QdrantInternalService {
     audit_config: Option<AuditConfig>,
     toc: Arc<TableOfContent>,
     private_oram_peer_identity: Option<Arc<PrivateOramPeerRecoveryIdentity>>,
-    private_oram_activation_ack_cache: Mutex<PrivateOramActivationAckCache>,
+    private_oram_activation_ack_cache: Mutex<PrivateOramNonceResponseCache>,
+    /// Owner-side replay guard for capsule install requests: the coordinator issues the nonce,
+    /// so without this an identical signed install could be re-sent to make the owner re-hash,
+    /// re-validate and re-install a package of up to the capsule cap under the replication lock.
+    private_oram_install_receipt_cache: Mutex<PrivateOramNonceResponseCache>,
     private_oram_replication_lock: Mutex<()>,
     private_oram_install_stream_slots: Semaphore,
     /// When each fixed-layout transfer was last restarted with a fresh preinstall.
@@ -490,7 +506,14 @@ impl QdrantInternalService {
             audit_config,
             toc,
             private_oram_peer_identity,
-            private_oram_activation_ack_cache: Mutex::new(Default::default()),
+            private_oram_activation_ack_cache: Mutex::new(PrivateOramNonceResponseCache::new(
+                PRIVATE_ORAM_ACTIVATION_ACK_CACHE_MAX_ENTRIES,
+                PRIVATE_ORAM_ACTIVATION_ACK_NONCE_REUSED,
+            )),
+            private_oram_install_receipt_cache: Mutex::new(PrivateOramNonceResponseCache::new(
+                PRIVATE_ORAM_INSTALL_RECEIPT_CACHE_MAX_ENTRIES,
+                PRIVATE_ORAM_INSTALL_NONCE_REUSED,
+            )),
             private_oram_replication_lock: Mutex::new(()),
             private_oram_install_stream_slots: Semaphore::new(
                 PRIVATE_ORAM_INSTALL_STREAM_CONCURRENCY,
@@ -3724,6 +3747,31 @@ impl QdrantInternal for QdrantInternalService {
                 "private ORAM owner capsule install identity does not match authority pin",
             ));
         }
+        // A replayed install (same nonce, byte-identical signed request and signature) is
+        // answered from the receipt cache before the package is hashed, validated or installed
+        // again; the same nonce with different bytes is refused.
+        let install_request_digest: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update((wire.install_request_canonical_json.len() as u64).to_be_bytes());
+            hasher.update(&wire.install_request_canonical_json);
+            hasher.update(&wire.coordinator_signature_canonical_json);
+            hasher.finalize().into()
+        };
+        {
+            let mut cache = self.private_oram_install_receipt_cache.lock().await;
+            if let Some(cached) = cache.lookup(
+                &install_request.challenge_nonce,
+                install_request_digest,
+                Instant::now(),
+            )? {
+                let response =
+                    InstallPrivateOramOwnerRecoveryCapsuleV2Response::decode(cached.as_slice())
+                        .map_err(|_| {
+                            Status::internal("private ORAM owner capsule receipt cache is invalid")
+                        })?;
+                return Ok(Response::new(response));
+            }
+        }
         let _verified_request = validate_private_oram_owner_capsule_install_request_signature_v2(
             &coordinator_public_key,
             &install_request,
@@ -3819,15 +3867,20 @@ impl QdrantInternal for QdrantInternalService {
                 "private ORAM owner capsule response is oversized",
             ));
         }
-        Ok(Response::new(
-            InstallPrivateOramOwnerRecoveryCapsuleV2Response {
-                receipt_canonical_json,
-                install_response_canonical_json,
-                owner_public_key_canonical_json,
-                owner_signature_canonical_json,
-                owner_install_attestation_canonical_json,
-            },
-        ))
+        let response = InstallPrivateOramOwnerRecoveryCapsuleV2Response {
+            receipt_canonical_json,
+            install_response_canonical_json,
+            owner_public_key_canonical_json,
+            owner_signature_canonical_json,
+            owner_install_attestation_canonical_json,
+        };
+        self.private_oram_install_receipt_cache.lock().await.insert(
+            install_request.challenge_nonce.clone(),
+            install_request_digest,
+            response.encode_to_vec(),
+            Instant::now(),
+        );
+        Ok(Response::new(response))
     }
 
     async fn prestage_private_oram_mutation_owner_v2(
@@ -5993,5 +6046,38 @@ mod tests {
             64
         );
         assert_eq!(bundle.current.unwrap().root_hash, root_hash);
+    }
+}
+
+#[cfg(test)]
+mod private_oram_nonce_response_cache_tests {
+    use super::*;
+
+    #[test]
+    fn nonce_response_cache_answers_identical_retries_and_refuses_reused_nonces() {
+        let mut cache = PrivateOramNonceResponseCache::new(2, "nonce reused");
+        let now = Instant::now();
+        assert_eq!(cache.lookup("n1", [1u8; 32], now).unwrap(), None);
+
+        cache.insert("n1".to_string(), [1u8; 32], b"r1".to_vec(), now);
+        assert_eq!(
+            cache.lookup("n1", [1u8; 32], now).unwrap(),
+            Some(b"r1".to_vec())
+        );
+        let reused = cache.lookup("n1", [2u8; 32], now).unwrap_err();
+        assert_eq!(reused.code(), tonic::Code::InvalidArgument);
+        assert_eq!(reused.message(), "nonce reused");
+
+        // Capacity evicts the oldest nonce; expiry drops entries past the TTL.
+        cache.insert("n2".to_string(), [2u8; 32], b"r2".to_vec(), now);
+        cache.insert("n3".to_string(), [3u8; 32], b"r3".to_vec(), now);
+        assert_eq!(cache.lookup("n1", [1u8; 32], now).unwrap(), None);
+        assert_eq!(
+            cache.lookup("n3", [3u8; 32], now).unwrap(),
+            Some(b"r3".to_vec())
+        );
+        let later = now + PRIVATE_ORAM_ACTIVATION_ACK_CACHE_TTL + Duration::from_secs(1);
+        assert_eq!(cache.lookup("n3", [3u8; 32], later).unwrap(), None);
+        assert!(cache.entries.is_empty() && cache.order.is_empty());
     }
 }
