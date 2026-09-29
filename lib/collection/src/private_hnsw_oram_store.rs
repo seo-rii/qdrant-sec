@@ -4396,7 +4396,7 @@ fn private_hnsw_client_error(err: qdrant_sec::PrivateHnswClientError) -> Collect
         PrivateHnswClientError::InvalidMerkleRoot => "private HNSW ORAM Merkle root is invalid",
         PrivateHnswClientError::MerkleRootMismatch => "private HNSW ORAM Merkle root mismatch",
         PrivateHnswClientError::InvalidCommitEpoch => {
-            "private HNSW ORAM commit new_epoch must be greater than old_epoch"
+            "private HNSW ORAM commit new_epoch must be exactly old_epoch + 1"
         }
         PrivateHnswClientError::EmptyCommit => {
             "private HNSW ORAM commit must update at least one bucket"

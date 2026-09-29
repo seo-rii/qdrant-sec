@@ -5535,7 +5535,7 @@ mod private_hnsw_grpc_tests {
             assert_eq!(err.code(), Code::InvalidArgument);
             assert!(
                 err.message()
-                    .contains("new_epoch must be greater than old_epoch")
+                    .contains("new_epoch must be exactly old_epoch + 1")
             );
             assert!(!err.message().contains(&session.session_id));
             assert!(
@@ -5959,7 +5959,10 @@ mod private_hnsw_grpc_tests {
                 .max()
                 .unwrap_or(0)
                 + 1;
-            while oversized_writeback_buckets.len() <= 3 {
+            // The session writeback budget grows with every path the session has read, so only
+            // more buckets than the whole tree is oversized for every session.
+            let whole_tree = usize::try_from(fixture.manifest.bucket_count).unwrap();
+            while oversized_writeback_buckets.len() <= whole_tree {
                 let mut bucket = search_run.updated_buckets[0].clone();
                 bucket.bucket_id = next_bucket_id;
                 next_bucket_id += 1;
