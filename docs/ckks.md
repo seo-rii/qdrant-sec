@@ -4936,6 +4936,68 @@ Known remaining limitations:
 - `CiphertextEnvelope` (control plane) has no production consumer; its
   `headers` and `capability` fields are not cross-validated and
   `add_vector_rule` overwrites a duplicate vector rule silently.
+
+### Ninth pass: server-side HNSW ORAM, point staging and capsule transport audits
+
+This pass audited the owner/server side of the private HNSW ORAM (manifests,
+bucket commitments, Merkle root, commit planning, shape validation), the
+point staging codec and the owner capsule install transport. No High or
+Medium findings. Fixed:
+
+- The pre-decode ceiling for uploaded and written-back HNSW buckets was the
+  heuristic `bucket_size * block_size + 4096`, which falls below the exact
+  fixed ciphertext size once `bucket_size` exceeds 4053; such a layout was
+  signable and accepted, then every well-formed bucket was rejected as
+  oversized. The ceiling is now the fixed size itself, in the crate and in
+  the server's duplicate.
+- The owner could not detect a replayed capsule install request because the
+  challenge nonce is coordinator-issued and the owner kept no record of it;
+  a captured signed install could be re-sent to make the owner re-hash,
+  re-validate and re-install a package of up to 128 MiB under the
+  replication lock (the capsule store is idempotent, so no state changed).
+  The owner now keeps a bounded, expiring nonce cache keyed by the signed
+  request and signature bytes: an identical retry is answered from the
+  cached receipt response before the package is touched, and the same nonce
+  with different bytes is refused. The activation acknowledgement cache was
+  generalized for this.
+- The private HNSW REST and gRPC route tests had not been run since the
+  commit rule became `new_epoch == old_epoch + 1` and the writeback budget
+  became per-session: a stale error expectation poisoned the shared fixture
+  and failed every route test after it. The expectations (and the
+  collection store's error wording) now match the checked rule, and the
+  oversized-writeback case exceeds the whole tree so it is oversized for
+  every session budget. All 167 route and cache tests pass on Linux.
+
+Checked and left as is: the length-prefixed, domain-separated signature
+messages (manifest, read paths, commit, install request/response/attestation),
+bucket commitments and the Merkle construction (no leaf/inner confusion,
+padding cannot collide with a commitment, server rebuilds the root from all
+leaves), checked epoch and size arithmetic, base64 pre-decode caps, the
+staging codec's symmetric bounds and canonical re-encode, and Debug
+redaction throughout.
+
+Known remaining limitations added by this pass:
+
+- The manifest signature still omits `created_at_unix` (and
+  `owner_signing_key_id`, which is pinned by the signature header): a copy
+  with an altered creation time verifies and then trips the server's
+  immutability comparison (availability only). Closing this needs a v2
+  signature domain with migration.
+- The read-paths signature carries no session or counter binding, so a
+  captured signed read is replayable within an epoch by anyone already on
+  the transport; commits are not replayable.
+- `private_hnsw_oram_fixed_search_read_path_count` counts one path per step
+  while the server serves rounds of `path_batch_size` paths; the convenience
+  commit planner therefore under-budgets fail-closed relative to the server.
+- Write-back is bounded by count, not by membership in the session's served
+  paths; the owner signature on every commit keeps this from being an
+  escalation.
+- The bare capsule attestation validator is self-certifying (it verifies
+  with the embedded key); every admission path uses the signer-pinned
+  variant, but the bare function remains public as shape validation.
+- The install response path hashes the receipt before verifying the
+  signature (receipt capped at 64 KiB); empty shard keywords are accepted by
+  the staging validator; staged frames are re-encoded up to three times.
 - Padding and deleted steps of an HNSW search skip the distance and
   candidate bookkeeping, so per-step latency differs slightly from real
   steps; computing the distance regardless would make the work
