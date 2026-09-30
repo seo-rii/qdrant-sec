@@ -387,11 +387,14 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
             &capsule.point_stage_state,
         )?;
         let slot = reconcile_snapshot.lease_slot();
+        // The active lease may have been renewed since the capsule was minted (a longer expiry
+        // and a higher renewal revision); `validate_reconcile_lease_slot` accepts exactly those
+        // renewals and nothing else. Installs must still precede any abort decision.
+        let active_lease = validate_reconcile_lease_slot(&capsule.descriptor, slot)?;
         if reconcile_snapshot.parent_watermark() != Some(expected_watermark.watermark())
             || reconcile_snapshot.consensus_state()
                 != &capsule.descriptor.expected_consensus_old_state
-            || slot.generation != capsule.descriptor.preparing_lease.generation
-            || slot.active.as_ref() != Some(&capsule.descriptor.preparing_lease)
+            || active_lease.phase != PrivateOramMutationLeasePhase::Preparing
             || capsule.descriptor.preparing_lease.phase != PrivateOramMutationLeasePhase::Preparing
         {
             return Err(PrivateOramMutationJournalError::InvalidTransition);

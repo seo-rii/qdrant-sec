@@ -3316,10 +3316,20 @@ fn validated_mutation_decision_from_v2_snapshot(
     snapshot: &PrivateOramMutationJournalStructuralSnapshotV2,
     evidence: RawPrivateOramMutationDecisionEvidenceV2,
 ) -> Result<PrivateOramValidatedMutationDecisionV2, PrivateOramMutationJournalError> {
-    let state = snapshot.effective_state();
+    // The permit is built from the durable pointer state: a crash between publishing the
+    // DecisionDurable record and moving the pointer leaves that record as `pending_next`, and
+    // resuming must re-run the exact publisher rather than refuse forever. A pending record may
+    // only be the DecisionDurable successor carrying this very evidence.
+    let state = &snapshot.state;
     if state.phase != PrivateOramMutationJournalPhaseV2::PointStageDurable
         || state.decision.is_some()
     {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    if snapshot.pending_next.as_ref().is_some_and(|pending| {
+        pending.phase != PrivateOramMutationJournalPhaseV2::DecisionDurable
+            || pending.decision.as_ref() != Some(&evidence)
+    }) {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     Ok(PrivateOramValidatedMutationDecisionV2 {
