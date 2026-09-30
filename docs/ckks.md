@@ -5044,6 +5044,68 @@ Known remaining limitations added by this pass:
 - Reservation resolution receipts are checked against their context by
   three callers with hand-written comparisons rather than one shared
   validator.
+
+### Eleventh pass: collection HNSW ORAM store and storage journal writer audits
+
+This pass audited the on-disk private HNSW ORAM store (`lib/collection`)
+and the V2 mutation journal writer with its owner recovery capsule module
+(`lib/storage`). Fixed:
+
+- Restart resume was permanently stuck in one crash window: when the
+  DecisionDurable record had been published but the state pointer had not
+  moved, the resume dispatcher matched the pointer phase yet validated
+  against the pending record, refused with an invalid transition, and every
+  retry failed identically. The decision permit is now built from the
+  durable pointer state, a pending record is accepted only when it is the
+  DecisionDurable successor carrying the same evidence, and applying the
+  permit republishes it. A test drives the crash window end to end.
+- Owner capsule installs rejected any lease renewal (exact lease equality),
+  so late owners could never install after the coordinator renewed the
+  lease and the recovery-capsule certificate could never complete. Installs
+  now accept exactly the renewals the reconcile lease validator accepts and
+  still require the lease to be in the preparing phase.
+- The HNSW store could write records it could never read back: the atomic
+  JSON writer had no size cap while every reader enforces one, so a large
+  owner-signed commit produced a pending write-back record above the 512 MiB
+  read cap that wedged the index until the file was removed by hand. The
+  pending record is now refused before any file is created when it exceeds
+  the reader's cap, and partial temp files are removed on every write error.
+- A post-commit manifest refresh could replace the anchored manifest with
+  one whose commitment context differed (for example another `rk_epoch`),
+  breaking replication and verification of every stored bucket; the refresh
+  now has to preserve every field except epoch, root, node counts and the
+  creation time.
+- Restored-snapshot verification read one proof per bucket and recomputed
+  the whole Merkle tree each time (quadratic in the tree size); buckets are
+  now verified in batches of 1024 per proof read.
+
+Checked and left as is: write-then-fsync-then-rename ordering with parent
+directory fsyncs in both stores, `RENAME_NOREPLACE` immutable records and
+record-before-pointer publication in the journal, `openat2` beneath-root
+opens with inode pinning, fixed-size and commitment-context checks on every
+served bucket, epoch monotonicity, canonical JSON re-encode checks and Debug
+redaction.
+
+Known remaining limitations added by this pass:
+
+- Several server paths still run fsync-heavy store I/O on async runtime
+  threads (bucket-set upload, session-open recovery, bundle export, replica
+  prepare, and the distributed prepare/abort/finalize closures); moving
+  them to blocking tasks is a server-side refactor.
+- Proof reads still recompute the Merkle levels of the whole tree per call.
+- A same-generation capsule cannot be replaced after an activation-authority
+  change while the mutation is live; the stale file must be removed by hand.
+- One journal read (`local-cleanup-complete`) is path-based and lock-free
+  (fail-closed); stale temp files and staging directories left by crashes
+  are never swept in either store; the pending write-back record still
+  embeds a full copy of the Merkle tree; the store's test-only public
+  mutators bypass the invariants the production paths enforce.
+- The storage test `v2_owner_recovery_capsule_store_supersedes_previous_generation`
+  is ignored with its reason: `begin_v2` pins the lease generation and writer
+  fence to the signed mutation bundle and the immutable manifest, and the
+  paired store fixture has no knob to mint a coherent next-generation bundle.
+  The supersede rule stays covered by the conflicting-package and exact-replay
+  tests; the fixture needs a lease-generation parameter.
 - Padding and deleted steps of an HNSW search skip the distance and
   candidate bookkeeping, so per-step latency differs slightly from real
   steps; computing the distance regardless would make the work
