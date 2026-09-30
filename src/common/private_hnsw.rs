@@ -3099,10 +3099,13 @@ fn ensure_private_hnsw_restored_snapshot_storage_matches(
         ));
     }
     let max_bucket_ciphertext_bytes = max_bucket_ciphertext_bytes(expected_manifest)?;
-    for bucket_id in 0..expected_manifest.bucket_count {
+    // Every proof read recomputes the Merkle levels of the whole tree, so buckets are verified
+    // in batches: one recomputation per batch instead of one per bucket.
+    let bucket_ids: Vec<u64> = (0..expected_manifest.bucket_count).collect();
+    for batch in bucket_ids.chunks(PRIVATE_HNSW_SNAPSHOT_VERIFICATION_BATCH) {
         store
             .read_bucket_batch_with_proof(
-                &[bucket_id],
+                batch,
                 expected_epoch.index_epoch,
                 &expected_epoch.root_hash,
                 expected_manifest.bucket_count,
@@ -3112,6 +3115,9 @@ fn ensure_private_hnsw_restored_snapshot_storage_matches(
     }
     Ok(())
 }
+
+/// Buckets verified per proof read while checking a restored snapshot against its tree.
+const PRIVATE_HNSW_SNAPSHOT_VERIFICATION_BATCH: usize = 1024;
 
 fn private_hnsw_manifest_read_store_error(err: CollectionError) -> StorageError {
     match err {
