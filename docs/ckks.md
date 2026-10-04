@@ -5193,3 +5193,71 @@ Known remaining limitations added by this pass:
   consensus waits during private ORAM recovery requests.
 - A mutation activation floor without an activation authority accepts a
   missing pending token (pre-release fixture compatibility).
+
+### Twelfth pass: result ORAM store, mutation journal core and owner store adapter audits
+
+This pass audited the on-disk private result ORAM store (`lib/collection`),
+the core of the V1/V2 mutation journal (`lib/storage`) and the owner store
+adapter that pairs the HNSW and result stores. The hardening the eleventh
+pass applied to the HNSW store had not been carried over to the result
+store. Fixed:
+
+- A post-commit result manifest refresh could replace the anchored manifest
+  with one whose commitment context differed (another `rk_epoch`, bucket
+  count or signer), so every untouched bucket stopped verifying and V2 owner
+  store verification failed permanently. The refresh now has to preserve
+  every field except epoch, root, result counts and the creation time, as in
+  the HNSW store; a test covers the refused fields.
+- The result store's atomic JSON writer had no size cap while every reader
+  enforces one, so an oversized prepared write-back (or Merkle tree, or
+  manifest) was written successfully and then could not be read by commit,
+  recover or abort. Each such record is now refused before any file is
+  created when it exceeds its reader's cap, and partial temp files are
+  removed on every write error instead of only on a failed rename.
+- Restored result snapshot verification read one proof per bucket, each
+  re-reading and re-hashing the whole Merkle tree (quadratic in the tree
+  size); buckets are now verified in batches of 1024 per proof read.
+- Journal `begin` disarmed its staging-directory guard before the publishing
+  rename, so a refused or failed publish left a full descriptor copy under
+  `temp/` that nothing sweeps. The guard now stays armed until the rename
+  succeeds.
+- Journal JSON reads and writes went through unbuffered files, so serde_json
+  issued one system call per byte on every load and transition (descriptors
+  are capped at 512 MiB). Reads and writes are now buffered; the size limit
+  is still enforced on the underlying reader.
+
+Checked and left as is: bounded, `O_NOFOLLOW`, owner/mode/link-count checked
+reads in both modules; canonical re-encode checks on the manifest and
+reservation decoders; hashed-and-verified atomic state publication; strictly
+sequential phase transitions with checked generation and fence arithmetic;
+signature verification before any state use; epoch CAS and replay handling
+in the result store; the adapter's validation-before-lock, consistent lock
+order, live-binding re-check under the store locks and HNSW-then-result
+write order.
+
+Known remaining limitations added by this pass:
+
+- Admitted-mutation recovery rebuilds the lease with `renewal_revision` 0 and
+  requires exact equality with the committed lease, so a committed mutation
+  whose preparing lease had been renewed could not be recovered. No server
+  path proposes a mutation-lease renewal today
+  (`private_oram_mutation_v2_renewal_operation` has no caller), so this is
+  latent; enabling renewals needs the recovery plan, the parent descriptor
+  digest and the exact-manifest lookup to accept the renewed lease together.
+- A crash between the manifest and signature renames of a manifest refresh
+  (both stores) leaves the new manifest next to the old signature; the
+  identical-retry arm then refuses forever and the files must be repaired by
+  hand. Writing manifest and signature as one record would remove the window.
+- The V1 journal `transition` and `begin` paths read and publish through the
+  root path rather than the pinned root descriptor that `acquire_lock`
+  validated; only the recovery-authority path re-validates the root identity.
+- V1 journal state validation checks the shape of `previous_record_digest`
+  but not that it chains to the predecessor record (the digest is unkeyed,
+  so this is a consistency check, not authentication).
+- Admission recovery manifests verify each owner attestation against the key
+  embedded in it; owner identity is bound by the append-reservation
+  validator, and whether the consensus admission apply path binds the keys as
+  well has not been traced.
+- The result manifest refresh may still change `created_at_unix`, which V2
+  owner store verification pins; a refresh that changes it fails V2
+  verification rather than being refused at upload.
