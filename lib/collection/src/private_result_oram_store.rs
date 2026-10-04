@@ -699,17 +699,19 @@ impl PrivateResultOramStore {
         signature: &PrivateResultOramSignature,
     ) -> CollectionResult<()> {
         self.ensure_layout_under_owner_lock(token)?;
-        write_json_atomic(
+        write_json_atomic_with_limit(
             &self.root,
             &self.temp_dir(),
             &self.manifest_path(),
             manifest,
+            MAX_MANIFEST_BYTES,
         )?;
-        write_json_atomic(
+        write_json_atomic_with_limit(
             &self.root,
             &self.temp_dir(),
             &self.manifest_signature_path(),
             signature,
+            MAX_SIGNATURE_BYTES,
         )
     }
 
@@ -1425,7 +1427,18 @@ impl PrivateResultOramStore {
                     }
                     Ok(())
                 }
-                Ok(_) | Err(CollectionError::NotFound { .. }) => {
+                Ok((stored_manifest, _)) => {
+                    // A post-commit refresh may only move the fields a commit legitimately
+                    // changes; everything else (identifiers, key metadata including rk_epoch,
+                    // layout, bucket count) is the commitment context of every stored bucket.
+                    if !manifest_refresh_preserves_immutable_fields(&stored_manifest, manifest) {
+                        return Err(CollectionError::bad_request(
+                            "private result ORAM manifest refresh changes fields other than epoch, root and result counts",
+                        ));
+                    }
+                    self.write_manifest_under_owner_lock(token, manifest, signature)
+                }
+                Err(CollectionError::NotFound { .. }) => {
                     self.write_manifest_under_owner_lock(token, manifest, signature)
                 }
                 Err(err) => Err(err),
@@ -1819,7 +1832,15 @@ impl PrivateResultOramStore {
             merkle_tree,
             commit_signature: commit_signature.clone(),
         };
-        write_json_atomic(&self.root, &self.temp_dir(), &pending_path, &pending)?;
+        // Every reader of the pending record enforces this cap; writing a larger one would
+        // leave a prepared write-back that commit, recover and abort can no longer read.
+        write_json_atomic_with_limit(
+            &self.root,
+            &self.temp_dir(),
+            &pending_path,
+            &pending,
+            MAX_PENDING_WRITEBACK_BYTES,
+        )?;
         Ok(consensus_writeback)
     }
 
@@ -2536,11 +2557,12 @@ impl PrivateResultOramStore {
     ) -> CollectionResult<()> {
         self.ensure_layout_under_owner_lock(token)?;
         validate_merkle_tree(tree)?;
-        write_json_atomic(
+        write_json_atomic_with_limit(
             &self.root,
             &self.temp_dir(),
             &self.merkle_nodes_path(),
             tree,
+            MAX_MERKLE_BYTES,
         )
     }
 
@@ -4585,29 +4607,51 @@ fn write_json_atomic<T: Serialize>(
     target: &Path,
     value: &T,
 ) -> CollectionResult<()> {
+    write_json_atomic_with_limit(root, temp_dir, target, value, u64::MAX)
+}
+
+/// Writes `value` atomically, refusing before any file is created when the serialized form
+/// exceeds `max_bytes` (the cap its reader enforces), and removing the temp file on any error.
+fn write_json_atomic_with_limit<T: Serialize>(
+    root: &Path,
+    temp_dir: &Path,
+    target: &Path,
+    value: &T,
+    max_bytes: u64,
+) -> CollectionResult<()> {
     validate_target_under_root(root, target)?;
     validate_private_dir(temp_dir)?;
     let bytes = serde_json::to_vec_pretty(value).map_err(|_| {
         CollectionError::service_error("failed to serialize private result ORAM file")
     })?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > max_bytes) {
+        return Err(CollectionError::bad_request(
+            "private result ORAM record exceeds its maximum size",
+        ));
+    }
     let temp_path = unique_temp_path(temp_dir);
-    let mut file = open_private_file_for_write(&temp_path)?;
-    file.write_all(&bytes).map_err(|_| {
-        CollectionError::service_error("failed to write private result ORAM temp file")
-    })?;
-    file.flush().map_err(|_| {
-        CollectionError::service_error("failed to flush private result ORAM temp file")
-    })?;
-    file.sync_all().map_err(|_| {
-        CollectionError::service_error("failed to sync private result ORAM temp file")
-    })?;
-    drop(file);
-    sync_dir(temp_dir)?;
-
-    fs::rename(&temp_path, target).map_err(|_| {
+    let written = (|| -> CollectionResult<()> {
+        let mut file = open_private_file_for_write(&temp_path)?;
+        file.write_all(&bytes).map_err(|_| {
+            CollectionError::service_error("failed to write private result ORAM temp file")
+        })?;
+        file.flush().map_err(|_| {
+            CollectionError::service_error("failed to flush private result ORAM temp file")
+        })?;
+        file.sync_all().map_err(|_| {
+            CollectionError::service_error("failed to sync private result ORAM temp file")
+        })?;
+        drop(file);
+        sync_dir(temp_dir)?;
+        fs::rename(&temp_path, target).map_err(|_| {
+            CollectionError::service_error("failed to replace private result ORAM file")
+        })
+    })();
+    if let Err(err) = written {
+        // Nothing sweeps `temp/`, so a failed write must not leave its partial file behind.
         let _ = fs::remove_file(&temp_path);
-        CollectionError::service_error("failed to replace private result ORAM file")
-    })?;
+        return Err(err);
+    }
     if let Some(parent) = target.parent() {
         sync_dir(parent)?;
     }
@@ -4615,6 +4659,22 @@ fn write_json_atomic<T: Serialize>(
         sync_dir(temp_dir)?;
     }
     Ok(())
+}
+
+/// A post-commit manifest refresh may change only `index_epoch`, `root_hash`, the result counts
+/// and `created_at_unix`; every other field is part of each stored bucket's commitment context
+/// or of the runtime policy pinned at upload.
+fn manifest_refresh_preserves_immutable_fields(
+    stored: &PrivateResultOramManifest,
+    refreshed: &PrivateResultOramManifest,
+) -> bool {
+    let mut expected = stored.clone();
+    expected.index_epoch = refreshed.index_epoch;
+    expected.root_hash = refreshed.root_hash.clone();
+    expected.logical_result_count = refreshed.logical_result_count;
+    expected.dummy_result_count = refreshed.dummy_result_count;
+    expected.created_at_unix = refreshed.created_at_unix;
+    expected == *refreshed
 }
 
 fn remove_private_file(path: &Path, parent: &Path, max_bytes: u64) -> CollectionResult<()> {
@@ -6006,6 +6066,73 @@ mod tests {
             store.read_manifest().unwrap(),
             (new_manifest, new_signature)
         );
+    }
+
+    #[test]
+    fn post_commit_manifest_refresh_cannot_change_bucket_commitment_context() {
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old_manifest = fixture_manifest();
+        let old_signature = fixture_signature();
+        let old_epoch = PrivateResultOramEpochState {
+            index_epoch: old_manifest.index_epoch,
+            root_hash: old_manifest.root_hash.clone(),
+        };
+        let new_epoch = PrivateResultOramEpochState {
+            index_epoch: old_manifest.index_epoch + 1,
+            root_hash: root_hash(43),
+        };
+        let new_signature = PrivateResultOramSignature {
+            sig: BASE64URL_NOPAD.encode(&[8; 64]),
+            ..old_signature.clone()
+        };
+        store
+            .write_manifest_with_initial_epoch_if_absent_or_matching(
+                &old_manifest,
+                &old_signature,
+                &old_epoch,
+            )
+            .unwrap();
+        store
+            .compare_and_swap_epoch(&old_epoch, &new_epoch)
+            .unwrap();
+
+        let mut refreshed = old_manifest.clone();
+        refreshed.index_epoch = new_epoch.index_epoch;
+        refreshed.root_hash = new_epoch.root_hash.clone();
+        let mut changed_rk_epoch = refreshed.clone();
+        changed_rk_epoch.rk_epoch += 1;
+        let mut changed_bucket_count = refreshed.clone();
+        changed_bucket_count.bucket_count += 1;
+        let mut changed_signer = refreshed.clone();
+        changed_signer.owner_signing_key_id.push('x');
+        for tampered in [changed_rk_epoch, changed_bucket_count, changed_signer] {
+            let rendered = store
+                .write_manifest_with_initial_epoch_if_absent_or_matching(
+                    &tampered,
+                    &new_signature,
+                    &new_epoch,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                rendered.contains("manifest refresh changes fields"),
+                "{rendered}"
+            );
+            assert_eq!(
+                store.read_manifest().unwrap(),
+                (old_manifest.clone(), old_signature.clone())
+            );
+        }
+
+        store
+            .write_manifest_with_initial_epoch_if_absent_or_matching(
+                &refreshed,
+                &new_signature,
+                &new_epoch,
+            )
+            .unwrap();
+        assert_eq!(store.read_manifest().unwrap(), (refreshed, new_signature));
     }
 
     #[test]
