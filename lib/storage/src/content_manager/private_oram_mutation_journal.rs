@@ -3991,9 +3991,12 @@ impl PrivateOramMutationJournal {
         write_new_json_private(&staging.path().join(STATE_FILE), &state, MAX_STATE_BYTES)?;
         sync_directory(staging.path())?;
 
-        let staging_path = staging.keep();
-        match fs::rename(&staging_path, self.active_path()) {
-            Ok(()) => {}
+        // Keep the guard armed until the rename succeeds so a refused or
+        // failed publish removes the staged descriptor copy.
+        match fs::rename(staging.path(), self.active_path()) {
+            Ok(()) => {
+                let _ = staging.keep();
+            }
             Err(error) => {
                 if path_entry_exists(&self.active_path())? {
                     let current = self.load_locked()?;
@@ -6027,10 +6030,10 @@ fn write_json_atomic_classified<T: Serialize>(
         NamedTempFile::new_in(temp_dir).map_err(PrivateOramMutationJournalError::Io)?;
     let mut candidate_hasher = Sha256::new();
     {
-        let mut writer = Sha256Writer {
+        let mut writer = io::BufWriter::new(Sha256Writer {
             inner: &mut candidate,
             hasher: &mut candidate_hasher,
-        };
+        });
         serde_json::to_writer(&mut writer, value)
             .map_err(|error| PrivateOramMutationJournalError::Io(io::Error::other(error)))?;
         writer
@@ -6189,9 +6192,14 @@ pub(super) fn write_new_json_private<T: Serialize>(
     let mut file = options
         .open(path)
         .map_err(PrivateOramMutationJournalError::Io)?;
-    serde_json::to_writer(&mut file, value)
-        .map_err(|error| PrivateOramMutationJournalError::Io(io::Error::other(error)))?;
-    file.flush().map_err(PrivateOramMutationJournalError::Io)?;
+    {
+        let mut writer = io::BufWriter::new(&mut file);
+        serde_json::to_writer(&mut writer, value)
+            .map_err(|error| PrivateOramMutationJournalError::Io(io::Error::other(error)))?;
+        writer
+            .flush()
+            .map_err(PrivateOramMutationJournalError::Io)?;
+    }
     let metadata = file
         .metadata()
         .map_err(PrivateOramMutationJournalError::Io)?;
@@ -6207,10 +6215,11 @@ pub(super) fn read_json_private<T: DeserializeOwned>(
     let read_limit = max_bytes
         .checked_add(1)
         .ok_or(PrivateOramMutationJournalError::Corrupt)?;
-    let mut reader = file.take(read_limit);
+    // serde_json issues one read per byte on an unbuffered reader.
+    let mut reader = io::BufReader::new(file.take(read_limit));
     let value = serde_json::from_reader(&mut reader)
         .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
-    if reader.limit() == 0 {
+    if reader.get_ref().limit() == 0 {
         return Err(PrivateOramMutationJournalError::Corrupt);
     }
     Ok(value)
