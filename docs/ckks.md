@@ -5486,3 +5486,61 @@ Known remaining limitations added by this pass:
   refusals are only logged (the proposer waits for the full timeout), and
   `await_for_multiple_operations` leaves senders behind on timeout
   (upstream).
+
+### Sixteenth pass: floor checkpoint store and Raft loop audits; CI coverage
+
+This pass audited the local private ORAM floor checkpoint store
+(`lib/storage/.../floor_store.rs`) and the private ORAM handling in the Raft
+loop (`src/consensus.rs`). It also added the private ORAM store, journal,
+consensus and server test filters to the `qdrant-sec CI` workflow: the
+workflow compiled those targets but ran none of their private ORAM tests,
+including the regression tests added by earlier passes. Fixed:
+
+- The leader's activation-pending scan, which gates learner promotion and
+  ordinary proposals on every loop iteration, returned a service error for
+  an unreadable or undecodable uncommitted WAL entry, and the error stopped
+  the consensus thread. A peer can forward such an entry (bytes that are
+  not an operation, or a variant from a newer binary), and a newly elected
+  leader holding the same entry stopped the same way. The scan now treats
+  such an entry as a possible pending activation (blocking promotions and
+  ordinary proposals) instead of failing.
+
+Checked and left as is: floor checkpoint writes (temp file in the pinned
+directory, fsync, rename, digest re-check, parent fsync with an
+indeterminate outcome), bounded reads with `deny_unknown_fields` and
+domain-separated digests, strict generation increments, recovery only to the
+exact prior or next Raft image, detection of a deleted floor directory or
+Raft state file at startup, floor-before-collections ordering on snapshot
+install, WAL compaction bounded by the last applied entry, consistent lock
+order and no panics in the loop.
+
+Known remaining limitations added by this pass:
+
+- Proposal gates (`ensure_private_oram_topology_proposal_allowed`, the
+  general proposal gate while an activation is pending) run only on the
+  proposing node; a follower that has not yet applied the activation
+  forwards proposals that the leader appends without the gate. A learner
+  added this way is only warned about at apply, and while any learner
+  exists every peer-recovery signer pin refuses. The leader should check
+  forwarded `MsgProp` entries before stepping them, and apply should refuse
+  such topology changes deterministically.
+- The floor checkpoint's 64 MiB file cap is reached at roughly 65-70k
+  authority floors, below the 100k the validator allows; at that size every
+  save fails the same way and stops consensus. The two caps should be
+  derived from each other and checked at plan time with a `bad_request`.
+- Fix design for the collection-delete halt recorded in the fifteenth pass:
+  the "no disappearing floor" rule stops a snapshot or state that omits a
+  collection from being accepted as a deletion and then replaying the
+  collection's older authority from scratch, so it cannot simply be lifted.
+  The authority key is derived from the collection name, so a tombstone
+  must be ordered by Raft index rather than ban the key: the delete records
+  a retired-authority tombstone (final floor digest, maximum ordinal, delete
+  entry locator) in Raft state and snapshots; the checkpoint (version 2)
+  carries tombstones that never disappear; a floor may leave only with a
+  newer matching tombstone; an authority under a retired key is accepted
+  only when activated after the delete; snapshot validation requires the
+  incoming tombstones to cover the local ones; and the delete is refused
+  with a `bad_request` before any side effect when the tombstone cannot be
+  formed. The snapshot authority acceptance plan (`wire == None` is
+  `InvalidTransition`) needs the same exemption, or a node cannot restart
+  after such a delete.
