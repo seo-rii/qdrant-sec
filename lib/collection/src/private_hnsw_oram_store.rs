@@ -9034,13 +9034,15 @@ mod tests {
         store.compare_and_swap_epoch(&old, &new).unwrap();
         assert_eq!(store.read_current_epoch().unwrap(), new);
 
+        // A well-formed old+1 transition from the superseded state must hit the root check
+        // (an epoch gap is refused earlier by the exact old+1 rule).
         let newer = PrivateHnswOramEpochState {
-            index_epoch: 44,
+            index_epoch: 43,
             root_hash: root_hash(44),
         };
         let err = store.compare_and_swap_epoch(&old, &newer).unwrap_err();
         let rendered = err.to_string();
-        assert!(rendered.contains("RootHashMismatch"));
+        assert!(rendered.contains("RootHashMismatch"), "{rendered}");
         assert!(!rendered.contains("42"), "{rendered}");
         assert!(!rendered.contains("43"), "{rendered}");
         assert!(!rendered.contains("44"), "{rendered}");

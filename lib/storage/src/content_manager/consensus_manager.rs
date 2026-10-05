@@ -4948,12 +4948,12 @@ mod tests {
                 .private_oram_mutation_activation_transition_pending(2, 2)
                 .unwrap()
         );
+        // An undecodable uncommitted entry fails closed (treated as pending) instead of
+        // stopping the consensus thread.
         assert!(
             manager
                 .private_oram_mutation_activation_transition_pending(2, 3)
-                .unwrap_err()
-                .to_string()
-                .contains("WAL entry is malformed")
+                .unwrap()
         );
 
         let prepared = validate_private_oram_mutation_activation_barrier_v2(

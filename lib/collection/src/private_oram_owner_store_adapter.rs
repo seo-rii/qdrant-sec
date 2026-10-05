@@ -2125,11 +2125,21 @@ mod tests {
                 )
                 .unwrap(),
             RecoveryFixtureStoreState::Third => {
+                // Two exact old+1 steps reach a third state that is neither the
+                // mutation's old nor its new state.
                 let old = fixture.hnsw_store.read_current_epoch().unwrap();
+                let between = PrivateHnswOramEpochState {
+                    index_epoch: old.index_epoch + 1,
+                    root_hash: digest(210),
+                };
+                fixture
+                    .hnsw_store
+                    .compare_and_swap_epoch(&old, &between)
+                    .unwrap();
                 fixture
                     .hnsw_store
                     .compare_and_swap_epoch(
-                        &old,
+                        &between,
                         &PrivateHnswOramEpochState {
                             index_epoch: old.index_epoch + 2,
                             root_hash: digest(200),
@@ -2155,11 +2165,21 @@ mod tests {
                 )
                 .unwrap(),
             RecoveryFixtureStoreState::Third => {
+                // Two exact old+1 steps reach a third state that is neither the
+                // mutation's old nor its new state.
                 let old = fixture.result_store.read_current_epoch().unwrap();
+                let between = PrivateResultOramEpochState {
+                    index_epoch: old.index_epoch + 1,
+                    root_hash: digest(211),
+                };
+                fixture
+                    .result_store
+                    .compare_and_swap_epoch(&old, &between)
+                    .unwrap();
                 fixture
                     .result_store
                     .compare_and_swap_epoch(
-                        &old,
+                        &between,
                         &PrivateResultOramEpochState {
                             index_epoch: old.index_epoch + 2,
                             root_hash: digest(201),
