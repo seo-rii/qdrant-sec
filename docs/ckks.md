@@ -5326,9 +5326,10 @@ Known remaining limitations added by this pass:
   tree once per 1024-bucket batch, and restore requires the current epoch to
   equal the manifest anchor, so a snapshot of a collection that has committed
   since its manifest upload cannot be restored.
-- A failed session open after an upload reservation drops the registry lock
-  before releasing the reservation, so the release can remove a reservation
-  taken by another caller in between.
+- A failed session open after an upload reservation dropped the registry
+  lock before releasing the reservation, so the release could remove a
+  reservation taken by another caller in between (fixed in the fourteenth
+  pass for both registries).
 - Standalone result ORAM sessions are not bound to the principal that opened
   them (the stored client id is unused), and reads need only read access.
 - Append prepared, admission and admission-rejected apply arms do not
@@ -5341,3 +5342,76 @@ Known remaining limitations added by this pass:
 - Consensus apply does not check which peer proposed an abort decision or a
   reserved-attempt rejection, so a Raft member can deny other coordinators'
   appends (liveness only; all Raft peers are trusted, as upstream).
+
+### Fourteenth pass: server HNSW handlers, internal peer RPCs and consensus apply audits
+
+This pass audited the server-side private HNSW request handling
+(`src/common/private_hnsw.rs`), the internal peer gRPC service
+(`src/tonic/api/qdrant_internal_api.rs`) and the private ORAM apply arms of
+the persistent consensus state (`lib/storage/.../consensus/persistent.rs`).
+Fixed:
+
+- Two deterministic apply refusals were raised as service errors, which stop
+  consensus on every replica at that entry and again on every restart: a
+  legacy (pre-tagged) mutation lease, initialize or apply operation meeting
+  an upgraded tagged authority slot, and the reservation V3 floor barrier
+  meeting non-quiescent reservation history (a reservation can commit
+  between the proposer's check and the barrier). Every replica holds the
+  same state, so both now reject the entry and advance the apply cursor; the
+  legacy reducers stay fenced and the barrier can be re-proposed.
+- Replica write-back finalize and abort RPCs carry no coordinator signature
+  and acted on the shape of the request alone, so a client reaching the
+  internal port could finalize a replica to an epoch consensus never
+  accepted, or abort one that consensus had committed. The replica now
+  checks its own consensus view: a finalize must name the committed
+  epoch/root/write-back digest (waiting up to 10 s for the local apply), and
+  an abort must not undo it.
+- On an indeterminate epoch CAS the staged owner write-back is meant to stay
+  in its commit phase for session recovery, but the context was dropped
+  unsettled and its drop guard released the commit slot, after which
+  recovery failed with "no commit in progress" once it had already moved
+  the store. Both the HNSW and result contexts now mark that branch as left
+  pending for recovery.
+- A failed session open after an upload reservation released the
+  reservation after dropping the registry lock, so another caller's
+  reservation could be removed and a session, snapshot or second upload
+  could run during that caller's upload. Both registries now keep the
+  reservation when the open fails, so only the caller's guard releases it;
+  tests cover both.
+- Replication bundle export and recovery inspection read and verified the
+  manifest with read access before checking the write access they require;
+  access is now checked first (HNSW and result ORAM).
+
+Checked and left as is: request caps before allocation, ciphertext length
+checks before base64 decoding, checked arithmetic, commit signature
+coverage (collection, vector, key metadata, epochs, roots, bucket ids and
+digests, algorithm and key id), the detached single-node commit task,
+RAII upload/snapshot guards with no await after acquisition, canonical-JSON
+size caps before decoding on owner RPCs, signer pins from consensus before
+signature verification, bounded nonce caches, deterministic apply (no wall
+clock, sorted or order-independent map use), guarded `expect`s, 1M record
+caps per replicated map, and validated snapshot and persisted-state loads.
+
+Known remaining limitations added by this pass:
+
+- The internal gRPC port authenticates peers only by CA-chained client
+  certificates when p2p TLS is on, and nothing forces TLS on when private
+  ORAM is configured; certificates are not bound to peer ids. Handlers
+  without a coordinator signature (shard recovery and resharding resume,
+  which can restart a fixed-layout transfer every 60 s, and the write-back
+  completion RPCs above beyond their consensus check) rely on that.
+- The single install-stream slot is shared by capsule install, prestage,
+  index install and live-replica install, and a slow sender holds it for the
+  5 minute stream timeout; the decoder buffers up to 512 MiB before the
+  capsule handler's 128 MiB check.
+- Prestage, owner recovery and adoption requests carry nonces without expiry
+  and have no replay cache.
+- Collection-delete pruning of the replicated private ORAM maps uses each
+  node's local collection config, so a node without that config prunes
+  nothing and the maps diverge.
+- The staged write-back drop guard races on `Arc::strong_count` and gives up
+  when the registry mutex is busy (`try_lock`).
+- An abort that reaches a replica whose consensus apply lags behind a
+  committed CAS still passes the new consensus check.
+- `private_hnsw_oram_api_required_message` echoes the requested vector
+  name.
