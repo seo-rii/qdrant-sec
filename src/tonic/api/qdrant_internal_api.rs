@@ -552,6 +552,46 @@ impl QdrantInternalService {
         }
     }
 
+    /// The completion RPC carries no coordinator signature, so the replica checks it against
+    /// its own consensus view: a finalize must name the epoch/root/digest consensus committed
+    /// (waiting briefly for the local apply to catch up), and an abort must not undo it.
+    async fn wait_for_writeback_completion_consensus(
+        &self,
+        key: &PrivateOramEpochKey,
+        new_epoch: u64,
+        new_root_hash: &str,
+        writeback_digest: &str,
+        abort: bool,
+    ) -> Result<(), Status> {
+        let deadline = Instant::now() + PRIVATE_ORAM_TRANSFER_RESERVATION_APPLY_TIMEOUT;
+        loop {
+            let committed = self
+                .consensus_state
+                .private_oram_epoch(key)
+                .is_some_and(|state| {
+                    state.index_epoch == new_epoch
+                        && state.root_hash == new_root_hash
+                        && state.writeback_digest.as_deref() == Some(writeback_digest)
+                });
+            match (abort, committed) {
+                (false, true) | (true, false) => return Ok(()),
+                (true, true) => {
+                    return Err(Status::failed_precondition(
+                        "private ORAM writeback abort conflicts with the committed consensus epoch",
+                    ));
+                }
+                (false, false) if Instant::now() < deadline => {
+                    tokio::time::sleep(PRIVATE_ORAM_TRANSFER_RESERVATION_APPLY_POLL_INTERVAL).await;
+                }
+                (false, false) => {
+                    return Err(Status::failed_precondition(
+                        "private ORAM writeback finalize does not match the committed consensus epoch",
+                    ));
+                }
+            }
+        }
+    }
+
     async fn complete_private_oram_writeback(
         &self,
         request: CompletePrivateOramWritebackRequest,
@@ -563,6 +603,31 @@ impl QdrantInternalService {
         let transition = required_transition(request.transition)?;
         let old = transition.old.expect("validated transition old state");
         let new = transition.new.expect("validated transition new state");
+        let (index_kind, index_name) = match kind {
+            PrivateOramReplicationIndexKind::Hnsw => {
+                (PrivateOramIndexKind::Hnsw, request.vector_name.clone())
+            }
+            PrivateOramReplicationIndexKind::Result => {
+                (PrivateOramIndexKind::ResultPayload, String::new())
+            }
+            PrivateOramReplicationIndexKind::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "private ORAM index kind is required",
+                ));
+            }
+        };
+        self.wait_for_writeback_completion_consensus(
+            &PrivateOramEpochKey {
+                collection_id: request.collection_id.clone(),
+                index_kind,
+                index_name,
+            },
+            new.index_epoch,
+            &new.root_hash,
+            &transition.writeback_digest,
+            abort,
+        )
+        .await?;
         let auth = Auth::new_internal(Access::full("private ORAM replication"));
         let _lock = self.acquire_private_oram_replication_lock().await?;
 
@@ -2647,6 +2712,7 @@ pub(crate) async fn commit_private_hnsw_paths_coordinated(
             // The epoch CAS is still unresolved: the prepared writeback stays on every replica
             // and the session stays in its commit phase until session recovery classifies the
             // settled consensus state.
+            context.leave_pending_for_recovery();
             Err(coordinate_error)
         }
         Err(coordinate_error) => {
@@ -2925,7 +2991,9 @@ pub(crate) async fn commit_private_result_oram_buckets_coordinated(
         Err(coordinate_error)
             if private_oram_writeback_outcome_indeterminate(&coordinate_error) =>
         {
-            // See the HNSW path: an unresolved CAS must not trigger a rollback.
+            // See the HNSW path: an unresolved CAS must not trigger a rollback, and the session
+            // stays in its commit phase for session recovery.
+            context.leave_pending_for_recovery();
             Err(coordinate_error)
         }
         Err(coordinate_error) => {

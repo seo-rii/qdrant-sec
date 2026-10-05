@@ -243,6 +243,13 @@ impl PrivateHnswOwnerWritebackContext {
             )
     }
 
+    /// Leaves the session in its commit phase for session recovery: used when the epoch CAS
+    /// outcome is indeterminate, where releasing the commit slot (as the drop guard would)
+    /// makes the later `recover_commit` fail after recovery has already moved the store.
+    pub(crate) fn leave_pending_for_recovery(&self) {
+        self.settled.store(true, Ordering::Release);
+    }
+
     pub(crate) fn cancel_staged_session(&self) -> StorageResult<()> {
         self.settled.store(true, Ordering::Release);
         session_registry()
@@ -505,7 +512,14 @@ impl PrivateHnswSessionRegistry {
                 "private HNSW ORAM recovery reservation is missing",
             ));
         }
-        self.open(session, now_unix)
+        let opened = self.open(session, now_unix);
+        if opened.is_err() {
+            // Keep holding the reservation until the caller's guard releases it: once the
+            // registry lock is dropped another caller could otherwise reserve the index and have
+            // that reservation removed by our guard.
+            self.active_upload_by_index.insert(index_key);
+        }
+        opened
     }
 
     fn close_owned(
@@ -1385,13 +1399,14 @@ pub async fn do_export_private_hnsw_initial_replication_bundle(
     vector_name: &str,
     max_bundle_bytes: usize,
 ) -> StorageResult<qdrant_sec::PrivateHnswOramUploadBundle> {
-    let record =
-        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
+    // Authorize the write-scoped export before the manifest is read and verified.
     let pass = auth.check_collection_access(
         collection_name,
         AccessRequirements::new().write(),
         "private_hnsw_initial_replication_export",
     )?;
+    let record =
+        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
     let collection = toc.get_collection(&pass).await?;
     let _guard =
         begin_private_hnsw_upload_write_window(&record.manifest.collection_id, vector_name)?;
@@ -1417,13 +1432,14 @@ pub async fn do_export_private_hnsw_live_replication_bundle(
     vector_name: &str,
     max_bundle_bytes: usize,
 ) -> StorageResult<PrivateHnswOramLiveReplicationBundle> {
-    let record =
-        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
+    // Authorize the write-scoped export before the manifest is read and verified.
     let pass = auth.check_collection_access(
         collection_name,
         AccessRequirements::new().write(),
         "private_hnsw_live_replication_export",
     )?;
+    let record =
+        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
     let collection = toc.get_collection(&pass).await?;
     let _guard =
         begin_private_hnsw_upload_write_window(&record.manifest.collection_id, vector_name)?;
@@ -2739,6 +2755,12 @@ pub async fn do_inspect_private_hnsw_recovery(
     collection_name: &str,
     vector_name: &str,
 ) -> StorageResult<PrivateHnswRecoveryContext> {
+    // The replica context below requires write access; check it before reading the manifest.
+    auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_hnsw_recovery_inspect",
+    )?;
     let record =
         do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
     let collection_id = record.manifest.collection_id.clone();
@@ -6970,6 +6992,38 @@ mod private_hnsw_tests {
         assert_eq!(response.session_id, "recovered-session");
         assert!(registry.active_upload_by_index.is_empty());
         assert!(registry.has_active_index("collection-uuid-1", "text", now));
+    }
+
+    #[test]
+    fn session_registry_keeps_recovery_reservation_when_open_fails() {
+        let now = 10;
+        let mut registry = PrivateHnswSessionRegistry::default();
+        for index in 0..MAX_SESSION_COUNT {
+            let mut session = fixture_session(&format!("capacity-session-{index}"), 20);
+            session.collection_id = format!("capacity-collection-{index}");
+            session.manifest.collection_id = session.collection_id.clone();
+            registry.open(session, now).unwrap();
+        }
+        registry
+            .begin_upload("collection-uuid-1", "text", now)
+            .unwrap();
+
+        registry
+            .open_after_upload_reservation(fixture_session("recovered-session", 20), now)
+            .unwrap_err();
+
+        // The reservation stays with the caller, whose guard releases it; nobody else can take
+        // the index in between.
+        assert!(
+            registry
+                .active_upload_by_index
+                .contains(&private_hnsw_index_key("collection-uuid-1", "text"))
+        );
+        assert!(
+            registry
+                .begin_upload("collection-uuid-1", "text", now)
+                .is_err()
+        );
     }
 
     #[test]

@@ -230,6 +230,13 @@ impl PrivateResultOramOwnerWritebackContext {
             )
     }
 
+    /// Leaves the session in its commit phase for session recovery: used when the epoch CAS
+    /// outcome is indeterminate, where releasing the commit slot (as the drop guard would)
+    /// makes the later `recover_commit` fail after recovery has already moved the store.
+    pub(crate) fn leave_pending_for_recovery(&self) {
+        self.settled.store(true, Ordering::Release);
+    }
+
     pub(crate) fn cancel_staged_session(&self) -> StorageResult<()> {
         self.settled.store(true, Ordering::Release);
         session_registry()
@@ -453,7 +460,15 @@ impl PrivateResultOramSessionRegistry {
                 "private result ORAM recovery reservation is missing",
             ));
         }
-        self.open(session, now_unix)
+        let collection_id = session.collection_id.clone();
+        let opened = self.open(session, now_unix);
+        if opened.is_err() {
+            // Keep holding the reservation until the caller's guard releases it: once the
+            // registry lock is dropped another caller could otherwise reserve the collection and
+            // have that reservation removed by our guard.
+            self.active_upload_by_collection.insert(collection_id);
+        }
+        opened
     }
 
     fn close_owned(
@@ -1166,12 +1181,13 @@ pub async fn do_export_private_result_oram_initial_replication_bundle(
     collection_name: &str,
     max_bundle_bytes: usize,
 ) -> StorageResult<PrivateResultOramUploadBundle> {
-    let record = do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
+    // Authorize the write-scoped export before the manifest is read and verified.
     let pass = auth.check_collection_access(
         collection_name,
         AccessRequirements::new().write(),
         "private_result_oram_initial_replication_export",
     )?;
+    let record = do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
     let collection = toc.get_collection(&pass).await?;
     let _guard = begin_private_result_oram_upload_write_window(&record.manifest.collection_id)?;
     let bundle = PrivateResultOramStore::new(collection.path())
@@ -1195,12 +1211,13 @@ pub async fn do_export_private_result_oram_live_replication_bundle(
     collection_name: &str,
     max_bundle_bytes: usize,
 ) -> StorageResult<PrivateResultOramLiveReplicationBundle> {
-    let record = do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
+    // Authorize the write-scoped export before the manifest is read and verified.
     let pass = auth.check_collection_access(
         collection_name,
         AccessRequirements::new().write(),
         "private_result_oram_live_replication_export",
     )?;
+    let record = do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
     let collection = toc.get_collection(&pass).await?;
     let _guard = begin_private_result_oram_upload_write_window(&record.manifest.collection_id)?;
     let bundle = PrivateResultOramStore::new(collection.path())
@@ -2384,6 +2401,12 @@ pub async fn do_inspect_private_result_oram_recovery(
     settings: &Settings,
     collection_name: &str,
 ) -> StorageResult<PrivateResultOramRecoveryContext> {
+    // The replica context below requires write access; check it before reading the manifest.
+    auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_result_oram_recovery_inspect",
+    )?;
     let record = do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
     let collection_id = record.manifest.collection_id.clone();
     let signing_key_id = record.manifest.owner_signing_key_id.clone();
@@ -4781,6 +4804,38 @@ mod private_result_oram_tests {
         assert_eq!(response.session_id, "recovered-session");
         assert!(registry.active_upload_by_collection.is_empty());
         assert!(registry.has_active_collection("collection-private-result-test", now));
+    }
+
+    #[test]
+    fn session_registry_keeps_recovery_reservation_when_open_fails() {
+        let now = 10;
+        let mut registry = PrivateResultOramSessionRegistry::default();
+        for index in 0..MAX_SESSION_COUNT {
+            let mut session = fixture_session(&format!("capacity-session-{index}"), 20);
+            session.collection_id = format!("capacity-collection-{index}");
+            session.manifest.collection_id = session.collection_id.clone();
+            registry.open(session, now).unwrap();
+        }
+        registry
+            .begin_upload("collection-private-result-test", now)
+            .unwrap();
+
+        registry
+            .open_after_upload_reservation(fixture_session("recovered-session", 20), now)
+            .unwrap_err();
+
+        // The reservation stays with the caller, whose guard releases it; nobody else can take
+        // the collection in between.
+        assert!(
+            registry
+                .active_upload_by_collection
+                .contains("collection-private-result-test")
+        );
+        assert!(
+            registry
+                .begin_upload("collection-private-result-test", now)
+                .is_err()
+        );
     }
 
     #[test]
