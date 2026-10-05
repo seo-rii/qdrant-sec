@@ -5245,9 +5245,9 @@ Known remaining limitations added by this pass:
   latent; enabling renewals needs the recovery plan, the parent descriptor
   digest and the exact-manifest lookup to accept the renewed lease together.
 - A crash between the manifest and signature renames of a manifest refresh
-  (both stores) leaves the new manifest next to the old signature; the
-  identical-retry arm then refuses forever and the files must be repaired by
-  hand. Writing manifest and signature as one record would remove the window.
+  (both stores) left the new manifest next to the old signature (fixed in
+  the thirteenth pass: an identical re-upload with a verified signature now
+  republishes the pair).
 - The V1 journal `transition` and `begin` paths read and publish through the
   root path rather than the pinned root descriptor that `acquire_lock`
   validated; only the recovery-authority path re-validates the root identity.
@@ -5261,3 +5261,83 @@ Known remaining limitations added by this pass:
 - The result manifest refresh may still change `created_at_unix`, which V2
   owner store verification pins; a refresh that changes it fails V2
   verification rather than being refused at upload.
+
+### Thirteenth pass: server-side result ORAM, mutation coordinator, mutation sessions and consensus authority audits
+
+This pass audited the server-side private result ORAM request handling
+(`src/common/private_result_oram.rs`), the distributed mutation coordinator
+and mutation session lifecycle (`src/common/private_oram_mutation.rs`,
+`private_oram_mutation_session.rs`) and the consensus-applied mutation
+authority (`lib/storage/.../private_oram_mutation_cleanup/authority.rs`).
+Fixed:
+
+- A single-node result ORAM or HNSW ORAM commit whose request future was
+  dropped while the store commit ran (client disconnect, gRPC deadline) never
+  recorded its outcome: the session stayed `commit_in_progress`, which expiry
+  and close skip, so the collection refused every later session, upload,
+  snapshot and lifecycle operation until restart. The store commit and the
+  registry update now run in one detached task that completes regardless of
+  the caller.
+- The result ORAM staged owner write-back marked itself settled before its
+  abort or finalize store call, so a failed store call skipped both the
+  registry update and the drop guard and left the commit slot held. It now
+  records the outcome only after the store call, as the HNSW context does.
+- A manifest refresh torn between the manifest and signature renames wedged
+  both stores (the identical-retry arm refused the matching manifest because
+  the signature differed). Both upload paths verify the signature against
+  the pinned owner key before the store is called, so an identical manifest
+  with a different signature now republishes the pair; tests cover the
+  repair in both stores.
+- Mutation session read routes (HNSW paths and result buckets) required only
+  read access although they move session state (read-in-progress flag and
+  path budget), and a missing session answered differently from one of
+  another collection. They now require write access like the other session
+  routes, and both cases return the same invalid-session error.
+
+Answered from the twelfth pass: admission recovery manifests verify owner
+attestations against embedded keys, but every consensus path that accepts a
+manifest (append prepared, admission, admission rejected) checks it against
+the retained reservation, whose owner signers were pinned to the activation
+authority manifest and whose roster equals the layout when it was applied;
+Admission additionally pins the manifest bytes to the prepared ones. A
+coordinator cannot get self-signed owner attestations accepted.
+
+Checked and left as is: RBAC before store work on every result ORAM route;
+manifest, read and commit signatures verified before state changes and
+pinned to the owner key; exact old+1 epoch CAS re-checked under the store
+lock; request batch caps, duplicate checks and base64 length pre-checks;
+registry capped at 1024 sessions with one writer per collection; no registry
+guard across `.await`; deterministic consensus apply (no wall clock, local
+files or map iteration order), guarded indexing and checked counters on
+replicated input, strict aggregate-digest and locator ordering with exact
+replay digests, bounded append history and challenge outcomes.
+
+Known remaining limitations added by this pass:
+
+- Commit validation (Ed25519 over the bucket references, ciphertext size
+  checks, the current-epoch file read) runs inside the process-wide result
+  ORAM registry mutex on an async worker; session open (pending write-back
+  recovery and a whole-tree proof read), bucket upload, replica
+  prepare/complete and bundle export run store I/O on async workers.
+- The staged owner write-back drop guard uses `try_lock` and gives up when
+  the registry mutex is busy; a lost release is recovered only by
+  coordinated recovery.
+- Restored-snapshot verification still re-reads and re-hashes the Merkle
+  tree once per 1024-bucket batch, and restore requires the current epoch to
+  equal the manifest anchor, so a snapshot of a collection that has committed
+  since its manifest upload cannot be restored.
+- A failed session open after an upload reservation drops the registry lock
+  before releasing the reservation, so the release can remove a reservation
+  taken by another caller in between.
+- Standalone result ORAM sessions are not bound to the principal that opened
+  them (the stored client id is unused), and reads need only read access.
+- Append prepared, admission and admission-rejected apply arms do not
+  re-check the reservation's activation-authority locator against the
+  current one; authority rotation has no consensus operation today, so this
+  is latent until rotation is enabled.
+- The mutation session registry's `seen_job_authorities` and
+  `cleanup_tombstones` sets grow by one entry per mutation for the process
+  lifetime.
+- Consensus apply does not check which peer proposed an abort decision or a
+  reserved-attempt rejection, so a Raft member can deny other coordinators'
+  appends (liveness only; all Raft peers are trusted, as upstream).
