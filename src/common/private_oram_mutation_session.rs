@@ -572,9 +572,12 @@ impl PrivateOramMutationSessionRegistryV2 {
         session_id: &str,
         _now_unix: u64,
     ) -> StorageResult<&mut PrivateOramMutationSessionV2> {
-        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
-            StorageError::bad_request("private ORAM mutation session is missing or expired")
-        })?;
+        // A missing session and one of another collection answer identically, so a caller
+        // probing session ids cannot tell which ids exist.
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(invalid_mutation_session)?;
         if session.collection_name != collection_name {
             return Err(invalid_mutation_session());
         }
@@ -1883,9 +1886,11 @@ pub(crate) async fn do_read_private_oram_mutation_hnsw_paths_v2(
 ) -> StorageResult<PrivateHnswReadPathsResponse> {
     // Authorize before the registry is touched: an unauthorized caller must neither flip the
     // session's read-in-progress state nor learn from distinct errors whether it exists.
+    // Reads move session state (read-in-progress, path budget), so they need the same write
+    // access as opening, reporting and closing the session.
     auth.check_collection_access(
         collection_name,
-        AccessRequirements::new(),
+        AccessRequirements::new().write(),
         "private_oram_mutation_read_hnsw_paths",
     )?;
     let leader = current_active_mutation_leader_token(dispatcher)?;
@@ -1942,7 +1947,7 @@ pub(crate) async fn do_read_private_oram_mutation_result_buckets_v2(
 ) -> StorageResult<PrivateResultOramReadBucketsResponse> {
     auth.check_collection_access(
         collection_name,
-        AccessRequirements::new(),
+        AccessRequirements::new().write(),
         "private_oram_mutation_read_result_buckets",
     )?;
     let leader = current_active_mutation_leader_token(dispatcher)?;

@@ -2398,52 +2398,62 @@ pub async fn do_commit_private_hnsw_paths(
         key_id: commit_signature.key_id.clone(),
         sig: commit_signature.sig.clone(),
     };
-    let committed = tokio::task::spawn_blocking(move || {
-        plan.store
-            .commit_writeback_with_signature(
-                &old,
-                &new,
-                plan.bucket_count,
-                &updated_buckets,
-                plan.max_bucket_ciphertext_bytes,
-                &store_commit_signature,
-                PrivateHnswSignatureVerification {
-                    expected_key_id: &store_commit_signature.key_id,
-                    public_key: &plan.public_key,
-                },
-            )
-            .map_err(private_hnsw_commit_writeback_store_error)
+    // The store commit and the registry outcome run in one detached task: if the request future
+    // is dropped (client disconnect, gRPC deadline) while the commit is in flight, the outcome
+    // is still recorded instead of leaving the session `commit_in_progress` forever.
+    let collection_crypto_id = request_context.collection_crypto_id.clone();
+    let vector_name = vector_name.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let committed = tokio::task::spawn_blocking(move || {
+            plan.store
+                .commit_writeback_with_signature(
+                    &old,
+                    &new,
+                    plan.bucket_count,
+                    &updated_buckets,
+                    plan.max_bucket_ciphertext_bytes,
+                    &store_commit_signature,
+                    PrivateHnswSignatureVerification {
+                        expected_key_id: &store_commit_signature.key_id,
+                        public_key: &plan.public_key,
+                    },
+                )
+                .map_err(private_hnsw_commit_writeback_store_error)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(StorageError::service_error(
+                "private HNSW ORAM commit task failed",
+            ))
+        });
+        let mut registry = session_registry().lock().map_err(|_| {
+            StorageError::service_error("private HNSW ORAM session registry poisoned")
+        })?;
+        match committed {
+            Ok(committed) => {
+                registry.complete_commit(
+                    &collection_crypto_id,
+                    &vector_name,
+                    &session_id,
+                    &committed,
+                    now_unix,
+                    session_lease_expires_unix(now_unix)?,
+                )?;
+                Ok(committed)
+            }
+            Err(error) => {
+                let _ = registry.cancel_commit(&collection_crypto_id, &vector_name, &session_id);
+                Err(error)
+            }
+        }
     })
     .await
     .unwrap_or_else(|_| {
         Err(StorageError::service_error(
             "private HNSW ORAM commit task failed",
         ))
-    });
-    let mut registry = session_registry()
-        .lock()
-        .map_err(|_| StorageError::service_error("private HNSW ORAM session registry poisoned"))?;
-    match committed {
-        Ok(committed) => {
-            registry.complete_commit(
-                &request_context.collection_crypto_id,
-                vector_name,
-                session_id,
-                &committed,
-                now_unix,
-                session_lease_expires_unix(now_unix)?,
-            )?;
-            Ok(committed)
-        }
-        Err(error) => {
-            let _ = registry.cancel_commit(
-                &request_context.collection_crypto_id,
-                vector_name,
-                session_id,
-            );
-            Err(error)
-        }
-    }
+    })
 }
 
 pub async fn do_close_private_hnsw_session(

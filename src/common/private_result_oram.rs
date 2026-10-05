@@ -184,7 +184,8 @@ impl PrivateResultOramOwnerWritebackContext {
     }
 
     pub(crate) fn abort_local(&self) -> StorageResult<()> {
-        self.settled.store(true, Ordering::Release);
+        // `settled` is recorded only once the store outcome is known, as in the HNSW context:
+        // a failed store call must leave the drop guard able to release the commit slot.
         self.store
             .abort_replica_writeback_with_signature(
                 &self.transition,
@@ -192,6 +193,7 @@ impl PrivateResultOramOwnerWritebackContext {
                 self.signature_verification(),
             )
             .map_err(private_result_oram_commit_writeback_store_error)?;
+        self.settled.store(true, Ordering::Release);
         session_registry()
             .lock()
             .map_err(|_| {
@@ -205,7 +207,6 @@ impl PrivateResultOramOwnerWritebackContext {
         now_unix: u64,
         lease_expires_unix: u64,
     ) -> StorageResult<()> {
-        self.settled.store(true, Ordering::Release);
         let committed = self
             .store
             .commit_replica_writeback_with_signature(
@@ -214,6 +215,7 @@ impl PrivateResultOramOwnerWritebackContext {
                 self.signature_verification(),
             )
             .map_err(private_result_oram_commit_writeback_store_error)?;
+        self.settled.store(true, Ordering::Release);
         session_registry()
             .lock()
             .map_err(|_| {
@@ -2060,47 +2062,61 @@ pub async fn do_commit_private_result_oram_buckets(
         index_epoch: new_epoch,
         root_hash: new_root_hash,
     };
-    let committed = tokio::task::spawn_blocking(move || {
-        plan.store
-            .commit_writeback_with_signature(
-                &old,
-                &new,
-                plan.bucket_count,
-                &updated_buckets,
-                plan.max_bucket_ciphertext_bytes,
-                &commit_signature,
-                PrivateResultOramSignatureVerification {
-                    expected_key_id: &commit_signature.key_id,
-                    public_key: &plan.public_key,
-                },
-            )
-            .map_err(private_result_oram_commit_writeback_store_error)
+    // The store commit and the registry outcome run in one detached task: if the request future
+    // is dropped (client disconnect, gRPC deadline) while the commit is in flight, the outcome
+    // is still recorded instead of leaving the session `commit_in_progress` forever, which would
+    // block every later session, upload, snapshot and lifecycle operation on the collection.
+    let collection_crypto_id = request_context.collection_crypto_id.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let committed = tokio::task::spawn_blocking(move || {
+            plan.store
+                .commit_writeback_with_signature(
+                    &old,
+                    &new,
+                    plan.bucket_count,
+                    &updated_buckets,
+                    plan.max_bucket_ciphertext_bytes,
+                    &commit_signature,
+                    PrivateResultOramSignatureVerification {
+                        expected_key_id: &commit_signature.key_id,
+                        public_key: &plan.public_key,
+                    },
+                )
+                .map_err(private_result_oram_commit_writeback_store_error)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(StorageError::service_error(
+                "private result ORAM commit task failed",
+            ))
+        });
+        let mut registry = session_registry().lock().map_err(|_| {
+            StorageError::service_error("private result ORAM session registry poisoned")
+        })?;
+        match committed {
+            Ok(committed) => {
+                registry.complete_commit(
+                    &collection_crypto_id,
+                    &session_id,
+                    &committed,
+                    now_unix,
+                    session_lease_expires_unix(now_unix)?,
+                )?;
+                Ok(committed)
+            }
+            Err(error) => {
+                let _ = registry.cancel_commit(&collection_crypto_id, &session_id);
+                Err(error)
+            }
+        }
     })
     .await
     .unwrap_or_else(|_| {
         Err(StorageError::service_error(
             "private result ORAM commit task failed",
         ))
-    });
-    let mut registry = session_registry().lock().map_err(|_| {
-        StorageError::service_error("private result ORAM session registry poisoned")
-    })?;
-    match committed {
-        Ok(committed) => {
-            registry.complete_commit(
-                &request_context.collection_crypto_id,
-                session_id,
-                &committed,
-                now_unix,
-                session_lease_expires_unix(now_unix)?,
-            )?;
-            Ok(committed)
-        }
-        Err(error) => {
-            let _ = registry.cancel_commit(&request_context.collection_crypto_id, session_id);
-            Err(error)
-        }
-    }
+    })
 }
 
 pub async fn do_close_private_result_oram_session(
