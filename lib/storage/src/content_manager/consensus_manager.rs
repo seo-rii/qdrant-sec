@@ -732,6 +732,26 @@ impl ConsensusApplyReceipt {
     }
 }
 
+/// Classifies a private ORAM topology meta-op that did not reach its committed state. A
+/// deterministic refusal (any non-service error) that left the topology `Pending` is the same
+/// on every replica, so it is returned as is and rejects the entry; a local failure or a
+/// partially applied transition stays a service error and stops consensus.
+fn private_oram_meta_op_not_applied(
+    apply_result: Result<bool, StorageError>,
+    state: PrivateOramLayoutTransitionState,
+    message: &'static str,
+) -> StorageError {
+    match apply_result {
+        Err(error)
+            if state == PrivateOramLayoutTransitionState::Pending
+                && !matches!(error, StorageError::ServiceError { .. }) =>
+        {
+            error
+        }
+        _ => StorageError::service_error(message),
+    }
+}
+
 impl<C: CollectionContainer> ConsensusManager<C> {
     pub fn new(
         persistent_state: Persistent,
@@ -1184,22 +1204,30 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.apply_normal_entry_inner(entry, NormalEntryApplyContext::CommittedAtCurrentCursor)
     }
 
+    /// Resolves the term of the entry the activation proof is anchored on.
+    ///
+    /// This runs inside apply, so every outcome must be the same on every replica regardless of
+    /// local WAL compaction or snapshot timing: a refusal is a `bad_request` (rejected entry),
+    /// never a service error that stops consensus.
+    /// - An enable barrier resolves from the durable pending activation: its proof was checked
+    ///   against the real base term when the prepare barrier applied, and the base entry may
+    ///   since have been compacted from the local WAL.
+    /// - A prepare barrier applied at `entry_index` must sit directly after its base entry, which
+    ///   is then the last applied entry and is never compacted.
     fn private_oram_activation_barrier_base_term(
         &self,
         operation: &PrivateOramMutationActivationBarrierV2,
+        entry_index: Option<u64>,
     ) -> Result<u64, StorageError> {
+        let unavailable = || {
+            StorageError::bad_request("private ORAM mutation activation base term is unavailable")
+        };
         let proof = operation.decode_proof()?;
-        let base_index = proof.expected_hard_commit();
-        let snapshot_meta = self.persistent.read().latest_snapshot_meta().clone();
-        if snapshot_meta.index == base_index {
-            if snapshot_meta.term == 0 {
-                return Err(StorageError::service_error(
-                    "private ORAM mutation activation base term is unavailable",
-                ));
-            }
-            return Ok(snapshot_meta.term);
-        }
-        if base_index < snapshot_meta.index {
+        if matches!(
+            operation.phase(),
+            PrivateOramMutationActivationBarrierPhaseV2::EnableMutationV2
+                | PrivateOramMutationActivationBarrierPhaseV2::EnableReservationV3Writes
+        ) {
             let pending_enable = self
                 .persistent
                 .read()
@@ -1210,24 +1238,39 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 .as_ref()
                 == Some(operation);
             if pending_enable {
-                // The signed proof binds the compacted base entry term. Only the exact enable
-                // operation reconstructed from durable pending state may use it after snapshot
-                // installation; a new prepare with an old base remains rejected.
                 return Ok(proof.expected_commit_entry_term());
             }
+            return Err(StorageError::bad_request(
+                "private ORAM mutation activation enable barrier does not match the pending activation",
+            ));
+        }
+        let base_index = proof.expected_hard_commit();
+        if let Some(entry_index) = entry_index
+            && base_index.checked_add(1) != Some(entry_index)
+        {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation activation prepare barrier must follow its base entry",
+            ));
+        }
+        let snapshot_meta = self.persistent.read().latest_snapshot_meta().clone();
+        if snapshot_meta.index == base_index {
+            if snapshot_meta.term == 0 {
+                return Err(unavailable());
+            }
+            return Ok(snapshot_meta.term);
+        }
+        if base_index < snapshot_meta.index {
             return Err(StorageError::bad_request(
                 "private ORAM mutation activation proof is older than the installed snapshot",
             ));
         }
-        let base_entry = self.wal.lock().entry(base_index).map_err(|_| {
-            StorageError::service_error(
-                "private ORAM mutation activation base entry is unavailable",
-            )
-        })?;
+        let base_entry = self
+            .wal
+            .lock()
+            .entry(base_index)
+            .map_err(|_| unavailable())?;
         if base_entry.term == 0 {
-            return Err(StorageError::service_error(
-                "private ORAM mutation activation base term is unavailable",
-            ));
+            return Err(unavailable());
         }
         Ok(base_entry.term)
     }
@@ -1248,7 +1291,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             )
         };
         let proof = operation.decode_proof()?;
-        let base_term = self.private_oram_activation_barrier_base_term(operation)?;
+        let base_term = self.private_oram_activation_barrier_base_term(operation, None)?;
         let persistent = self.persistent.read();
         let hard_commit = persistent.state.hard_state.commit;
         let phase_preconditions_hold = match operation.phase() {
@@ -3125,7 +3168,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             },
             ConsensusOperations::ActivatePrivateOramMutationV2(operation) => match context {
                 NormalEntryApplyContext::CommittedAtCurrentCursor => {
-                    let base_term = self.private_oram_activation_barrier_base_term(&operation)?;
+                    let base_term = self
+                        .private_oram_activation_barrier_base_term(&operation, Some(entry.index))?;
                     match self
                         .persistent
                         .write()
@@ -3248,13 +3292,15 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             let apply_result = self
                 .toc
                 .perform_private_oram_collection_layout_meta_op(transition);
-            if !matches!(apply_result, Ok(true))
-                && self.toc.private_oram_layout_transition_state(transition)?
-                    != PrivateOramLayoutTransitionState::Applied
-            {
-                return Err(StorageError::service_error(
-                    "private ORAM collection layout transition was not applied",
-                ));
+            if !matches!(apply_result, Ok(true)) {
+                let state = self.toc.private_oram_layout_transition_state(transition)?;
+                if state != PrivateOramLayoutTransitionState::Applied {
+                    return Err(private_oram_meta_op_not_applied(
+                        apply_result,
+                        state,
+                        "private ORAM collection layout transition was not applied",
+                    ));
+                }
             }
         }
         self.persistent
@@ -3329,15 +3375,17 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             let apply_result = self
                 .toc
                 .perform_collection_meta_op((*operation.collection_meta).clone());
-            if !matches!(apply_result, Ok(true))
-                && self
+            if !matches!(apply_result, Ok(true)) {
+                let state = self
                     .toc
-                    .private_oram_shard_transfer_finish_state(operation)?
-                    != PrivateOramLayoutTransitionState::Applied
-            {
-                return Err(StorageError::service_error(
-                    "private ORAM shard transfer finish was not applied",
-                ));
+                    .private_oram_shard_transfer_finish_state(operation)?;
+                if state != PrivateOramLayoutTransitionState::Applied {
+                    return Err(private_oram_meta_op_not_applied(
+                        apply_result,
+                        state,
+                        "private ORAM shard transfer finish was not applied",
+                    ));
+                }
             }
         }
         self.persistent
@@ -3365,13 +3413,15 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             .validate_private_oram_resharding_operation(operation)?;
         if topology_state == PrivateOramLayoutTransitionState::Pending {
             let apply_result = self.toc.perform_private_oram_resharding_meta_op(operation);
-            if !matches!(apply_result, Ok(true))
-                && self.toc.private_oram_resharding_state(operation)?
-                    != PrivateOramLayoutTransitionState::Applied
-            {
-                return Err(StorageError::service_error(
-                    "private ORAM resharding start was not applied",
-                ));
+            if !matches!(apply_result, Ok(true)) {
+                let state = self.toc.private_oram_resharding_state(operation)?;
+                if state != PrivateOramLayoutTransitionState::Applied {
+                    return Err(private_oram_meta_op_not_applied(
+                        apply_result,
+                        state,
+                        "private ORAM resharding start was not applied",
+                    ));
+                }
             }
         }
         if self.toc.private_oram_resharding_state(operation)?
@@ -3396,13 +3446,15 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         // Meta-op first, layout CAS second (see `apply_private_oram_collection_layout_transition`).
         if topology_state == PrivateOramLayoutTransitionState::Pending {
             let apply_result = self.toc.perform_private_oram_resharding_meta_op(operation);
-            if !matches!(apply_result, Ok(true))
-                && self.toc.private_oram_resharding_state(operation)?
-                    != PrivateOramLayoutTransitionState::Applied
-            {
-                return Err(StorageError::service_error(
-                    "private ORAM resharding finish was not applied",
-                ));
+            if !matches!(apply_result, Ok(true)) {
+                let state = self.toc.private_oram_resharding_state(operation)?;
+                if state != PrivateOramLayoutTransitionState::Applied {
+                    return Err(private_oram_meta_op_not_applied(
+                        apply_result,
+                        state,
+                        "private ORAM resharding finish was not applied",
+                    ));
+                }
             }
         }
         self.persistent
@@ -4943,7 +4995,7 @@ mod tests {
         }
         assert_eq!(
             manager
-                .private_oram_activation_barrier_base_term(&fixture.enable_operation)
+                .private_oram_activation_barrier_base_term(&fixture.enable_operation, None)
                 .unwrap(),
             fixture.base_entry_term,
         );
