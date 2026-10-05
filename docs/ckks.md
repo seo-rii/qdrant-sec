@@ -5415,3 +5415,74 @@ Known remaining limitations added by this pass:
   committed CAS still passes the new consensus check.
 - `private_hnsw_oram_api_required_message` echoes the requested vector
   name.
+
+### Fifteenth pass: write-back coordinator, peer client and consensus manager audits
+
+This pass audited the coordinator side of the replicated private ORAM
+write-back (`lib/storage/src/dispatcher.rs`), the peer client for the
+internal private ORAM RPCs (`lib/collection/src/shards/channel_service.rs`)
+and the private ORAM parts of the consensus manager
+(`lib/storage/src/content_manager/consensus_manager.rs`). Fixed:
+
+- A coordinator whose own apply of a committed epoch CAS failed locally
+  (persistence fenced, indeterminate save) read the `Failed` outcome as a
+  definite rejection and aborted every prepared journal, although the entry
+  had committed and the other replicas had applied it, leaving consensus at
+  the new epoch with stores that lack its buckets. A service error from the
+  local apply is now an indeterminate outcome (the CAS is re-proposed, and
+  the prepared journals are retained if it stays unresolved), and a rejected
+  attempt that finds consensus already at the requested state is treated as
+  applied on every attempt, not only on retries.
+- The activation barrier resolved its base term from the local WAL inside
+  apply, so ordinary local WAL compaction made the enable barrier fail with
+  a service error on that node (stopping consensus there on every restart)
+  and made it impossible for the leader to propose, which left every general
+  proposal blocked behind the pending activation. An enable barrier now
+  resolves its term from the durable pending activation (whose proof was
+  checked against the real base term when the prepare barrier applied), a
+  prepare barrier must directly follow its base entry, and every remaining
+  miss rejects the entry instead of stopping consensus.
+- A deterministic refusal of a private ORAM topology meta-op (layout
+  transition, shard transfer finish, resharding start and finish) that left
+  the topology pending was converted into a service error, which stops
+  consensus on every node (for example a resharding start whose
+  crypto-runtime parity check fails after a peer metadata update). Such a
+  refusal now rejects the entry; local failures and partially applied
+  transitions still stop consensus.
+
+Checked and left as is: the CAS is proposed only after every prepare is
+acknowledged by exactly the required peers; unresolved CAS attempts keep the
+prepared journals; re-proposal is idempotent; replica sets are computed once
+per write-back; peer calls are bounded by timeouts and retries; error texts
+from peers are replaced by fixed strings; V2/V3 owner RPCs require TLS, cap
+decode sizes and re-check pinned addresses; proposal waits are bounded; no
+std lock is held across `.await`; no wall clock in apply.
+
+Known remaining limitations added by this pass:
+
+- Deleting an encrypted collection whose V2 mutation authority has an
+  authority floor fails the save after pruning (the floor checkpoint refuses
+  a disappearing floor), which stops consensus on every node; after restart
+  the replay finds the collection gone and the records stay leaked. Pruning
+  also reads node-local collection config (divergence across nodes, records
+  leaked when the config lists no ORAM index), and a follower that lags
+  across such a prune refuses the leader's snapshot ("would roll back
+  committed state") fatally. A deterministic fix needs a replicated
+  collection-id to ORAM-key index maintained by the CAS and mutation apply
+  paths, and pruning by `collection_id` inside the same atomic patch.
+- Shard transfer start applies its layout CAS before the meta-op, so a
+  deterministic meta-op refusal there still stops consensus rather than
+  leave a partial transition.
+- Legacy prepare/finalize/abort/install peer RPCs do not require TLS or
+  re-check the pinned address, a replica's prepare acknowledgement only
+  echoes the digest the request carried, and their responses are decoded
+  without a size cap on the shared peer channel.
+- If any replica finalize fails after the CAS committed, the coordinator
+  skips its own local finalize until session recovery; recovery completion
+  re-derives the replica set and requires every replica to be active; an
+  abort timeout is reported as an unresolved CAS.
+- Early returns in the activation-barrier and delete-prune apply paths drop
+  the proposer's notification (reported as indeterminate), proposal-time
+  refusals are only logged (the proposer waits for the full timeout), and
+  `await_for_multiple_operations` leaves senders behind on timeout
+  (upstream).
