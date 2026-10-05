@@ -162,6 +162,12 @@ jobs:
           cargo test --locked -p qdrant shard_snapshot_recovery_
           cargo test --locked -p storage encrypted_snapshot_recovery_
 
+      - name: Run private ORAM store, journal, consensus and server tests
+        run: |
+          cargo test --locked -p collection --lib -- private_hnsw_oram_store private_result_oram_store private_oram_owner_store_adapter
+          cargo test --locked -p storage --lib -- private_oram consensus_manager consensus::persistent dispatcher
+          cargo test --locked -p qdrant --bin qdrant -- private_hnsw private_result_oram private_oram qdrant_internal_api
+
       - name: Run CLI snapshot crypto preflight tests
         run: cargo test --locked -p qdrant cli_snapshot_crypto_preflight_rejects
 
