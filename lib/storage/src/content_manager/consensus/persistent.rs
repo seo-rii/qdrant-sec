@@ -1889,8 +1889,11 @@ impl<'a> PrivateOramMutationPatchView<'a> {
         self.private_oram_mutation_lease_slots
             .get(key_digest)
             .map(|wire| {
+                // Every replica holds the same tagged slot, so refusing the legacy operation is
+                // deterministic: reject the entry (and advance the apply cursor) instead of
+                // raising a service error, which stops consensus on every node for good.
                 wire.historical_raw_slot().cloned().ok_or_else(|| {
-                    StorageError::service_error(
+                    StorageError::bad_request(
                         "legacy private ORAM mutation operation encountered tagged authority state",
                     )
                 })
@@ -2236,11 +2239,14 @@ impl Persistent {
                             "private ORAM mutation V3 floor upgrade authority is inconsistent",
                         )
                     })?;
+                    // A reservation can commit between the proposer's quiescence check and this
+                    // entry; reject the barrier deterministically so it can be re-proposed rather
+                    // than stopping consensus on every node.
                     if current
                         .aggregate()
                         .is_some_and(|aggregate| !aggregate.is_reservation_v3_floor_quiescent())
                     {
-                        return Err(StorageError::service_error(
+                        return Err(StorageError::bad_request(
                             "private ORAM mutation V3 floor upgrade requires quiescent reservation history",
                         ));
                     }
@@ -8134,7 +8140,7 @@ mod tests {
         let error = reloaded
             .compare_and_swap_private_oram_mutation_lease(&private_oram_mutation_acquire(&fixture))
             .unwrap_err();
-        assert!(matches!(error, StorageError::ServiceError { .. }));
+        assert!(matches!(error, StorageError::BadRequest { .. }));
         assert!(error.to_string().contains("tagged authority state"));
         assert_eq!(
             persistent_state_file_digest(&reloaded.path).unwrap(),
