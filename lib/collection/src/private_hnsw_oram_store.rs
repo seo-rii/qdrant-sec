@@ -1518,10 +1518,17 @@ impl PrivateHnswOramStore {
                     if stored_manifest.index_epoch == current.index_epoch
                         && stored_manifest.root_hash == current.root_hash =>
                 {
-                    if stored_manifest != *manifest || stored_signature != *signature {
+                    if stored_manifest != *manifest {
                         return Err(CollectionError::bad_request(
                             "private HNSW ORAM manifest upload does not match existing current manifest",
                         ));
+                    }
+                    if stored_signature != *signature {
+                        // The manifest and its signature are two renames; a crash between them
+                        // leaves the refreshed manifest beside the previous signature. The
+                        // upload path verifies `signature` over `manifest` against the pinned
+                        // owner key before calling here, so republishing it repairs the pair.
+                        return self.write_manifest_under_owner_lock(lock, manifest, signature);
                     }
                     Ok(())
                 }
@@ -7133,6 +7140,43 @@ mod tests {
         assert!(!rendered.contains(&signature.sig));
         assert!(!rendered.contains(&manifest.root_hash));
         assert_eq!(store.read_current_epoch().unwrap(), epoch);
+        assert_eq!(store.read_manifest().unwrap(), (manifest, signature));
+    }
+
+    #[test]
+    fn current_manifest_reupload_repairs_a_torn_signature() {
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let manifest = fixture_manifest();
+        let stale_signature = fixture_signature();
+        let epoch = PrivateHnswOramEpochState {
+            index_epoch: manifest.index_epoch,
+            root_hash: manifest.root_hash.clone(),
+        };
+        store
+            .write_manifest_with_initial_epoch_if_absent_or_matching(
+                &manifest,
+                &stale_signature,
+                &epoch,
+            )
+            .unwrap();
+
+        // A crash between the manifest and signature renames leaves the current manifest beside
+        // another signature; re-uploading the verified pair must repair it, not wedge it.
+        let signature = PrivateHnswOramSignature {
+            sig: BASE64URL_NOPAD.encode(&[8; 64]),
+            ..stale_signature.clone()
+        };
+        store
+            .write_manifest_with_initial_epoch_if_absent_or_matching(&manifest, &signature, &epoch)
+            .unwrap();
+        assert_eq!(
+            store.read_manifest().unwrap(),
+            (manifest.clone(), signature.clone())
+        );
+        store
+            .write_manifest_with_initial_epoch_if_absent_or_matching(&manifest, &signature, &epoch)
+            .unwrap();
         assert_eq!(store.read_manifest().unwrap(), (manifest, signature));
     }
 
