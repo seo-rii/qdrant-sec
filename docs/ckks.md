@@ -5494,7 +5494,11 @@ This pass audited the local private ORAM floor checkpoint store
 loop (`src/consensus.rs`). It also added the private ORAM store, journal,
 consensus and server test filters to the `qdrant-sec CI` workflow: the
 workflow compiled those targets but ran none of their private ORAM tests,
-including the regression tests added by earlier passes. Fixed:
+including the regression tests added by earlier passes. Their first run
+found three stale tests, now aligned: a stale-root CAS test and an owner
+store adapter fixture still used epoch gaps that the exact old+1 rule
+refuses, and the activation-pending scan test expected the error the fix
+below removes. Fixed:
 
 - The leader's activation-pending scan, which gates learner promotion and
   ordinary proposals on every loop iteration, returned a service error for
