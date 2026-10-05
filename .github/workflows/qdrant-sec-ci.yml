@@ -163,10 +163,22 @@ jobs:
           cargo test --locked -p storage encrypted_snapshot_recovery_
 
       - name: Run private ORAM store, journal, consensus and server tests
+        shell: bash
         run: |
-          cargo test --locked -p collection --lib -- private_hnsw_oram_store private_result_oram_store private_oram_owner_store_adapter
-          cargo test --locked -p storage --lib -- private_oram consensus_manager consensus::persistent dispatcher
-          cargo test --locked -p qdrant --bin qdrant -- private_hnsw private_result_oram private_oram qdrant_internal_api
+          status=0
+          run_tests() {
+            cargo test --locked "$@" 2>&1 | tee -a private-oram-tests.log
+            return "${PIPESTATUS[0]}"
+          }
+          run_tests -p collection --lib -- private_hnsw_oram_store private_result_oram_store private_oram_owner_store_adapter || status=1
+          run_tests -p storage --lib -- private_oram consensus_manager consensus::persistent dispatcher || status=1
+          run_tests -p qdrant --bin qdrant -- private_hnsw private_result_oram private_oram qdrant_internal_api || status=1
+          if [ "$status" -ne 0 ]; then
+            # Surface failing tests and panic sites as one annotation (job logs need admin rights).
+            summary=$({ grep -E '^test .* FAILED$|^error(\[|:)' private-oram-tests.log; grep -A3 'panicked at' private-oram-tests.log; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=private ORAM tests failed::${summary}"
+          fi
+          exit "$status"
 
       - name: Run CLI snapshot crypto preflight tests
         run: cargo test --locked -p qdrant cli_snapshot_crypto_preflight_rejects
