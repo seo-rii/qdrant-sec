@@ -2978,21 +2978,21 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             return Ok(false);
         }
 
+        // This scan only gates promotions and ordinary proposals, and it reads uncommitted
+        // entries a peer may have forwarded: an unreadable or undecodable entry is treated as a
+        // possible pending activation (fail closed) instead of an error, which would stop the
+        // leader's consensus thread before Raft could even truncate the entry.
         let wal = self.wal.lock();
         for index in first_index..=last_log_index {
-            let entry = wal.entry(index).map_err(|_| {
-                StorageError::service_error(
-                    "private ORAM mutation activation transition WAL entry is unavailable",
-                )
-            })?;
+            let Ok(entry) = wal.entry(index) else {
+                return Ok(true);
+            };
             if entry.get_entry_type() != EntryType::EntryNormal || entry.get_data().is_empty() {
                 continue;
             }
-            let operation = ConsensusOperations::try_from(&entry).map_err(|_| {
-                StorageError::service_error(
-                    "private ORAM mutation activation transition WAL entry is malformed",
-                )
-            })?;
+            let Ok(operation) = ConsensusOperations::try_from(&entry) else {
+                return Ok(true);
+            };
             if matches!(
                 operation,
                 ConsensusOperations::ActivatePrivateOramMutationV2(_)
