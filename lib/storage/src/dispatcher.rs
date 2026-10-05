@@ -570,10 +570,17 @@ impl Dispatcher {
                     "private ORAM consensus epoch/root CAS was not applied",
                 ))
             }
-            ConsensusProposalOutcome::NotSubmitted(error)
-            | ConsensusProposalOutcome::Failed(error) => {
+            ConsensusProposalOutcome::NotSubmitted(error) => {
                 PrivateOramEpochCasOutcome::Rejected(error)
             }
+            // `Failed` means the entry committed and this peer's apply returned an error. A
+            // service error there is local (persistence fenced, indeterminate save) while the
+            // other replicas may have applied the CAS, so it must not be read as a rejection
+            // that licenses rolling prepared writebacks back.
+            ConsensusProposalOutcome::Failed(error @ StorageError::ServiceError { .. }) => {
+                PrivateOramEpochCasOutcome::Indeterminate(error)
+            }
+            ConsensusProposalOutcome::Failed(error) => PrivateOramEpochCasOutcome::Rejected(error),
             ConsensusProposalOutcome::Indeterminate(error) => {
                 PrivateOramEpochCasOutcome::Indeterminate(error)
             }
@@ -600,12 +607,16 @@ impl Dispatcher {
             {
                 PrivateOramEpochCasOutcome::Applied => return Ok(()),
                 PrivateOramEpochCasOutcome::Rejected(error) => {
-                    if attempt > 0
-                        && self.private_oram_consensus_epoch(&operation.key)?.as_ref()
-                            == Some(&operation.new)
+                    if self.private_oram_consensus_epoch(&operation.key)?.as_ref()
+                        == Some(&operation.new)
                     {
-                        // The earlier unresolved attempt did commit; the retry lost the CAS
-                        // against the state it produced.
+                        // An earlier unresolved attempt (or the same write-back's earlier
+                        // proposal) did commit; this attempt lost the CAS against the state it
+                        // produced.
+                        log::debug!(
+                            "private ORAM epoch CAS was rejected on attempt {} against its own committed state",
+                            attempt + 1
+                        );
                         return Ok(());
                     }
                     return Err(error);
