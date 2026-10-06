@@ -8108,8 +8108,20 @@ mod tests {
         let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
         install_private_oram_mutation_fixture(&mut persistent, &fixture);
         let key_digest = private_oram_mutation_key_digest(&fixture.key);
+        // The floor checkpoint only accepts the activated authority after the tagged legacy
+        // authority was durable at the pre-activation format floor.
+        let legacy = mutation_legacy_authority(&fixture);
+        persistent.private_oram_mutation_lease_slots.insert(
+            key_digest.clone(),
+            DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(legacy.clone()),
+        );
+        persistent.private_oram_mutation_format_floor = Some(mutation_format_floor(1, false, 1));
+        persistent.state.hard_state.commit = 1;
+        persistent.latest_snapshot_meta.index = 1;
+        persistent.apply_progress_queue.set_from_snapshot(1);
+        persistent.save().unwrap();
         let activated = activate_private_oram_mutation_authority_v2(
-            &mutation_legacy_authority(&fixture),
+            &legacy,
             &fixture.key.collection_id,
             private_oram_mutation_activation_context_for_test(
                 test_digest(1),
