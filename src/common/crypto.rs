@@ -8783,6 +8783,16 @@ impl AwsKmsMasterKeyProvider {
         if access_key_id.is_empty() || secret_access_key.is_empty() || region.is_empty() {
             return Err(qdrant_sec::EncryptionError::SealFailed);
         }
+        // The region is spliced into the default endpoint host and also signs the request: a
+        // value such as `x.attacker.net#` would send the signed request and session token to
+        // another host, so it must look like an AWS region identifier.
+        if region.len() > 32
+            || !region
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(qdrant_sec::EncryptionError::SealFailed);
+        }
         let endpoint_url = match aws_kms_env(&self.env_prefix, "ENDPOINT_URL") {
             Ok(endpoint_url) => {
                 validate_aws_kms_endpoint_url(&endpoint_url, self.expected_host.as_deref())
@@ -9390,7 +9400,14 @@ impl MasterKeyProvider for VaultTransitMasterKeyProvider {
                 .decode(plaintext.as_bytes())
                 .map_err(|_| qdrant_sec::EncryptionError::InvalidEncoding)?,
         );
-        if wrapped.version == VAULT_TRANSIT_BOUND_BLOB_VERSION {
+        // Stored materials keep only the nonce and ciphertext, not the blob version, so the
+        // decode path always presents version 1. The plaintext shape is unambiguous instead: a
+        // bound plaintext is tag || SHA-256(aad) || key (65 bytes), a legacy one is the bare
+        // 32-byte key. Opening a bound plaintext as a bare key failed outright, and treating it
+        // by version alone skipped the scope check for every stored blob.
+        if wrapped.version == VAULT_TRANSIT_BOUND_BLOB_VERSION
+            || plaintext.len() > 1 + VAULT_TRANSIT_BINDING_DIGEST_LEN
+        {
             return vault_transit_unbind_plaintext(plaintext.as_slice(), aad);
         }
         // Version 1 blobs predate the in-plaintext scope binding and rely on Transit `context`
@@ -16557,6 +16574,80 @@ mod tests {
         }
 
         assert_eq!(decoded.as_bytes(), &[37u8; 32]);
+    }
+
+    #[test]
+    fn decode_wrapped_resource_key_opens_scope_bound_vault_transit_plaintext() {
+        let wrapping_material_name = "tenant-a/mk-vault-bound";
+        let material_name = "tenant-a/payload-rk-bound";
+        let wrapped_material = CryptoMaterialConfig {
+            kind: "wrapped_symmetric_key_32".to_string(),
+            wrapped_by: Some(wrapping_material_name.to_string()),
+            wrap_algorithm: Some(VAULT_TRANSIT_WRAP_ALGORITHM.to_string()),
+            nonce: Some(VAULT_TRANSIT_NONCE_SENTINEL_B64.to_string()),
+            wrapped_key_b64: Some(BASE64URL_NOPAD.encode(b"vault:v1:bound-ciphertext")),
+            rk_epoch: Some(5),
+            state: Some("active".to_string()),
+            scope: Some("collection:docs/payload:body".to_string()),
+            ..CryptoMaterialConfig::default()
+        };
+        // What `wrap_resource_key` hands to Transit for this material and scope.
+        let aad = resource_key_wrap_aad(
+            material_name,
+            &wrapped_material,
+            wrapping_material_name,
+            VAULT_TRANSIT_WRAP_ALGORITHM,
+        );
+        let bound = vault_transit_bound_plaintext(&SecretKey::from_bytes([41u8; 32]), &aad);
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/transit/decrypt/docs")
+            .match_header("x-vault-token", "bound-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({ "data": { "plaintext": BASE64.encode(bound.as_slice()) } }).to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+        unsafe {
+            std::env::set_var("QDRANT_TEST_VAULT_TRANSIT_BOUND_TOKEN", "bound-token");
+        }
+        let wrapping_material = CryptoMaterialConfig {
+            kind: "wrapping_key_32".to_string(),
+            source: Some(VAULT_TRANSIT_SOURCE.to_string()),
+            env: Some("QDRANT_TEST_VAULT_TRANSIT_BOUND_TOKEN".to_string()),
+            path: Some(format!("{}/v1/transit/keys/docs", server.url())),
+            ..CryptoMaterialConfig::default()
+        };
+        let mut moved_material = wrapped_material.clone();
+        moved_material.scope = Some("collection:other/payload:body".to_string());
+        let settings = CryptoSettings {
+            zero_trust_profile: None,
+            ckks_grouped_max_candidates: crate::settings::default_ckks_grouped_max_candidates(),
+            ckks_scoring_source_batch_max: crate::settings::default_ckks_scoring_source_batch_max(),
+            ckks_query_nonce_replay_ttl_secs:
+                crate::settings::default_ckks_query_nonce_replay_ttl_secs(),
+            ckks_query_nonce_replay_cache_max_entries:
+                crate::settings::default_ckks_query_nonce_replay_cache_max_entries(),
+            allow_inline_key_material: false,
+            instances: HashMap::new(),
+            backends: HashMap::new(),
+            materials: HashMap::from([
+                (wrapping_material_name.to_string(), wrapping_material),
+                (material_name.to_string(), wrapped_material.clone()),
+            ]),
+        };
+
+        let decoded = decode_wrapped_resource_key(&settings, material_name, &wrapped_material);
+        // The same ciphertext presented under another scope must not open.
+        let moved = decode_wrapped_resource_key(&settings, material_name, &moved_material);
+        unsafe {
+            std::env::remove_var("QDRANT_TEST_VAULT_TRANSIT_BOUND_TOKEN");
+        }
+
+        assert_eq!(decoded.unwrap().as_bytes(), &[41u8; 32]);
+        assert!(moved.is_err());
     }
 
     fn set_aws_kms_test_env(prefix: &str, endpoint_url: &str) {

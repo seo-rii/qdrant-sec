@@ -122,6 +122,12 @@ impl Collections for CollectionsService {
                 "grpc create collection converted to unexpected collection meta operation",
             ));
         };
+        // Authorize before the crypto runtime validation: it unwraps resource keys through
+        // external key services and its errors name materials and other collections' scopes.
+        auth.check_global_access(
+            storage::rbac::AccessRequirements::new().manage(),
+            "create_collection",
+        )?;
         validate_create_collection_crypto_runtime(
             &self.settings,
             &create_operation.collection_name,

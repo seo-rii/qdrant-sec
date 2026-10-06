@@ -176,6 +176,14 @@ async fn create_collection(
         return process_response(create_collection_op, timing, None);
     };
 
+    // Authorize before the crypto runtime validation: it unwraps resource keys through external
+    // key services and its errors name materials and other collections' crypto scopes.
+    if let Err(err) =
+        auth.check_global_access(AccessRequirements::new().manage(), "create_collection")
+    {
+        return process_response::<bool>(Err(err), timing, None);
+    }
+
     if let Err(err) = validate_create_collection_crypto_runtime(
         settings.get_ref(),
         &collection_name,
