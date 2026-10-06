@@ -5548,3 +5548,66 @@ Known remaining limitations added by this pass:
   formed. The snapshot authority acceptance plan (`wire == None` is
   `InvalidTransition`) needs the same exemption, or a node cannot restart
   after such a delete.
+
+### Seventeenth pass: server crypto runtime audit and consensus follow-ups
+
+This pass audited the server crypto runtime (`src/common/crypto.rs`: backend
+and material validation, KMS, Vault Transit and file material sources,
+collection crypto validation, fingerprints) and fixed two consensus items
+recorded in the sixteenth pass. Local builds were not possible (the WSL
+disk image filled the system drive), so these changes were verified by CI.
+Fixed:
+
+- High: resource keys wrapped through Vault Transit by this server could
+  not be opened, and scope binding was never checked. Wrapping produces a
+  version-2 blob whose plaintext is a tag, the SHA-256 of the wrap AAD and
+  the key, but stored materials keep no blob version and decoding always
+  presented version 1, so a key generated or rewrapped onto Vault failed
+  with an invalid key length and every blob that did open skipped the scope
+  check. The plaintext shape is unambiguous (65 bytes bound, 32 bytes
+  legacy), so a bound plaintext is now always unbound and its scope digest
+  checked; a test drives the decode path through a mocked Vault, including
+  a refused cross-scope open.
+- Collection creation ran the crypto runtime validation, which unwraps
+  resource keys through external key services and whose errors name
+  materials and other collections' crypto scopes, before checking that the
+  caller may create collections; REST and gRPC now check manage access
+  first.
+- The AWS region read from the environment was spliced into the default
+  KMS endpoint host unchecked, so a crafted value could send the signed
+  request and session token to another host; it must now be a region
+  identifier (lowercase letters, digits and dashes, at most 32 bytes).
+- The floor checkpoint file cap (64 MiB) was reached near 65k authority
+  floors, below the 100k count cap, so every save failed identically on
+  every node; the file cap is now 256 MiB so the count cap binds.
+- The leader now re-applies the private ORAM gates to proposals forwarded
+  by followers (activation floor for configuration changes, activation
+  proposal validation, pending-activation gate) and drops proposals that
+  fail or do not decode.
+
+Checked and left as is: redacted Debug and Display for every crypto error
+and plan type, URL redaction, HMAC-only key commitments in fingerprints,
+TLS verification with redirects disabled, bounded timeouts and response
+bodies, sensitive headers, https-only external URLs without credentials,
+the strict zero-trust profile rejecting server materials, backends, inline
+material and server providers, file and descriptor material checks
+(`O_NOFOLLOW`, owner, mode, parent directories), the OpenFHE backend cache
+key coverage, checked ORAM sizing arithmetic and domain-separated client
+query signatures.
+
+Known remaining limitations added by this pass:
+
+- Vault Transit version-1 (unbound) blobs still open, relying on Transit
+  `context`, which ordinary keys ignore; the blob version should be stored
+  with the material and version 1 refused for new materials and under the
+  strict profile.
+- Key commitments for the runtime fingerprint, collection crypto validation
+  and create-collection validation unwrap keys through KMS, Vault or local
+  sockets with blocking I/O on async workers (telemetry polls included),
+  and a transient failure changes the fingerprint; commitments should be
+  cached at startup and validation moved to blocking tasks.
+- Key service response buffers grow by reallocation and parse into
+  non-zeroizing JSON values, and the untrimmed AWS secret access key is
+  dropped without zeroization.
+- Client CKKS vector instances are not checked against the collection's
+  key id and encryption epoch.
