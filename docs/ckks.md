@@ -5611,3 +5611,28 @@ Known remaining limitations added by this pass:
   dropped without zeroization.
 - Client CKKS vector instances are not checked against the collection's
   key id and encryption epoch.
+
+### Eighteenth pass: collection delete no longer halts consensus
+
+Deleting an encrypted collection whose activated V2 mutation authority pins
+a local floor removed the authority, and the floor checkpoint refuses a
+floor that disappears, so the save failed on every node and consensus
+stopped (after a restart the replay found the collection gone and the
+records leaked). Retaining only the authority is not enough: snapshot and
+load validation cross-check the mutation state, lease slot, epochs,
+layouts, session leases and external recoveries, and the activation
+barriers require mutation states and lease slots to match one to one. The
+delete now retains all of such a collection's private ORAM consensus
+records; every replica holds the same authority, so the decision is the
+same everywhere, and the floor's rollback protection is unchanged. A test
+covers the retention, the unchanged durable state and a clean reload.
+
+Known remaining limitations added by this pass:
+
+- The retained records are never reclaimed, and a collection recreated
+  under the same name cannot initialize private ORAM state until they are.
+  Reclaiming them needs the Raft-ordered retirement tombstone described in
+  the sixteenth pass.
+- Collections without a floor-pinning authority are still pruned using
+  node-local collection config (divergence across nodes), and a follower
+  lagging across such a prune can refuse the leader's snapshot.
