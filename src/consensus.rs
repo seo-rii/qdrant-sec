@@ -755,6 +755,18 @@ impl Consensus {
                     );
                 }
 
+                if message.get_msg_type() == MessageType::MsgProp
+                    && self.is_leader()
+                    && let Err(error) = self.validate_forwarded_proposal(&message)
+                {
+                    // Dropping a proposal is safe: the proposer's wait times out.
+                    log::warn!(
+                        "Dropped a proposal forwarded by peer {}: {error:#}",
+                        message.from
+                    );
+                    return Ok(());
+                }
+
                 self.node.step(*message).context("failed to step message")?;
             }
         }
@@ -785,6 +797,25 @@ impl Consensus {
         &self,
         change: TopologyChange,
     ) -> anyhow::Result<()> {
+        self.ensure_private_oram_topology_floor_allows(change)?;
+        let commit = self.node.store().hard_state().commit;
+        let last_log_index = self.node.store().last_index()?;
+        let applied = self.node.raft.raft_log.applied;
+        if commit != last_log_index
+            || applied != commit
+            || raft_conf_change_pending(self.node.raft.pending_conf_index, applied)
+        {
+            return Err(anyhow!(
+                "cluster topology change requires a fully applied stable Raft log"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_private_oram_topology_floor_allows(
+        &self,
+        change: TopologyChange,
+    ) -> anyhow::Result<()> {
         if self
             .broker
             .consensus_state
@@ -804,16 +835,59 @@ impl Consensus {
                 }
             }
         }
-        let commit = self.node.store().hard_state().commit;
-        let last_log_index = self.node.store().last_index()?;
-        let applied = self.node.raft.raft_log.applied;
-        if commit != last_log_index
-            || applied != commit
-            || raft_conf_change_pending(self.node.raft.pending_conf_index, applied)
-        {
-            return Err(anyhow!(
-                "cluster topology change requires a fully applied stable Raft log"
-            ));
+        Ok(())
+    }
+
+    /// Re-applies the private ORAM proposal gates to a proposal a follower forwarded to this
+    /// leader. The gates run on the proposing node against its own state, and a follower that has
+    /// not yet applied an activation forwards proposals the leader would refuse (a learner added
+    /// after activation blocks every peer-recovery signer pin). The leader's own Raft-log
+    /// quiescence is not required here; raft itself refuses a second pending conf change.
+    fn validate_forwarded_proposal(&self, message: &RaftMessage) -> anyhow::Result<()> {
+        for entry in &message.entries {
+            match entry.get_entry_type() {
+                EntryType::EntryConfChangeV2 => {
+                    let change: ConfChangeV2 = prost_for_raft::Message::decode(entry.get_data())
+                        .context("forwarded configuration change is malformed")?;
+                    for single in &change.changes {
+                        self.ensure_private_oram_topology_floor_allows(
+                            match single.change_type() {
+                                ConfChangeType::RemoveNode => TopologyChange::RemovePeer,
+                                _ => TopologyChange::AddPeer,
+                            },
+                        )?;
+                    }
+                }
+                EntryType::EntryConfChange => {
+                    let change: ConfChange = prost_for_raft::Message::decode(entry.get_data())
+                        .context("forwarded configuration change is malformed")?;
+                    self.ensure_private_oram_topology_floor_allows(match change.change_type() {
+                        ConfChangeType::RemoveNode => TopologyChange::RemovePeer,
+                        _ => TopologyChange::AddPeer,
+                    })?;
+                }
+                EntryType::EntryNormal => {
+                    if entry.get_data().is_empty() {
+                        continue;
+                    }
+                    let operation = ConsensusOperations::try_from(entry)
+                        .context("forwarded proposal is malformed")?;
+                    if let ConsensusOperations::ActivatePrivateOramMutationV2(operation) = operation
+                    {
+                        self.broker
+                            .consensus_state
+                            .validate_private_oram_mutation_activation_proposal(
+                                &operation,
+                                self.node.raft.term,
+                                self.node.store().last_index()?,
+                                self.node.raft.raft_log.applied,
+                                self.node.raft.pending_conf_index,
+                            )?;
+                    } else {
+                        self.ensure_private_oram_activation_transition_allows_general_proposal()?;
+                    }
+                }
+            }
         }
         Ok(())
     }
