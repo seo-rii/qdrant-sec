@@ -4821,6 +4821,28 @@ impl Persistent {
         let Some(collection_id) = index_keys.first().map(|key| key.collection_id.clone()) else {
             return Ok(false);
         };
+        let mutation_digest = private_oram_mutation_key_digest(&PrivateOramMutationKey {
+            collection_id: collection_id.clone(),
+        });
+        // An activated authority with an aggregate pins a local floor, and the floor checkpoint
+        // refuses a floor that disappears (that rule is what stops a snapshot omitting the
+        // collection from replaying its older authority). Removing it here failed the save on
+        // every node and stopped consensus. Snapshot and load validation also cross-check the
+        // mutation state, lease slot, epochs, layouts, session leases and external recoveries,
+        // so the collection's records are retained as a whole until a validated retirement
+        // (a Raft-ordered tombstone) exists. Every replica holds the same authority, so the
+        // decision is the same everywhere.
+        if self
+            .private_oram_mutation_lease_slots
+            .get(&mutation_digest)
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .is_some_and(|authority| authority.aggregate().is_some())
+        {
+            log::warn!(
+                "retaining private ORAM consensus records of a deleted collection whose mutation                  authority pins a local floor"
+            );
+            return Ok(false);
+        }
         let mut removed = false;
         for key in index_keys {
             let digest = private_oram_epoch_key_digest(key);
@@ -4839,8 +4861,6 @@ impl Persistent {
             .private_oram_external_recoveries
             .remove(&recovery_digest)
             .is_some();
-        let mutation_digest =
-            private_oram_mutation_key_digest(&PrivateOramMutationKey { collection_id });
         removed |= self
             .private_oram_mutation_states
             .remove(&mutation_digest)
@@ -8079,6 +8099,68 @@ mod tests {
             reloaded.active_private_oram_mutation_keys().unwrap(),
             vec![fixture.key]
         );
+    }
+
+    #[test]
+    fn deleting_a_collection_retains_records_pinned_by_an_authority_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        let key_digest = private_oram_mutation_key_digest(&fixture.key);
+        let activated = activate_private_oram_mutation_authority_v2(
+            &mutation_legacy_authority(&fixture),
+            &fixture.key.collection_id,
+            private_oram_mutation_activation_context_for_test(
+                test_digest(1),
+                test_digest(2),
+                1,
+                10,
+                2,
+                test_digest(32),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(activated.aggregate().is_some());
+        persistent.private_oram_mutation_lease_slots.insert(
+            key_digest.clone(),
+            DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(activated),
+        );
+        persistent.private_oram_mutation_format_floor = Some(mutation_format_floor(2, true, 11));
+        persistent.state.hard_state.commit = 11;
+        persistent.latest_snapshot_meta.index = 11;
+        persistent.apply_progress_queue.set_from_snapshot(11);
+        persistent.save().unwrap();
+        let durable_digest = persistent_state_file_digest(&persistent.path).unwrap();
+
+        // The delete must not remove the floor-pinning authority (the floor checkpoint would
+        // refuse the save on every node); the collection's records are retained as a whole.
+        let pruned = persistent
+            .prune_private_oram_collection_state(&[PrivateOramEpochKey {
+                collection_id: fixture.key.collection_id.clone(),
+                index_kind: PrivateOramIndexKind::Hnsw,
+                index_name: "vector".to_string(),
+            }])
+            .unwrap();
+        assert!(!pruned);
+        assert!(
+            persistent
+                .private_oram_mutation_lease_slots
+                .contains_key(&key_digest)
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_states
+                .contains_key(&key_digest)
+        );
+        assert_eq!(
+            persistent_state_file_digest(&persistent.path).unwrap(),
+            durable_digest
+        );
+        persistent.save().unwrap();
+        drop(persistent);
+        Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
     #[test]
