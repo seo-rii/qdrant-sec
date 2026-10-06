@@ -1,0 +1,44 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "qdrant-sec-rustc",
+      "pattern": [
+        {
+          "regexp": "^(error(?:\\[E\\d+\\])?: .*)$",
+          "message": 1
+        },
+        {
+          "regexp": "^\\s*--> (.+?):(\\d+):(\\d+)$",
+          "file": 1,
+          "line": 2,
+          "column": 3
+        }
+      ]
+    },
+    {
+      "owner": "qdrant-sec-panic",
+      "pattern": [
+        {
+          "regexp": "^thread '(.+?)'.* panicked at (.+?):(\\d+):(\\d+):$",
+          "code": 1,
+          "file": 2,
+          "line": 3,
+          "column": 4
+        },
+        {
+          "regexp": "^(.+)$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "qdrant-sec-test",
+      "pattern": [
+        {
+          "regexp": "^(test \\S+ \\.\\.\\. FAILED)$",
+          "message": 1
+        }
+      ]
+    }
+  ]
+}
