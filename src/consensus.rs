@@ -755,7 +755,7 @@ impl Consensus {
                     );
                 }
 
-                if message.get_msg_type() == MessageType::MsgProp
+                if message.get_msg_type() == MessageType::MsgPropose
                     && self.is_leader()
                     && let Err(error) = self.validate_forwarded_proposal(&message)
                 {
