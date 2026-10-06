@@ -41,7 +41,10 @@ const FLOOR_LOCK_FILE: &str = ".lock";
 const FLOOR_TEMP_PREFIX: &str = ".floor-";
 const LOCAL_FLOOR_CHECKPOINT_VERSION: u16 = 1;
 const LOCAL_FLOOR_PENDING_VERSION: u16 = 1;
-const MAX_LOCAL_FLOOR_FILE_BYTES: u64 = 64 * 1024 * 1024;
+// A serialized authority floor is roughly 1 KiB (ten base64 digests, its key and field names),
+// so the count cap below must be the binding one: at 64 MiB the file cap was reached near 65k
+// floors, below the validator's 100k, and every save then failed the same way on every node.
+const MAX_LOCAL_FLOOR_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_AUTHORITY_FLOORS: usize = 100_000;
 const PARENT_SYNC_ATTEMPTS: usize = 3;
 
