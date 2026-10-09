@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2504,7 +2504,51 @@ impl Persistent {
         &self.latest_snapshot_meta
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_from_snapshot(
+        &mut self,
+        meta: &SnapshotMetadata,
+        address_by_id: PeerAddressById,
+        metadata_by_id: PeerMetadataById,
+        new_cluster_metadata: HashMap<String, serde_json::Value>,
+        new_private_oram_epochs: HashMap<String, PrivateOramConsensusEpoch>,
+        new_private_oram_session_leases: HashMap<String, PrivateOramSessionLease>,
+        new_private_oram_layouts: HashMap<String, PrivateOramConsensusLayout>,
+        new_private_oram_external_recoveries: HashMap<String, PrivateOramExternalRecoveryState>,
+        new_private_oram_mutation_states: HashMap<String, PrivateOramConsensusCollectionStateV2>,
+        new_private_oram_mutation_lease_slots: HashMap<
+            String,
+            DecodedPrivateOramMutationAuthorityWireV2,
+        >,
+        new_private_oram_mutation_format_floor: Option<PrivateOramMutationFormatFloorV2>,
+        new_private_oram_mutation_activation_pending: Option<
+            PrivateOramMutationActivationPendingV2,
+        >,
+        new_private_oram_activation_authority: Option<PrivateOramActivationAuthorityStateV1>,
+    ) -> Result<(), StorageError> {
+        self.update_from_snapshot_retiring(
+            meta,
+            address_by_id,
+            metadata_by_id,
+            new_cluster_metadata,
+            new_private_oram_epochs,
+            new_private_oram_session_leases,
+            new_private_oram_layouts,
+            new_private_oram_external_recoveries,
+            new_private_oram_mutation_states,
+            new_private_oram_mutation_lease_slots,
+            new_private_oram_mutation_format_floor,
+            new_private_oram_mutation_activation_pending,
+            new_private_oram_activation_authority,
+            &HashSet::new(),
+        )
+    }
+
+    /// Installs a Raft snapshot. `retired_external_recovery_keys` are the external recovery
+    /// key digests of local collections the snapshot no longer contains (by stable crypto id):
+    /// their records may disappear, because a deleted collection's id is never reused.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_from_snapshot_retiring(
         &mut self,
         meta: &SnapshotMetadata,
         address_by_id: PeerAddressById,
@@ -2524,6 +2568,7 @@ impl Persistent {
             PrivateOramMutationActivationPendingV2,
         >,
         new_private_oram_activation_authority: Option<PrivateOramActivationAuthorityStateV1>,
+        retired_external_recovery_keys: &HashSet<String>,
     ) -> Result<(), StorageError> {
         self.ensure_persistence_writable()?;
         Self::validate_private_oram_snapshot_state_at_index(
@@ -2538,10 +2583,11 @@ impl Persistent {
             new_private_oram_activation_authority.as_ref(),
             meta.index,
         )?;
-        validate_private_oram_external_recovery_snapshot_transition_for_peer(
+        validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
             &self.private_oram_external_recoveries,
             &new_private_oram_external_recoveries,
             self.this_peer_id,
+            retired_external_recovery_keys,
         )?;
         self.validate_private_oram_activation_authority_for_snapshot(
             new_private_oram_activation_authority.as_ref(),
@@ -4839,7 +4885,7 @@ impl Persistent {
             .is_some_and(|authority| authority.aggregate().is_some())
         {
             log::warn!(
-                "retaining private ORAM consensus records of a deleted collection whose mutation                  authority pins a local floor"
+                "retaining private ORAM records of a deleted collection pinned by an authority floor"
             );
             return Ok(false);
         }
@@ -6776,7 +6822,12 @@ pub(crate) fn validate_private_oram_external_recovery_snapshot_transition(
     current: &HashMap<String, PrivateOramExternalRecoveryState>,
     incoming: &HashMap<String, PrivateOramExternalRecoveryState>,
 ) -> Result<(), StorageError> {
-    validate_private_oram_external_recovery_snapshot_transition_inner(current, incoming, None)
+    validate_private_oram_external_recovery_snapshot_transition_inner(
+        current,
+        incoming,
+        None,
+        &HashSet::new(),
+    )
 }
 
 pub(crate) fn validate_private_oram_external_recovery_snapshot_transition_for_peer(
@@ -6784,10 +6835,30 @@ pub(crate) fn validate_private_oram_external_recovery_snapshot_transition_for_pe
     incoming: &HashMap<String, PrivateOramExternalRecoveryState>,
     this_peer_id: PeerId,
 ) -> Result<(), StorageError> {
+    validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
+        current,
+        incoming,
+        this_peer_id,
+        &HashSet::new(),
+    )
+}
+
+/// Like [`validate_private_oram_external_recovery_snapshot_transition_for_peer`], but a record
+/// under one of `retired_keys` may disappear: its collection is absent from the snapshot, so
+/// the leader deleted it, and the collection's stable crypto id is never reused. Without this
+/// a follower lagging across the delete of a collection with committed external recovery state
+/// refused every snapshot from the leader.
+pub(crate) fn validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
+    current: &HashMap<String, PrivateOramExternalRecoveryState>,
+    incoming: &HashMap<String, PrivateOramExternalRecoveryState>,
+    this_peer_id: PeerId,
+    retired_keys: &HashSet<String>,
+) -> Result<(), StorageError> {
     validate_private_oram_external_recovery_snapshot_transition_inner(
         current,
         incoming,
         Some(this_peer_id),
+        retired_keys,
     )
 }
 
@@ -6795,9 +6866,13 @@ fn validate_private_oram_external_recovery_snapshot_transition_inner(
     current: &HashMap<String, PrivateOramExternalRecoveryState>,
     incoming: &HashMap<String, PrivateOramExternalRecoveryState>,
     this_peer_id: Option<PeerId>,
+    retired_keys: &HashSet<String>,
 ) -> Result<(), StorageError> {
     for (key, current_state) in current {
         let Some(incoming_state) = incoming.get(key) else {
+            if retired_keys.contains(key) {
+                continue;
+            }
             if current_state.committed_backup_generation == 0
                 && !current_state.active_lease.as_ref().is_some_and(|lease| {
                     lease.phase == PrivateOramExternalRecoveryLeasePhase::Installing
@@ -12867,6 +12942,56 @@ mod tests {
         assert_eq!(
             persistent.private_oram_external_recovery(&recovery_key),
             Some(committed)
+        );
+    }
+
+    #[test]
+    fn private_oram_external_recovery_snapshot_drops_records_of_retired_collections() {
+        let key_digest =
+            private_oram_external_recovery_key_digest(&PrivateOramExternalRecoveryKey {
+                collection_id: "collection-uuid-retired".to_string(),
+            });
+        let other_digest =
+            private_oram_external_recovery_key_digest(&PrivateOramExternalRecoveryKey {
+                collection_id: "collection-uuid-live".to_string(),
+            });
+        let committed = PrivateOramExternalRecoveryState {
+            committed_backup_generation: 7,
+            committed_checkpoint_digest: Some(BASE64URL_NOPAD.encode(&[51; 32])),
+            committed_install_intent_digest: None,
+            active_lease: None,
+        };
+        let current = HashMap::from([
+            (key_digest.clone(), committed.clone()),
+            (other_digest.clone(), committed.clone()),
+        ]);
+        let retired = HashSet::from([key_digest.clone()]);
+
+        // A follower lagging across the delete of the collection may drop its records...
+        validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
+            &current,
+            &HashMap::from([(other_digest.clone(), committed.clone())]),
+            7,
+            &retired,
+        )
+        .unwrap();
+        // ...but a live collection's committed state still cannot disappear or roll back.
+        assert!(
+            validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
+                &current,
+                &HashMap::new(),
+                7,
+                &retired,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_private_oram_external_recovery_snapshot_transition_for_peer(
+                &current,
+                &HashMap::from([(other_digest, committed)]),
+                7,
+            )
+            .is_err()
         );
     }
 

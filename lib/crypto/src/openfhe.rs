@@ -1841,7 +1841,7 @@ pub fn validate_landlock_read_allow_root(root: &Path) -> Result<(), CkksError> {
         .any(|segment| segment.is_empty() || segment == b"." || segment == b"..")
     {
         return Err(CkksError::Backend(
-            "Landlock read-allow roots must be normalized paths without `.`, `..`, empty or              trailing segments"
+            "Landlock read-allow roots must be normalized paths without `.`, `..` or empty segments"
                 .to_string(),
         ));
     }

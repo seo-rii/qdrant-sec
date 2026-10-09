@@ -1006,8 +1006,13 @@ impl Dispatcher {
             return Err(consensus_error);
         }
 
-        finalize_replicas().await?;
-        finalize_local()
+        // The CAS committed, so consensus already serves the new epoch: the local finalize is
+        // correct whatever the replicas report. Skipping it when a replica failed left the
+        // coordinator itself behind consensus until session recovery.
+        let replicas_finalized = finalize_replicas().await;
+        let local_finalized = finalize_local();
+        replicas_finalized?;
+        local_finalized
     }
 
     /// Resolve the exact peers that must durably prepare a collection-local private ORAM

@@ -2400,6 +2400,82 @@ mod tests {
             Some(follow_up_consensus_epoch),
         );
 
+        // A replica finalize failing after the CAS committed must not skip the local finalize.
+        let replica_failure_writeback = PrivateHnswOramConsensusWriteback {
+            old: follow_up_writeback.new.clone(),
+            new: PrivateHnswOramEpochState {
+                index_epoch: 45,
+                root_hash: data_encoding::BASE64URL_NOPAD.encode(&[45; 32]),
+            },
+            writeback_digest: data_encoding::BASE64URL_NOPAD.encode(&[13; 32]),
+        };
+        let replica_failure_operation = dispatcher
+            .private_hnsw_oram_writeback_cas(
+                private_oram_key.collection_id.clone(),
+                private_oram_key.index_name.clone(),
+                &replica_failure_writeback,
+            )
+            .unwrap();
+        let replica_failure_epoch = replica_failure_operation.new.clone();
+        let replica_failure_events = Arc::new(Mutex::new(Vec::new()));
+        let finalize_local_events = replica_failure_events.clone();
+        let finalize_replicas_events = replica_failure_events.clone();
+        let replica_finalize_error = handle
+            .block_on(dispatcher.coordinate_replicated_private_oram_writeback(
+                replica_failure_operation,
+                &required_replica_peers,
+                None,
+                || Ok(()),
+                {
+                    let digest = replica_failure_writeback.writeback_digest.clone();
+                    move || async move {
+                        Ok(vec![
+                            PrivateOramReplicaPrepareAck {
+                                peer_id: 8,
+                                writeback_digest: digest.clone(),
+                            },
+                            PrivateOramReplicaPrepareAck {
+                                peer_id: 9,
+                                writeback_digest: digest,
+                            },
+                        ])
+                    }
+                },
+                || Ok(()),
+                || async { Ok(()) },
+                move || {
+                    finalize_local_events.lock().unwrap().push("finalize_local");
+                    Ok(())
+                },
+                move || async move {
+                    finalize_replicas_events
+                        .lock()
+                        .unwrap()
+                        .push("finalize_replicas");
+                    Err(
+                        storage::content_manager::errors::StorageError::service_error(
+                            "replica finalize failed",
+                        ),
+                    )
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            replica_finalize_error
+                .to_string()
+                .contains("replica finalize failed")
+        );
+        assert_eq!(
+            *replica_failure_events.lock().unwrap(),
+            vec!["finalize_replicas", "finalize_local"],
+        );
+        assert_eq!(
+            dispatcher
+                .private_oram_consensus_epoch(&private_oram_key)
+                .unwrap(),
+            Some(replica_failure_epoch),
+        );
+
         handle.block_on(async {
             create_private_hnsw_collection_with_private_result_oram(&dispatcher).await;
             let auth = Auth::new_internal(Access::full("private HNSW consensus route test"));

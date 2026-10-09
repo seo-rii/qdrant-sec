@@ -63,7 +63,7 @@ use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use crate::content_manager::consensus::entry_queue::EntryId;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus::persistent::{
-    Persistent, PrivateOramMutationAtEntryOutcome,
+    Persistent, PrivateOramMutationAtEntryOutcome, private_oram_external_recovery_key_digest,
 };
 use crate::content_manager::consensus::private_oram_activation_authority::{
     PrivateOramActivationAuthorityLocatorV1, PrivateOramActivationAuthorityStateV1,
@@ -200,6 +200,34 @@ impl fmt::Debug for SnapshotData {
             )
             .finish()
     }
+}
+
+/// External recovery key digests of local encrypted collections that `incoming` no longer
+/// contains, matched by stable crypto id (a fresh UUID per created collection, so a collection
+/// re-created under the same name does not match). Their consensus records were pruned by the
+/// delete the snapshot already covers, so a lagging follower may drop them.
+fn retired_private_oram_external_recovery_keys(
+    local: &CollectionsSnapshot,
+    incoming: &CollectionsSnapshot,
+) -> HashSet<String> {
+    let stable_ids = |snapshot: &CollectionsSnapshot| {
+        snapshot
+            .collections
+            .iter()
+            .filter(|(_, state)| state.config.params.effective_encryption().is_some())
+            .filter_map(|(name, state)| state.config.stable_crypto_id(name).ok())
+            .collect::<HashSet<_>>()
+    };
+    let incoming_ids = stable_ids(incoming);
+    stable_ids(local)
+        .into_iter()
+        .filter(|collection_id| !incoming_ids.contains(collection_id))
+        .map(|collection_id| {
+            private_oram_external_recovery_key_digest(&PrivateOramExternalRecoveryKey {
+                collection_id,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -1094,7 +1122,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             // bound to the activation-time configuration, so ORAM mutation paths keep failing
             // closed for peers outside it until the authority is re-established.
             log::warn!(
-                "committed cluster topology change crossed the private ORAM activation floor;                  private ORAM mutation participation is limited to the activation-time roster"
+                "topology change crossed the private ORAM activation floor; mutation roster stays fixed"
             );
         }
         let change: ConfChangeV2 = prost_for_raft::Message::decode(entry.get_data())?;
@@ -3505,16 +3533,21 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             private_oram_activation_authority.as_ref(),
             meta.index,
         )?;
+        let retired_external_recovery_keys = retired_private_oram_external_recovery_keys(
+            &self.toc.collections_snapshot(),
+            &collections_data,
+        );
         let mut persistent = self.persistent.write();
         let current_private_oram_epochs = persistent.private_oram_epochs.clone();
         let current_private_oram_layouts = persistent.private_oram_layouts.clone();
         let current_private_oram_external_recoveries =
             persistent.private_oram_external_recoveries.clone();
         let this_peer_id = persistent.this_peer_id();
-        crate::content_manager::consensus::persistent::validate_private_oram_external_recovery_snapshot_transition_for_peer(
+        crate::content_manager::consensus::persistent::validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
             &current_private_oram_external_recoveries,
             &private_oram_external_recoveries,
             this_peer_id,
+            &retired_external_recovery_keys,
         )?;
         persistent.validate_private_oram_activation_authority_for_snapshot(
             private_oram_activation_authority.as_ref(),
@@ -3545,7 +3578,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 return Err(error);
             }
         }
-        if let Err(error) = persistent.update_from_snapshot(
+        if let Err(error) = persistent.update_from_snapshot_retiring(
             meta,
             address_by_id,
             metadata_by_id,
@@ -3559,6 +3592,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             private_oram_mutation_format_floor,
             private_oram_mutation_activation_pending,
             private_oram_activation_authority,
+            &retired_external_recovery_keys,
         ) {
             persistent.fence_after_snapshot_side_effect_failure();
             return Err(error);

@@ -8453,7 +8453,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stale fixture: begin_v2 pins the lease generation and writer fence to the signed                 mutation bundle and immutable manifest, and the paired store fixture has no                 knob to mint a coherent next-generation bundle; the supersede rule is covered                 by the conflicting-package and exact-replay tests"]
+    #[ignore = "stale fixture: the paired store fixture cannot mint a next-generation bundle"]
     fn v2_owner_recovery_capsule_store_supersedes_previous_generation() {
         let parent_temp = tempfile::tempdir().unwrap();
         let next_parent_temp = tempfile::tempdir().unwrap();
