@@ -5629,10 +5629,71 @@ covers the retention, the unchanged durable state and a clean reload.
 
 Known remaining limitations added by this pass:
 
-- The retained records are never reclaimed, and a collection recreated
-  under the same name cannot initialize private ORAM state until they are.
-  Reclaiming them needs the Raft-ordered retirement tombstone described in
-  the sixteenth pass.
+- The retained records are never reclaimed (a bounded leak per deleted
+  floor-pinned collection). Reclaiming them needs the Raft-ordered
+  retirement tombstone described in the sixteenth pass. A collection
+  re-created under the same name is not affected: the records are keyed by
+  the collection's stable crypto id, a fresh UUID per created collection
+  (corrected in the nineteenth pass).
 - Collections without a floor-pinning authority are still pruned using
   node-local collection config (divergence across nodes), and a follower
   lagging across such a prune can refuse the leader's snapshot.
+
+### Nineteenth pass: snapshot catch-up after deletes, client CKKS key binding, key service I/O
+
+This pass worked through the open items of the seventeenth and eighteenth
+passes. Fixed:
+
+- A follower lagging across the delete of an encrypted collection with
+  committed external recovery state refused every snapshot from the leader
+  (the external recovery transition check treats a disappearing committed
+  record as a rollback), so it could never catch up. Snapshot install now
+  derives the retired collections, local encrypted collections whose stable
+  crypto id the snapshot no longer contains, and lets only their records
+  disappear; a live collection's committed state still cannot roll back.
+  Because the id is a fresh UUID per created collection, a collection
+  re-created under the same name does not match.
+- A `vector/client-ckks@v1` runtime instance could use a `key_id` different
+  from the collection's `key_id`, so envelopes signed for another
+  collection key passed runtime validation. Both the collection runtime
+  validation and the vector write plan now require them to match, as the
+  client payload provider does. `rk_epoch` is the client's own resource-key
+  epoch and stays independent of the collection `encryption_epoch` (it is
+  tied only for the private ORAM providers).
+- Create-collection validation (REST and gRPC), the crypto manifest, the
+  activation challenge fingerprint and the telemetry fingerprint unwrap keys
+  through KMS, Vault Transit or a local socket with blocking I/O; they now
+  run on the blocking pool (`run_blocking_crypto_runtime_task`) instead of
+  an async worker.
+- Key service responses are read into zeroizing buffers that grow by copy
+  instead of reallocation (which freed unwiped copies), parsed into a JSON
+  value whose strings are wiped on drop, and the untrimmed AWS secret access
+  key and session token are wiped as well.
+- After a replicated write-back CAS committed, a failing replica finalize
+  made the coordinator skip its own local finalize, leaving it behind
+  consensus until session recovery. Both finalizes now run and the first
+  error is reported.
+- Four log, error and test-ignore messages (collection-delete retention,
+  topology change past the activation floor, Landlock root validation, a
+  journal test) contained runs of spaces from broken `\` line
+  continuations; they are single-line literals now.
+- The sixteenth pass asked Raft apply to refuse topology changes after
+  activation. A committed configuration change cannot be refused at apply
+  without diverging from the quorum, so the leader-side gate on forwarded
+  proposals added in the seventeenth pass is the fix; apply keeps the
+  warning.
+
+Checked and left as is: a replica abort that times out after a rejected
+CAS is reported as an indeterminate outcome, which sends the write-back to
+recovery rather than claiming a clean rejection while prepared replica
+journals may remain; a replay cache for owner pre-stage would still pay the
+stream decode and hash its key needs, and the handler is bound to a
+finalized consensus reservation challenge.
+
+Known remaining limitations:
+
+- Vault Transit version-1 blobs still open unbound; refusing them needs the
+  blob version stored with the material (a configuration format change).
+- The capability fingerprint still unwraps keys on every computation, so a
+  transient key service failure changes it; caching commitments needs a
+  settings identity to key the cache on.
