@@ -49,7 +49,7 @@ use storage::content_manager::collection_meta_ops::CreateCollection;
 use storage::content_manager::errors::StorageError;
 use thiserror::Error;
 use validator::Validate;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::settings::{
     CryptoBackendConfig, CryptoInstanceConfig, CryptoMaterialConfig, CryptoSettings, Settings,
@@ -461,14 +461,67 @@ fn zeroizing_json_body<T: Serialize>(
     Ok(body)
 }
 
+/// Reads at most `max_bytes + 1` bytes. The buffer is grown by copying into a new zeroizing
+/// allocation instead of `Vec` reallocation, which would free earlier copies of the body (key
+/// service responses carry key material) without wiping them.
 fn read_bounded_zeroizing_response_body<R: Read>(
     reader: R,
     max_bytes: u64,
 ) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    const CHUNK_BYTES: usize = 4096;
     let mut limited_reader = reader.take(max_bytes + 1);
-    let mut body = Zeroizing::new(Vec::new());
-    limited_reader.read_to_end(&mut body)?;
+    let mut body = Zeroizing::new(Vec::with_capacity(CHUNK_BYTES));
+    let mut chunk = Zeroizing::new([0_u8; CHUNK_BYTES]);
+    loop {
+        let read = match limited_reader.read(chunk.as_mut_slice()) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if body.len() + read > body.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                body.capacity().saturating_mul(2).max(body.len() + read),
+            ));
+            grown.extend_from_slice(body.as_slice());
+            body = grown;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
     Ok(body)
+}
+
+/// A parsed key service JSON response. Its strings carry wrapped or plaintext key material and
+/// are wiped when it is dropped.
+struct ZeroizingJsonValue(Value);
+
+impl ZeroizingJsonValue {
+    fn parse(bytes: &[u8]) -> serde_json::Result<Self> {
+        serde_json::from_slice(bytes).map(Self)
+    }
+}
+
+impl std::ops::Deref for ZeroizingJsonValue {
+    type Target = Value;
+
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingJsonValue {
+    fn drop(&mut self) {
+        zeroize_json_strings(&mut self.0);
+    }
+}
+
+fn zeroize_json_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(zeroize_json_strings),
+        Value::Object(fields) => fields.values_mut().for_each(zeroize_json_strings),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 fn unsupported_instance_option(options: &Value, allowed_options: &[&str]) -> Option<String> {
@@ -2138,6 +2191,12 @@ fn generic_vector_write_plan(
                     rule.instance
                 )));
             }
+            ensure_client_ckks_vector_collection_key_id(
+                collection_name,
+                &rule.instance,
+                encryption,
+                key_id,
+            )?;
             let expected_rk_id =
                 required_string_option(instance, &rule.instance, EXPECTED_RK_ID_OPTION)?;
             if !is_crypto_identifier(expected_rk_id) {
@@ -3042,6 +3101,19 @@ pub fn private_oram_mutation_v3_binary_capability_digest() -> String {
     hasher.update((VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER.len() as u64).to_be_bytes());
     hasher.update(VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER.as_bytes());
     BASE64URL_NOPAD.encode(&hasher.finalize())
+}
+
+/// Runs crypto runtime work that may unwrap resource keys through AWS KMS, Vault Transit or a
+/// local key socket (blocking HTTP and socket I/O with multi-second timeouts) on the blocking
+/// pool, so a slow key service cannot stall the async workers serving other requests.
+pub async fn run_blocking_crypto_runtime_task<T, F>(task: F) -> Result<T, StorageError>
+where
+    F: FnOnce() -> Result<T, StorageError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|_| StorageError::service_error("crypto runtime validation task failed"))?
 }
 
 pub fn crypto_runtime_capability_fingerprint(settings: &Settings) -> String {
@@ -7651,6 +7723,12 @@ fn validate_generic_collection_crypto_runtime(
                     rule.instance
                 )));
             }
+            ensure_client_ckks_vector_collection_key_id(
+                collection_name,
+                &rule.instance,
+                encryption,
+                key_id,
+            )?;
             let expected_rk_id =
                 required_string_option(instance, &rule.instance, EXPECTED_RK_ID_OPTION)?;
             if !is_crypto_identifier(expected_rk_id) {
@@ -7956,6 +8034,28 @@ fn validate_private_result_oram_collection_runtime(
         }
     }
 
+    Ok(())
+}
+
+/// A client CKKS vector instance must use the collection's key id, like the client payload
+/// provider: otherwise envelopes signed for another collection key pass runtime validation.
+/// `rk_epoch` is the client's own resource-key epoch and is deliberately not tied to the
+/// collection `encryption_epoch` (unlike the private ORAM providers).
+fn ensure_client_ckks_vector_collection_key_id(
+    collection_name: &str,
+    instance_name: &str,
+    encryption: &CollectionEncryptionConfig,
+    instance_key_id: &str,
+) -> Result<(), StorageError> {
+    if encryption
+        .key_id
+        .as_deref()
+        .is_some_and(|collection_key_id| collection_key_id != instance_key_id)
+    {
+        return Err(StorageError::bad_input(format!(
+            "collection {collection_name} vector crypto instance {instance_name} key_id must match collection key_id",
+        )));
+    }
     Ok(())
 }
 
@@ -8774,10 +8874,8 @@ impl AwsKmsMasterKeyProvider {
     fn credentials(&self) -> Result<AwsKmsCredentials, qdrant_sec::EncryptionError> {
         let access_key_id = aws_kms_env(&self.env_prefix, "ACCESS_KEY_ID")
             .map_err(|_| qdrant_sec::EncryptionError::SealFailed)?;
-        let secret_access_key = Zeroizing::new(
-            aws_kms_env(&self.env_prefix, "SECRET_ACCESS_KEY")
-                .map_err(|_| qdrant_sec::EncryptionError::SealFailed)?,
-        );
+        let secret_access_key = aws_kms_secret_env(&self.env_prefix, "SECRET_ACCESS_KEY")
+            .map_err(|_| qdrant_sec::EncryptionError::SealFailed)?;
         let region = aws_kms_env(&self.env_prefix, "REGION")
             .map_err(|_| qdrant_sec::EncryptionError::SealFailed)?;
         if access_key_id.is_empty() || secret_access_key.is_empty() || region.is_empty() {
@@ -8810,9 +8908,7 @@ impl AwsKmsMasterKeyProvider {
         Ok(AwsKmsCredentials {
             access_key_id,
             secret_access_key,
-            session_token: aws_kms_env(&self.env_prefix, "SESSION_TOKEN")
-                .ok()
-                .map(Zeroizing::new),
+            session_token: aws_kms_secret_env(&self.env_prefix, "SESSION_TOKEN").ok(),
             region,
             endpoint_url,
         })
@@ -8823,7 +8919,7 @@ impl AwsKmsMasterKeyProvider {
         target: &str,
         body: Zeroizing<Vec<u8>>,
         operation: &str,
-    ) -> Result<Value, qdrant_sec::EncryptionError> {
+    ) -> Result<ZeroizingJsonValue, qdrant_sec::EncryptionError> {
         let credentials = self.credentials()?;
         let date_time = Utc::now();
         let amz_date = date_time.format("%Y%m%dT%H%M%SZ").to_string();
@@ -8859,7 +8955,7 @@ impl AwsKmsMasterKeyProvider {
         if body_bytes.len() as u64 > VAULT_TRANSIT_RESPONSE_MAX_BYTES {
             return Err(qdrant_sec::EncryptionError::InvalidEncoding);
         }
-        serde_json::from_slice::<Value>(body_bytes.as_slice())
+        ZeroizingJsonValue::parse(body_bytes.as_slice())
             .map_err(|_| qdrant_sec::EncryptionError::InvalidEncoding)
     }
 }
@@ -8991,6 +9087,12 @@ fn aws_kms_operation_error(operation: &str) -> qdrant_sec::EncryptionError {
 
 fn aws_kms_env(prefix: &str, suffix: &str) -> Result<String, std::env::VarError> {
     std::env::var(format!("{prefix}_{suffix}")).map(|value| value.trim().to_string())
+}
+
+/// Like [`aws_kms_env`] for credentials: the untrimmed value is wiped too.
+fn aws_kms_secret_env(prefix: &str, suffix: &str) -> Result<Zeroizing<String>, std::env::VarError> {
+    let value = Zeroizing::new(std::env::var(format!("{prefix}_{suffix}"))?);
+    Ok(Zeroizing::new(value.trim().to_string()))
 }
 
 fn validate_aws_kms_endpoint_url(
@@ -9231,7 +9333,7 @@ impl VaultTransitMasterKeyProvider {
     fn read_response(
         response: reqwest::blocking::Response,
         operation: &str,
-    ) -> Result<Value, qdrant_sec::EncryptionError> {
+    ) -> Result<ZeroizingJsonValue, qdrant_sec::EncryptionError> {
         if !response.status().is_success() {
             return Err(match operation {
                 "decrypt" => qdrant_sec::EncryptionError::OpenFailed,
@@ -9244,7 +9346,7 @@ impl VaultTransitMasterKeyProvider {
         if body_bytes.len() as u64 > VAULT_TRANSIT_RESPONSE_MAX_BYTES {
             return Err(qdrant_sec::EncryptionError::InvalidEncoding);
         }
-        serde_json::from_slice::<Value>(body_bytes.as_slice())
+        ZeroizingJsonValue::parse(body_bytes.as_slice())
             .map_err(|_| qdrant_sec::EncryptionError::InvalidEncoding)
     }
 }
@@ -9853,7 +9955,7 @@ fn read_material_vault_kv2_to_string(
             reason: "Vault KV v2 response exceeds maximum size".to_string(),
         });
     }
-    let body = serde_json::from_slice::<Value>(body_bytes.as_slice()).map_err(|_| {
+    let body = ZeroizingJsonValue::parse(body_bytes.as_slice()).map_err(|_| {
         PayloadWriteSetupError::InvalidMaterialFileSource {
             material: material_name.to_string(),
             path: redacted_url.clone(),
@@ -23581,6 +23683,112 @@ mod tests {
 
         validate_collection_crypto_runtime_inner(&settings, "docs", &params)
             .expect("client-side vector provider should pass collection runtime validation");
+    }
+
+    #[test]
+    fn bounded_zeroizing_response_body_reads_across_growth_and_stops_past_the_limit() {
+        let body = (0..10_000_u32).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let read = read_bounded_zeroizing_response_body(body.as_slice(), 20_000).unwrap();
+        assert_eq!(read.as_slice(), body.as_slice());
+        let limited = read_bounded_zeroizing_response_body(body.as_slice(), 5_000).unwrap();
+        assert_eq!(limited.as_slice(), &body[..5_001]);
+        assert!(
+            read_bounded_zeroizing_response_body(&[][..], 16)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn zeroizing_json_value_wipes_nested_strings() {
+        let mut value = json!({"data": {"plaintext": "c2VjcmV0", "list": ["a", {"b": "c"}]}});
+        zeroize_json_strings(&mut value);
+        assert_eq!(
+            value,
+            json!({"data": {"plaintext": "", "list": ["", {"b": ""}]}})
+        );
+        let parsed = ZeroizingJsonValue::parse(br#"{"data":{"plaintext":"abc"}}"#).unwrap();
+        assert_eq!(
+            parsed.pointer("/data/plaintext").and_then(Value::as_str),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn validate_collection_crypto_runtime_rejects_client_vector_key_id_mismatch() {
+        let settings = Settings {
+            crypto: CryptoSettings {
+                zero_trust_profile: None,
+                ckks_grouped_max_candidates: crate::settings::default_ckks_grouped_max_candidates(),
+                ckks_scoring_source_batch_max:
+                    crate::settings::default_ckks_scoring_source_batch_max(),
+                ckks_query_nonce_replay_ttl_secs:
+                    crate::settings::default_ckks_query_nonce_replay_ttl_secs(),
+                ckks_query_nonce_replay_cache_max_entries:
+                    crate::settings::default_ckks_query_nonce_replay_cache_max_entries(),
+                instances: HashMap::from([(
+                    "docs_client_vector_v1".to_string(),
+                    CryptoInstanceConfig {
+                        provider: VECTOR_CLIENT_CKKS_PROVIDER.to_string(),
+                        materials: HashMap::new(),
+                        backend_ref: None,
+                        options: json!({
+                            "key_id": "tenant-a:docs",
+                            "expected_rk_id": "tenant-a/vector-rk",
+                            "min_rk_epoch": 3,
+                            "max_rk_epoch": 3,
+                            "search_mode": CLIENT_CKKS_VECTOR_SEARCH_MODE_OPAQUE_STORAGE_ONLY,
+                            "profile": CKKS_PROFILE_OPENFHE_128_N16384_D4_SCALE50,
+                            "crypto_context_b64": BASE64URL_NOPAD.encode(b"openfhe context"),
+                            "public_key_b64": BASE64URL_NOPAD.encode(b"openfhe public key"),
+                            "signature_public_keys": {
+                                "tenant-a/client-vector-signing-v1": BASE64URL_NOPAD.encode(&[9_u8; 32]),
+                            },
+                        }),
+                    },
+                )]),
+                ..CryptoSettings::default()
+            },
+            ..Settings::new(None).unwrap()
+        };
+        let params = CollectionParams {
+            encryption: Some(CollectionEncryptionConfig {
+                version: 1,
+                key_id: Some("tenant-b:docs".to_string()),
+                crypto_schema_version: 1,
+                encryption_epoch: 0,
+                migration_state: CryptoMigrationState::Active,
+                rules: vec![EncryptionRuleRef {
+                    id: "embedding_conf".to_string(),
+                    selector: EncryptionSelector::VectorNames {
+                        names: vec!["embedding".to_string()],
+                    },
+                    instance: "docs_client_vector_v1".to_string(),
+                    binding: Some(VECTOR_ENVELOPE_BINDING.to_string()),
+                }],
+            }),
+            ..CollectionParams::empty()
+        };
+
+        let err = validate_collection_crypto_runtime_inner(&settings, "docs", &params).unwrap_err();
+        assert!(
+            matches!(&err, StorageError::BadInput { description } if description.contains("key_id must match collection key_id")),
+            "{err}"
+        );
+        let err = generic_vector_write_plan(
+            &settings.crypto,
+            false,
+            "docs",
+            "docs-crypto-id",
+            &params,
+            params.encryption.as_ref().unwrap(),
+        )
+        .err()
+        .expect("mismatching client vector key_id must not build a write plan");
+        assert!(
+            matches!(&err, StorageError::BadInput { description } if description.contains("key_id must match collection key_id")),
+            "{err}"
+        );
     }
 
     #[test]

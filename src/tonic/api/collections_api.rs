@@ -22,7 +22,9 @@ use tonic::{Request, Response, Status};
 
 use super::validate;
 use crate::common::collections::*;
-use crate::common::crypto::validate_create_collection_crypto_runtime;
+use crate::common::crypto::{
+    run_blocking_crypto_runtime_task, validate_create_collection_crypto_runtime,
+};
 use crate::common::snapshots::begin_private_oram_collection_lifecycle_guard;
 use crate::settings::Settings;
 use crate::tonic::api::collections_common::get;
@@ -128,11 +130,19 @@ impl Collections for CollectionsService {
             storage::rbac::AccessRequirements::new().manage(),
             "create_collection",
         )?;
-        validate_create_collection_crypto_runtime(
-            &self.settings,
-            &create_operation.collection_name,
-            &create_operation.create_collection,
-        )?;
+        {
+            let settings = self.settings.clone();
+            let collection_name = create_operation.collection_name.clone();
+            let create_collection = create_operation.create_collection.clone();
+            run_blocking_crypto_runtime_task(move || {
+                validate_create_collection_crypto_runtime(
+                    &settings,
+                    &collection_name,
+                    &create_collection,
+                )
+            })
+            .await?;
+        }
 
         let timing = Instant::now();
         let result = self

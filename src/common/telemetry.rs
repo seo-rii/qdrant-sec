@@ -20,6 +20,9 @@ use tokio_util::task::AbortOnDropHandle;
 use tonic::Status;
 use uuid::Uuid;
 
+use crate::common::crypto::{
+    crypto_runtime_capability_fingerprint, run_blocking_crypto_runtime_task,
+};
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppBuildTelemetryCollector};
 use crate::common::telemetry_ops::cluster_telemetry::ClusterTelemetry;
 use crate::common::telemetry_ops::collections_telemetry::{
@@ -125,13 +128,30 @@ impl TelemetryCollector {
             .await
             .map_err(|_: Elapsed| StorageError::timeout(timeout, "collections telemetry"))???;
 
+        let crypto_runtime_capability_fingerprint =
+            if AppBuildTelemetry::wants_crypto_runtime_capability_fingerprint(
+                detail,
+                &self.settings,
+            ) {
+                let settings = self.settings.clone();
+                Some(
+                    run_blocking_crypto_runtime_task(move || {
+                        Ok(crypto_runtime_capability_fingerprint(&settings))
+                    })
+                    .await?,
+                )
+            } else {
+                None
+            };
+
         Ok(TelemetryData {
             id: self.process_id.to_string(),
             collections: collections_telemetry,
-            app: Some(AppBuildTelemetry::collect(
+            app: Some(AppBuildTelemetry::collect_with_crypto_fingerprint(
                 detail,
                 &self.app_telemetry_collector,
                 &self.settings,
+                crypto_runtime_capability_fingerprint,
             )),
             cluster: ClusterTelemetry::collect(auth, detail, &self.dispatcher, &self.settings),
             requests: RequestsTelemetry::collect(

@@ -36,7 +36,8 @@ use crate::actix::auth::ActixAuth;
 use crate::actix::helpers::{self, process_response};
 use crate::common::collections::*;
 use crate::common::crypto::{
-    validate_collection_crypto_runtime_with_crypto_id, validate_create_collection_crypto_runtime,
+    run_blocking_crypto_runtime_task, validate_collection_crypto_runtime_with_crypto_id,
+    validate_create_collection_crypto_runtime,
 };
 use crate::common::snapshots::begin_private_oram_collection_lifecycle_guard;
 use crate::common::update::{
@@ -118,7 +119,12 @@ async fn get_collection_crypto_manifest(
             .get_collection(&collection_pass)
             .await?;
         let config = collection.config_snapshot().await;
-        build_collection_crypto_manifest_response(&collection_name, &config, settings.get_ref())
+        let settings = settings.clone().into_inner();
+        let collection_name = collection_name.clone();
+        run_blocking_crypto_runtime_task(move || {
+            build_collection_crypto_manifest_response(&collection_name, &config, &settings)
+        })
+        .await
     };
 
     process_response(response.await, timing, None)
@@ -184,11 +190,20 @@ async fn create_collection(
         return process_response::<bool>(Err(err), timing, None);
     }
 
-    if let Err(err) = validate_create_collection_crypto_runtime(
-        settings.get_ref(),
-        &collection_name,
-        &create_collection_op.create_collection,
-    ) {
+    let validation = {
+        let settings = settings.into_inner();
+        let collection_name = collection_name.clone();
+        let create_collection = create_collection_op.create_collection.clone();
+        run_blocking_crypto_runtime_task(move || {
+            validate_create_collection_crypto_runtime(
+                &settings,
+                &collection_name,
+                &create_collection,
+            )
+        })
+        .await
+    };
+    if let Err(err) = validation {
         return process_response::<bool>(Err(err), timing, None);
     }
 

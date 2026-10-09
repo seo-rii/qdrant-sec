@@ -255,8 +255,15 @@ async fn activate_private_oram_mutation_v2(
                         .to_string(),
                 });
             };
-            let runtime_capability_fingerprint =
-                crate::common::crypto::crypto_runtime_capability_fingerprint(settings.get_ref());
+            let runtime_capability_fingerprint = {
+                let settings = settings.clone().into_inner();
+                crate::common::crypto::run_blocking_crypto_runtime_task(move || {
+                    Ok(crate::common::crypto::crypto_runtime_capability_fingerprint(
+                        &settings,
+                    ))
+                })
+                .await?
+            };
             let challenge_set = consensus.private_oram_peer_activation_challenge_set(
                 activation_id,
                 challenge_nonces,

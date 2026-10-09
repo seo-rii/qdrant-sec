@@ -83,6 +83,27 @@ impl AppBuildTelemetry {
         collector: &AppBuildTelemetryCollector,
         settings: &Settings,
     ) -> Self {
+        let fingerprint = Self::wants_crypto_runtime_capability_fingerprint(detail, settings)
+            .then(|| crypto_runtime_capability_fingerprint(settings));
+        Self::collect_with_crypto_fingerprint(detail, collector, settings, fingerprint)
+    }
+
+    /// Whether `collect` reports the crypto runtime capability fingerprint. Computing it may
+    /// unwrap resource keys through external key services, so async callers compute it on the
+    /// blocking pool and pass it to [`Self::collect_with_crypto_fingerprint`].
+    pub fn wants_crypto_runtime_capability_fingerprint(
+        detail: TelemetryDetail,
+        settings: &Settings,
+    ) -> bool {
+        detail.level >= DetailsLevel::Level1 && settings.crypto.is_configured()
+    }
+
+    pub fn collect_with_crypto_fingerprint(
+        detail: TelemetryDetail,
+        collector: &AppBuildTelemetryCollector,
+        settings: &Settings,
+        crypto_runtime_capability_fingerprint: Option<String>,
+    ) -> Self {
         AppBuildTelemetry {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -101,9 +122,8 @@ impl AppBuildTelemetry {
             system: (detail.level >= DetailsLevel::Level1).then(get_system_data),
             jwt_rbac: settings.service.jwt_rbac,
             hide_jwt_dashboard: settings.service.hide_jwt_dashboard,
-            crypto_runtime_capability_fingerprint: (detail.level >= DetailsLevel::Level1
-                && settings.crypto.is_configured())
-            .then(|| crypto_runtime_capability_fingerprint(settings)),
+            crypto_runtime_capability_fingerprint: crypto_runtime_capability_fingerprint
+                .filter(|_| Self::wants_crypto_runtime_capability_fingerprint(detail, settings)),
             startup: collector.startup,
         }
     }
