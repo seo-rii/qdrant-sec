@@ -5677,6 +5677,13 @@ passes. Fixed:
   recorded with `wrap_algorithm: vault-transit-bound`, which decodes as a
   version-2 blob and refuses a bare (unbound) plaintext, so a Transit
   response for another material can no longer open them unchecked.
+- The runtime fingerprint unwrapped every KMS or Vault Transit wrapped
+  resource key on each computation (telemetry polls included), and a
+  transient key service failure dropped the key's commitment and changed the
+  fingerprint. Commitments of remote-wrapped keys are now cached under a key
+  covering the wrapped blob, its wrap AAD fields and the remote key
+  reference (keyed by the attestation secret), so a cached value cannot
+  outlive the configuration that produced it.
 - After a replicated write-back CAS committed, a failing replica finalize
   made the coordinator skip its own local finalize, leaving it behind
   consensus until session recovery. Both finalizes now run and the first
@@ -5702,6 +5709,6 @@ Known remaining limitations:
 
 - Vault Transit materials recorded as `vault-transit` still open unbound
   (with a warning); there is no switch yet to refuse them outright.
-- The capability fingerprint still unwraps keys on every computation, so a
-  transient key service failure changes it; caching commitments needs a
-  settings identity to key the cache on.
+- Key commitments of locally sourced keys (env, file, socket) are still
+  recomputed on every fingerprint; they cannot be cached safely because the
+  key can change under the same configuration.

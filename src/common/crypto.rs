@@ -3240,7 +3240,112 @@ fn decode_cluster_key_attestation_secret() -> Result<Option<Zeroizing<Vec<u8>>>,
     Ok(Some(Zeroizing::new(secret)))
 }
 
+/// Most commitments cached for remote-wrapped resource keys; the cache is cleared when full.
+const REMOTE_KEY_COMMITMENT_CACHE_MAX_ENTRIES: usize = 4096;
+
+fn remote_key_commitment_cache() -> &'static parking_lot::Mutex<HashMap<[u8; 32], String>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<[u8; 32], String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Cache key for the commitment of a resource key wrapped by AWS KMS or Vault Transit, or
+/// `None` for any other material. For those the plaintext is fixed by the wrapped blob, its
+/// wrap AAD fields and the remote key reference, all part of this key (keyed by the
+/// attestation secret), so a cached commitment cannot go stale without the key changing.
+/// Locally sourced keys (env, file, socket) can change under the same config and are never
+/// cached.
+fn remote_key_commitment_cache_key(
+    runtime_settings: &CryptoSettings,
+    material_name: &str,
+    material: &CryptoMaterialConfig,
+    attestation_secret: &[u8],
+) -> Option<[u8; 32]> {
+    if material.kind != WRAPPED_SYMMETRIC_KEY_32_KIND {
+        return None;
+    }
+    let wrapped_by = material.wrapped_by.as_deref()?;
+    let wrapping = runtime_settings.materials.get(wrapped_by)?;
+    if !matches!(
+        wrapping.source.as_deref(),
+        Some(AWS_KMS_SOURCE | VAULT_TRANSIT_SOURCE)
+    ) {
+        return None;
+    }
+    let epoch = material.rk_epoch.map(|epoch| epoch.to_string());
+    let fields = [
+        Some(material_name),
+        Some(material.kind.as_str()),
+        Some(resource_key_state(material)),
+        epoch.as_deref(),
+        material.scope.as_deref(),
+        Some(wrapped_by),
+        material.wrap_algorithm.as_deref(),
+        material.nonce.as_deref(),
+        material.wrapped_key_b64.as_deref(),
+        wrapping.kind.as_str().into(),
+        wrapping.source.as_deref(),
+        wrapping.path.as_deref(),
+        wrapping.env.as_deref(),
+        wrapping.expected_host.as_deref(),
+        wrapping.provider_key_version.as_deref(),
+    ];
+    let key = hmac::Key::new(hmac::HMAC_SHA256, attestation_secret);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(b"qdrant-sec/crypto-runtime-key-commitment-cache/v1");
+    for field in fields {
+        match field {
+            Some(value) => {
+                context.update(&[1]);
+                context.update(&(value.len() as u64).to_be_bytes());
+                context.update(value.as_bytes());
+            }
+            None => context.update(&[0]),
+        }
+    }
+    let mut cache_key = [0_u8; 32];
+    cache_key.copy_from_slice(context.sign().as_ref());
+    Some(cache_key)
+}
+
+/// Commitment to a material's key for the runtime fingerprint. Commitments of remote-wrapped
+/// resource keys are cached: recomputing them unwrapped the key through KMS or Vault on every
+/// fingerprint (telemetry polls included), and a transient key service failure dropped the
+/// commitment and changed the fingerprint.
 fn material_key_attestation_commitment(
+    runtime_settings: &CryptoSettings,
+    material_name: &str,
+    material: &CryptoMaterialConfig,
+    attestation_secret: &[u8],
+) -> Option<String> {
+    let cache_key = remote_key_commitment_cache_key(
+        runtime_settings,
+        material_name,
+        material,
+        attestation_secret,
+    );
+    if let Some(cache_key) = &cache_key
+        && let Some(commitment) = remote_key_commitment_cache().lock().get(cache_key)
+    {
+        return Some(commitment.clone());
+    }
+    let commitment = uncached_material_key_attestation_commitment(
+        runtime_settings,
+        material_name,
+        material,
+        attestation_secret,
+    )?;
+    if let Some(cache_key) = cache_key {
+        let mut cache = remote_key_commitment_cache().lock();
+        if cache.len() >= REMOTE_KEY_COMMITMENT_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(cache_key, commitment.clone());
+    }
+    Some(commitment)
+}
+
+fn uncached_material_key_attestation_commitment(
     runtime_settings: &CryptoSettings,
     material_name: &str,
     material: &CryptoMaterialConfig,
@@ -16694,6 +16799,99 @@ mod tests {
         }
 
         assert_eq!(decoded.as_bytes(), &[37u8; 32]);
+    }
+
+    #[test]
+    fn remote_wrapped_key_commitments_are_cached_and_survive_key_service_outages() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/transit/decrypt/docs")
+            .match_header("x-vault-token", "commitment-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": { "plaintext": BASE64.encode(&[39u8; 32]) } }).to_string())
+            .expect(1)
+            .create();
+        unsafe {
+            std::env::set_var(
+                "QDRANT_TEST_VAULT_TRANSIT_COMMITMENT_TOKEN",
+                "commitment-token",
+            );
+        }
+        let wrapped_material = CryptoMaterialConfig {
+            kind: "wrapped_symmetric_key_32".to_string(),
+            wrapped_by: Some("tenant-a/mk-vault-commitment".to_string()),
+            wrap_algorithm: Some(VAULT_TRANSIT_WRAP_ALGORITHM.to_string()),
+            nonce: Some(VAULT_TRANSIT_NONCE_SENTINEL_B64.to_string()),
+            wrapped_key_b64: Some(BASE64URL_NOPAD.encode(b"vault:v1:commitment-ciphertext")),
+            rk_epoch: Some(5),
+            state: Some("active".to_string()),
+            scope: Some("collection:docs/payload:body".to_string()),
+            ..CryptoMaterialConfig::default()
+        };
+        let settings = CryptoSettings {
+            materials: HashMap::from([
+                (
+                    "tenant-a/mk-vault-commitment".to_string(),
+                    CryptoMaterialConfig {
+                        kind: "wrapping_key_32".to_string(),
+                        source: Some(VAULT_TRANSIT_SOURCE.to_string()),
+                        env: Some("QDRANT_TEST_VAULT_TRANSIT_COMMITMENT_TOKEN".to_string()),
+                        path: Some(format!("{}/v1/transit/keys/docs", server.url())),
+                        ..CryptoMaterialConfig::default()
+                    },
+                ),
+                (
+                    "tenant-a/payload-rk-commitment".to_string(),
+                    wrapped_material.clone(),
+                ),
+            ]),
+            ..CryptoSettings::default()
+        };
+        let secret = [0xC7_u8; 32];
+
+        let first = material_key_attestation_commitment(
+            &settings,
+            "tenant-a/payload-rk-commitment",
+            &wrapped_material,
+            &secret,
+        );
+        // The key service is unavailable for the second fingerprint: the commitment holds.
+        unsafe {
+            std::env::remove_var("QDRANT_TEST_VAULT_TRANSIT_COMMITMENT_TOKEN");
+        }
+        let second = material_key_attestation_commitment(
+            &settings,
+            "tenant-a/payload-rk-commitment",
+            &wrapped_material,
+            &secret,
+        );
+        mock.assert();
+        assert!(first.is_some());
+        assert_eq!(first, second);
+
+        // Any change to the wrapped blob is a different cache key.
+        let mut rewrapped = wrapped_material.clone();
+        rewrapped.wrapped_key_b64 = Some(BASE64URL_NOPAD.encode(b"vault:v1:other-ciphertext"));
+        assert!(
+            material_key_attestation_commitment(
+                &settings,
+                "tenant-a/payload-rk-commitment",
+                &rewrapped,
+                &secret,
+            )
+            .is_none()
+        );
+        // Locally sourced keys are never cached.
+        assert!(
+            remote_key_commitment_cache_key(
+                &settings,
+                "tenant-a/mk-vault-commitment",
+                &settings.materials["tenant-a/mk-vault-commitment"],
+                &secret,
+            )
+            .is_none()
+        );
     }
 
     #[test]
