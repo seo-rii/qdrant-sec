@@ -3421,7 +3421,11 @@ for example `/v1/<mount>/transit/keys/<key>`. qdrant-sec derives the
 corresponding `/encrypt/<key>` and `/decrypt/<key>` endpoints and sends the RK
 plaintext only to Vault Transit for wrap/unwrap. The config never contains the
 MK bytes, and `wrapped_symmetric_key_32.wrap_algorithm` becomes
-`vault-transit`. As with Vault KV v2, the URL must use HTTPS except loopback
+`vault-transit-bound`: the Transit plaintext carries a tag and the SHA-256 of
+the wrap AAD (material name, scope, epoch, wrapping material and algorithm)
+ahead of the key, and a material with this algorithm refuses a bare 32-byte
+plaintext. Materials recorded as `vault-transit` (wrapped before the binding
+existed) still open with a warning; re-wrap them to bind them to their scope. As with Vault KV v2, the URL must use HTTPS except loopback
 HTTP for tests/dev, credentials/query/fragment components are rejected, and
 `env` must name the Vault token environment variable. Non-loopback Vault
 Transit URLs require `expected_host` with the exact URL authority for the same
@@ -5669,6 +5673,10 @@ passes. Fixed:
   instead of reallocation (which freed unwiped copies), parsed into a JSON
   value whose strings are wiped on drop, and the untrimmed AWS secret access
   key and session token are wiped as well.
+- Resource keys this server wraps or re-wraps through Vault Transit are now
+  recorded with `wrap_algorithm: vault-transit-bound`, which decodes as a
+  version-2 blob and refuses a bare (unbound) plaintext, so a Transit
+  response for another material can no longer open them unchecked.
 - After a replicated write-back CAS committed, a failing replica finalize
   made the coordinator skip its own local finalize, leaving it behind
   consensus until session recovery. Both finalizes now run and the first
@@ -5692,8 +5700,8 @@ finalized consensus reservation challenge.
 
 Known remaining limitations:
 
-- Vault Transit version-1 blobs still open unbound; refusing them needs the
-  blob version stored with the material (a configuration format change).
+- Vault Transit materials recorded as `vault-transit` still open unbound
+  (with a warning); there is no switch yet to refuse them outright.
 - The capability fingerprint still unwraps keys on every computation, so a
   transient key service failure changes it; caching commitments needs a
   settings identity to key the cache on.

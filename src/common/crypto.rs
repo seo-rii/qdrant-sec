@@ -284,6 +284,9 @@ const AWS_KMS_KEY_ID_REDACTED: &str = "aws-kms-key-id:[redacted]";
 const AWS_KMS_ENV_PREFIX_REDACTED: &str = "aws-kms-env-prefix:[redacted]";
 const VAULT_TRANSIT_SOURCE: &str = "vault_transit";
 const VAULT_TRANSIT_WRAP_ALGORITHM: &str = "vault-transit";
+/// Recorded on resource keys this server wraps through Vault Transit: their plaintext carries
+/// the scope binding, so a bare (version 1) plaintext is refused instead of opened unbound.
+const VAULT_TRANSIT_BOUND_WRAP_ALGORITHM: &str = "vault-transit-bound";
 /// Wrapped-key blob version whose Transit plaintext carries the scope binding below.
 const VAULT_TRANSIT_BOUND_BLOB_VERSION: u8 = 2;
 const VAULT_TRANSIT_BINDING_TAG: u8 = 0x02;
@@ -6386,6 +6389,7 @@ fn validate_wrapped_resource_key_material(
     if algorithm != RESOURCE_KEY_WRAP_ALGORITHM
         && algorithm != AWS_KMS_WRAP_ALGORITHM
         && algorithm != VAULT_TRANSIT_WRAP_ALGORITHM
+        && algorithm != VAULT_TRANSIT_BOUND_WRAP_ALGORITHM
     {
         return Err(CryptoSetupError::UnsupportedWrapAlgorithm {
             material: material_name.to_string(),
@@ -8363,6 +8367,7 @@ fn decode_wrapped_resource_key_for_state(
     if algorithm != RESOURCE_KEY_WRAP_ALGORITHM
         && algorithm != AWS_KMS_WRAP_ALGORITHM
         && algorithm != VAULT_TRANSIT_WRAP_ALGORITHM
+        && algorithm != VAULT_TRANSIT_BOUND_WRAP_ALGORITHM
     {
         return Err(PayloadWriteSetupError::UnsupportedWrapAlgorithm {
             material: material_name.to_string(),
@@ -8392,7 +8397,7 @@ fn decode_wrapped_resource_key_for_state(
 
     let provider = runtime_master_key_provider(wrapped_by, wrapping_material)?;
     let wrapped = WrappedKeyBlob {
-        version: 1,
+        version: stored_wrapped_key_blob_version(algorithm),
         algorithm: algorithm.to_string(),
         mk_id: wrapped_by.to_string(),
         nonce: nonce.clone(),
@@ -8436,6 +8441,7 @@ pub fn rewrap_runtime_resource_key_material(
     if algorithm != RESOURCE_KEY_WRAP_ALGORITHM
         && algorithm != AWS_KMS_WRAP_ALGORITHM
         && algorithm != VAULT_TRANSIT_WRAP_ALGORITHM
+        && algorithm != VAULT_TRANSIT_BOUND_WRAP_ALGORITHM
     {
         return Err(PayloadWriteSetupError::UnsupportedWrapAlgorithm {
             material: material_name.to_string(),
@@ -8500,7 +8506,7 @@ pub fn rewrap_runtime_resource_key_material(
     let new_algorithm = new_provider.wrap_algorithm();
 
     let old_wrapped = WrappedKeyBlob {
-        version: 1,
+        version: stored_wrapped_key_blob_version(algorithm),
         algorithm: algorithm.to_string(),
         mk_id: old_wrapped_by.to_string(),
         nonce: old_nonce.clone(),
@@ -8772,8 +8778,18 @@ impl RuntimeMasterKeyProvider {
         match self {
             Self::AwsKms(_) => AWS_KMS_WRAP_ALGORITHM,
             Self::Local(_) => RESOURCE_KEY_WRAP_ALGORITHM,
-            Self::VaultTransit(_) => VAULT_TRANSIT_WRAP_ALGORITHM,
+            Self::VaultTransit(_) => VAULT_TRANSIT_BOUND_WRAP_ALGORITHM,
         }
+    }
+}
+
+/// Stored materials keep only the wrap algorithm, not the blob version; the scope-bound Vault
+/// Transit algorithm id stands for version 2, everything else for version 1.
+fn stored_wrapped_key_blob_version(algorithm: &str) -> u8 {
+    if algorithm == VAULT_TRANSIT_BOUND_WRAP_ALGORITHM {
+        VAULT_TRANSIT_BOUND_BLOB_VERSION
+    } else {
+        1
     }
 }
 
@@ -9466,7 +9482,9 @@ impl MasterKeyProvider for VaultTransitMasterKeyProvider {
                 wrapped.version,
             ));
         }
-        if wrapped.algorithm != VAULT_TRANSIT_WRAP_ALGORITHM {
+        if wrapped.algorithm != VAULT_TRANSIT_WRAP_ALGORITHM
+            && wrapped.algorithm != VAULT_TRANSIT_BOUND_WRAP_ALGORITHM
+        {
             return Err(qdrant_sec::EncryptionError::UnsupportedAlgorithm(
                 wrapped.algorithm.clone(),
             ));
@@ -16463,7 +16481,7 @@ mod tests {
         assert_eq!(material.wrapped_by.as_deref(), Some("tenant-a/mk-vault"));
         assert_eq!(
             material.wrap_algorithm.as_deref(),
-            Some(VAULT_TRANSIT_WRAP_ALGORITHM)
+            Some(VAULT_TRANSIT_BOUND_WRAP_ALGORITHM)
         );
         assert_eq!(
             material.nonce.as_deref(),
@@ -16676,6 +16694,58 @@ mod tests {
         }
 
         assert_eq!(decoded.as_bytes(), &[37u8; 32]);
+    }
+
+    #[test]
+    fn decode_wrapped_resource_key_refuses_bare_plaintext_for_bound_vault_transit_material() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/transit/decrypt/docs")
+            .match_header("x-vault-token", "bare-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": { "plaintext": BASE64.encode(&[38u8; 32]) } }).to_string())
+            .create();
+        unsafe {
+            std::env::set_var("QDRANT_TEST_VAULT_TRANSIT_BARE_TOKEN", "bare-token");
+        }
+        let wrapping_material = CryptoMaterialConfig {
+            kind: "wrapping_key_32".to_string(),
+            source: Some(VAULT_TRANSIT_SOURCE.to_string()),
+            env: Some("QDRANT_TEST_VAULT_TRANSIT_BARE_TOKEN".to_string()),
+            path: Some(format!("{}/v1/transit/keys/docs", server.url())),
+            ..CryptoMaterialConfig::default()
+        };
+        let wrapped_material = CryptoMaterialConfig {
+            kind: "wrapped_symmetric_key_32".to_string(),
+            wrapped_by: Some("tenant-a/mk-vault-bare".to_string()),
+            wrap_algorithm: Some(VAULT_TRANSIT_BOUND_WRAP_ALGORITHM.to_string()),
+            nonce: Some(VAULT_TRANSIT_NONCE_SENTINEL_B64.to_string()),
+            wrapped_key_b64: Some(BASE64URL_NOPAD.encode(b"vault:v1:bare-ciphertext")),
+            rk_epoch: Some(5),
+            state: Some("active".to_string()),
+            scope: Some("collection:docs/payload:body".to_string()),
+            ..CryptoMaterialConfig::default()
+        };
+        let settings = CryptoSettings {
+            materials: HashMap::from([
+                ("tenant-a/mk-vault-bare".to_string(), wrapping_material),
+                (
+                    "tenant-a/payload-rk-bare".to_string(),
+                    wrapped_material.clone(),
+                ),
+            ]),
+            ..CryptoSettings::default()
+        };
+
+        let decoded =
+            decode_wrapped_resource_key(&settings, "tenant-a/payload-rk-bare", &wrapped_material);
+        unsafe {
+            std::env::remove_var("QDRANT_TEST_VAULT_TRANSIT_BARE_TOKEN");
+        }
+
+        // A bound material must never open an unbound plaintext (no scope check possible).
+        assert!(decoded.is_err());
     }
 
     #[test]
