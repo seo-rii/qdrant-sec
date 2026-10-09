@@ -5640,8 +5640,9 @@ Known remaining limitations added by this pass:
   the collection's stable crypto id, a fresh UUID per created collection
   (corrected in the nineteenth pass).
 - Collections without a floor-pinning authority are still pruned using
-  node-local collection config (divergence across nodes), and a follower
-  lagging across such a prune can refuse the leader's snapshot.
+  node-local collection config for indexes that have no replicated mutation
+  state (legacy V1 collections). The nineteenth pass covers indexes named by
+  the mutation state and the lagging-follower snapshot refusal.
 
 ### Nineteenth pass: snapshot catch-up after deletes, client CKKS key binding, key service I/O
 
@@ -5684,6 +5685,10 @@ passes. Fixed:
   covering the wrapped blob, its wrap AAD fields and the remote key
   reference (keyed by the attestation secret), so a cached value cannot
   outlive the configuration that produced it.
+- The delete prune took the index keys only from node-local collection
+  config, so records of indexes the config no longer listed leaked. It now
+  also prunes the epoch and session-lease records of every index named by
+  the collection's replicated mutation state.
 - After a replicated write-back CAS committed, a failing replica finalize
   made the coordinator skip its own local finalize, leaving it behind
   consensus until session recovery. Both finalizes now run and the first

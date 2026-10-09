@@ -4889,8 +4889,19 @@ impl Persistent {
             );
             return Ok(false);
         }
+        // The replicated mutation state names its indexes too: pruning them as well does not
+        // depend on node-local collection config for collections that have one.
+        let mut keys = index_keys.to_vec();
+        if let Some(state) = self.private_oram_mutation_states.get(&mutation_digest) {
+            keys.extend(
+                state
+                    .indexes
+                    .iter()
+                    .map(|index| private_oram_mutation_index_epoch_key(&collection_id, index)),
+            );
+        }
         let mut removed = false;
-        for key in index_keys {
+        for key in &keys {
             let digest = private_oram_epoch_key_digest(key);
             removed |= self.private_oram_epochs.remove(&digest).is_some();
             removed |= self.private_oram_session_leases.remove(&digest).is_some();
@@ -8174,6 +8185,49 @@ mod tests {
             reloaded.active_private_oram_mutation_keys().unwrap(),
             vec![fixture.key]
         );
+    }
+
+    #[test]
+    fn deleting_a_collection_prunes_indexes_named_by_its_mutation_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        let state_index_digests = fixture
+            .old_state
+            .indexes
+            .iter()
+            .map(|index| {
+                private_oram_epoch_key_digest(&private_oram_mutation_index_epoch_key(
+                    &fixture.key.collection_id,
+                    index,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(!state_index_digests.is_empty());
+        assert!(
+            state_index_digests
+                .iter()
+                .all(|digest| persistent.private_oram_epochs.contains_key(digest))
+        );
+
+        // Node-local config that no longer lists the indexes must not leak their records.
+        let pruned = persistent
+            .prune_private_oram_collection_state(&[PrivateOramEpochKey {
+                collection_id: fixture.key.collection_id.clone(),
+                index_kind: PrivateOramIndexKind::Hnsw,
+                index_name: "not-configured-locally".to_string(),
+            }])
+            .unwrap();
+        assert!(pruned);
+        assert!(persistent.private_oram_mutation_states.is_empty());
+        assert!(
+            state_index_digests
+                .iter()
+                .all(|digest| !persistent.private_oram_epochs.contains_key(digest))
+        );
+        drop(persistent);
+        Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
     #[test]
