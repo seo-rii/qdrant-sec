@@ -1520,6 +1520,9 @@ Signed fields:
 
 - Backup rotation, client-state escrow, restore drill, key-loss 절차를 runbook으로
   작성한다.
+  - 2026-10-09: `docs/private-oram-operations-runbook.md`에 초안을 작성했다. Checkpoint
+    서명과 client-state escrow를 자동화하는 tooling과 staging restore drill 결과 기록은
+    아직 남아 있다.
 - Active target recovery, RF=1 external restore, append mutation을 Linux
   multi-process cluster E2E와 latency/bandwidth/write-amplification benchmark로
   고정한다.
