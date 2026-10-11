@@ -1506,6 +1506,9 @@ Signed fields:
 - 남은 release gate는 terminal Qdrant process를 fsync/rename/Raft 경계마다 kill하는 multi-process
   matrix, 두 supervisor/leader-change concurrency E2E, disk-full/permission/fsync injection과
   end-to-end snapshot/WAL binary sentinel scan이다.
+- 2026-10-11: private HNSW upload + collection snapshot의 storage/snapshot/temp binary sentinel
+  scan(`private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels`)이 추가됐다. Distributed
+  Raft WAL, result ORAM payload plaintext, logs/metrics, V2 append mutation scan은 남아 있다.
 
 완료 조건:
 

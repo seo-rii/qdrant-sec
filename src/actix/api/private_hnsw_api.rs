@@ -1316,6 +1316,191 @@ mod private_hnsw_rest_tests {
         assert_eq!(json_roundtrip(&commit_request), commit_request);
     }
 
+    fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).unwrap();
+                files.push((path, bytes));
+            }
+        }
+        files
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Leakage scan (PLAN V2-D5): a private HNSW index uploaded through the server path and
+    /// captured in a collection snapshot must leave no plaintext vector, node id, point token
+    /// or client key bytes anywhere under the storage, snapshot or temp directories.
+    #[test]
+    fn private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels() {
+        let _guard = route_e2e_guard();
+        let points = vec![
+            qdrant_sec::PrivateHnswBuildPoint {
+                node_id: *b"qdrant-sec-leak-scan-node-id-001",
+                point_token: *b"qdrant-sec-leak-scan-point-tok01",
+                vector: vec![1234.5678, -8765.4321],
+                payload_fetch_token: None,
+            },
+            qdrant_sec::PrivateHnswBuildPoint {
+                node_id: *b"qdrant-sec-leak-scan-node-id-002",
+                point_token: *b"qdrant-sec-leak-scan-point-tok02",
+                vector: vec![2345.6789, -7654.3219],
+                payload_fetch_token: None,
+            },
+            qdrant_sec::PrivateHnswBuildPoint {
+                node_id: *b"qdrant-sec-leak-scan-node-id-003",
+                point_token: *b"qdrant-sec-leak-scan-point-tok03",
+                vector: vec![-3456.7891, 6543.2198],
+                payload_fetch_token: None,
+            },
+        ];
+        let fixture = PrivateHnswRouteWireFixture::build_uploaded_with_points(points.clone());
+        let settings = fixture.route_settings();
+        let (temp, dispatcher) = test_dispatcher();
+        actix_web::rt::System::new().block_on(async {
+            create_private_hnsw_collection(&dispatcher).await;
+            let auth = Auth::new_internal(Access::full("private HNSW leakage scan"));
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            do_upload_private_hnsw_manifest(
+                toc,
+                &auth,
+                &settings,
+                "docs",
+                "text",
+                fixture.manifest.clone(),
+                fixture.manifest_signature.clone(),
+            )
+            .await
+            .unwrap();
+            do_upload_private_hnsw_buckets(
+                toc,
+                &auth,
+                &settings,
+                "docs",
+                "text",
+                fixture.encrypted_build.index_epoch,
+                fixture.encrypted_build.root_hash.clone(),
+                fixture.encrypted_build.buckets.clone(),
+            )
+            .await
+            .unwrap();
+            crate::common::collections::do_create_snapshot(toc.clone(), &auth, "docs")
+                .await
+                .unwrap();
+        });
+
+        let files = files_under(temp.path());
+        let snapshot_files = files
+            .iter()
+            .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "snapshot"))
+            .collect::<Vec<_>>();
+        assert!(
+            !snapshot_files.is_empty(),
+            "collection snapshot was not written"
+        );
+
+        // Positive control: the scan must see the uploaded ciphertext in the store and in the
+        // snapshot, or an absent sentinel would prove nothing.
+        let ciphertext_marker = fixture.encrypted_build.buckets[0].ciphertext.as_bytes();
+        assert!(
+            files.iter().any(
+                |(path, bytes)| path.extension().is_none_or(|ext| ext != "snapshot")
+                    && contains_bytes(bytes, ciphertext_marker)
+            ),
+            "uploaded bucket ciphertext not found in storage; the scan reads the wrong files",
+        );
+        assert!(
+            snapshot_files
+                .iter()
+                .any(|(_, bytes)| contains_bytes(bytes, ciphertext_marker)),
+            "uploaded bucket ciphertext not found in the snapshot archive",
+        );
+
+        let mut sentinels: Vec<(String, Vec<u8>)> =
+            vec![("client resource key".to_string(), [13_u8; 32].to_vec())];
+        for (index, point) in points.iter().enumerate() {
+            sentinels.push((format!("node id {index}"), point.node_id.to_vec()));
+            sentinels.push((format!("point token {index}"), point.point_token.to_vec()));
+            sentinels.push((
+                format!("node id {index} (base64url)"),
+                data_encoding::BASE64URL_NOPAD
+                    .encode(&point.node_id)
+                    .into_bytes(),
+            ));
+            sentinels.push((
+                format!("point token {index} (base64url)"),
+                data_encoding::BASE64URL_NOPAD
+                    .encode(&point.point_token)
+                    .into_bytes(),
+            ));
+            let f32_bytes = point
+                .vector
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            let f64_bytes = point
+                .vector
+                .iter()
+                .flat_map(|value| f64::from(*value).to_le_bytes())
+                .collect::<Vec<_>>();
+            sentinels.push((format!("vector {index} f32"), f32_bytes));
+            sentinels.push((format!("vector {index} f64"), f64_bytes));
+            for value in &point.vector {
+                sentinels.push((
+                    format!("vector {index} component {value} (text)"),
+                    format!("{value}").into_bytes(),
+                ));
+            }
+        }
+        // One pass per file: every 8-byte window is looked up among the sentinel prefixes and
+        // only a prefix hit compares the whole sentinel (a naive scan took 85 s in debug builds).
+        let mut by_prefix: std::collections::HashMap<[u8; 8], Vec<&(String, Vec<u8>)>> =
+            std::collections::HashMap::new();
+        for sentinel in &sentinels {
+            assert!(
+                sentinel.1.len() >= 8,
+                "sentinel {} is too short",
+                sentinel.0
+            );
+            let prefix: [u8; 8] = sentinel.1[..8].try_into().unwrap();
+            by_prefix.entry(prefix).or_default().push(sentinel);
+        }
+        for (path, bytes) in &files {
+            for offset in 0..bytes.len().saturating_sub(7) {
+                let window: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                // Preallocated WAL and mmap files are mostly zero, and no sentinel starts with
+                // eight zero bytes.
+                if window == [0; 8] {
+                    continue;
+                }
+                let Some(candidates) = by_prefix.get(&window) else {
+                    continue;
+                };
+                for (label, sentinel) in candidates {
+                    assert!(
+                        !bytes[offset..].starts_with(sentinel),
+                        "plaintext sentinel '{label}' leaked into {}",
+                        path.display(),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn private_hnsw_common_ops_require_write_access_for_mutations() {
         let _guard = route_e2e_guard();

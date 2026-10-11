@@ -5717,3 +5717,21 @@ Known remaining limitations:
 - Key commitments of locally sourced keys (env, file, socket) are still
   recomputed on every fingerprint; they cannot be cached safely because the
   key can change under the same configuration.
+
+### Release gate work: private HNSW storage and snapshot leakage scan
+
+`private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels`
+(`src/actix/api/private_hnsw_api.rs`) builds a private HNSW index over
+distinctive plaintext points, uploads its manifest and buckets through the
+server's upload path, creates a collection snapshot, and then scans every file
+under the storage, snapshot and temp directories. No node id, point token
+(raw or base64url), vector (f32, f64 or decimal text) or client resource key
+bytes may appear. A positive control requires the uploaded bucket ciphertext
+to be visible both in the store and in the snapshot archive, so an absent
+sentinel cannot come from scanning the wrong files. The test runs in the CI
+private ORAM step.
+
+Not yet covered by this scan: the Raft WAL and state of a distributed
+cluster (consensus records carry only digests, but no test scans them),
+result ORAM payload plaintext (the route fixture uses synthetic ciphertext),
+logs and metrics output, and V2 append mutations.

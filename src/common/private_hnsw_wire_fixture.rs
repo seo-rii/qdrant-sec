@@ -300,9 +300,27 @@ impl PrivateHnswRouteWireFixture {
         Self::build_uploaded_for_collection_id_with_path_batch_size(collection_id, 1)
     }
 
+    /// Builds the fixture over caller-chosen points (three, like the default fixture), for
+    /// leakage scans that need distinctive plaintext vectors and tokens.
+    pub(crate) fn build_uploaded_with_points(points: Vec<PrivateHnswBuildPoint>) -> Self {
+        Self::build_uploaded_for_collection_id_with_points(COLLECTION_ID, 1, points)
+    }
+
     fn build_uploaded_for_collection_id_with_path_batch_size(
         collection_id: &'static str,
         path_batch_size: u32,
+    ) -> Self {
+        Self::build_uploaded_for_collection_id_with_points(
+            collection_id,
+            path_batch_size,
+            Self::points(),
+        )
+    }
+
+    fn build_uploaded_for_collection_id_with_points(
+        collection_id: &'static str,
+        path_batch_size: u32,
+        points: Vec<PrivateHnswBuildPoint>,
     ) -> Self {
         let temp = TempDir::new().unwrap();
         let store = PrivateHnswOramStore::new(temp.path(), VECTOR_NAME).unwrap();
@@ -328,7 +346,7 @@ impl PrivateHnswRouteWireFixture {
             2,
             1,
             2,
-            &Self::points(),
+            &points,
             &[0, 1, 2],
         )
         .unwrap();
