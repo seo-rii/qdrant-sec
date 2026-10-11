@@ -5759,8 +5759,13 @@ when run as root, because root ignores directory permissions.
 store, Linux) re-runs itself alone in a child process, ignores `SIGXFSZ` and
 lowers `RLIMIT_FSIZE` to 64 bytes, so every commit write fails with `EFBIG`
 the way writes fail on a full disk; the commit must fail closed and succeed
-after the limit is lifted. Real `ENOSPC` and fsync failures are not injected
-yet. Raft state saves already
+after the limit is lifted.
+`writeback_commit_fails_closed_on_a_full_disk_and_retries_cleanly` injects a
+real `ENOSPC`: the child runs under `unshare -Urm` on a 512 KiB tmpfs, fills
+it after the upload, expects the commit to fail closed (old epoch and bucket
+intact, no pending write-back), frees the space and expects the retry to
+succeed. It skips where unprivileged user namespaces are unavailable (some
+CI kernels restrict them). fsync failures are still not injected. Raft state saves already
 have fsync and publish fault backends (`persistent.rs`).
 
 ### Release gate work: store-level process kill matrix

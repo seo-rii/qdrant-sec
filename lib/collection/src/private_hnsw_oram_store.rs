@@ -7871,6 +7871,121 @@ mod tests {
         );
     }
 
+    /// Fault injection (PLAN V2-D5): a commit on a genuinely full filesystem (`ENOSPC`) must
+    /// fail closed and succeed once space is freed. The child runs in a user and mount
+    /// namespace (`unshare -Urm`) on a 512 KiB tmpfs; the test skips where unprivileged user
+    /// namespaces are unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_commit_fails_closed_on_a_full_disk_and_retries_cleanly() {
+        const CHILD_DIR_ENV: &str = "QDRANT_SEC_PRIVATE_HNSW_STORE_ENOSPC_DIR";
+        const MOUNT_FAILED_EXIT: i32 = 77;
+        let Some(mount_dir) = std::env::var_os(CHILD_DIR_ENV) else {
+            let namespaces_available = std::process::Command::new("unshare")
+                .args(["-Urm", "true"])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !namespaces_available {
+                eprintln!("skipping: unprivileged user and mount namespaces are unavailable");
+                return;
+            }
+            let temp = TempDir::new().unwrap();
+            let status = std::process::Command::new("unshare")
+                .args([
+                    "-Urm",
+                    "sh",
+                    "-c",
+                    "mount -t tmpfs -o size=512k tmpfs \"$1\" || exit 77; exec \"$2\" \"$3\" --exact --test-threads=1",
+                    "sh",
+                ])
+                .arg(temp.path())
+                .arg(std::env::current_exe().unwrap())
+                .arg("private_hnsw_oram_store::tests::writeback_commit_fails_closed_on_a_full_disk_and_retries_cleanly")
+                .env(CHILD_DIR_ENV, temp.path())
+                .status()
+                .unwrap();
+            if status.code() == Some(MOUNT_FAILED_EXIT) {
+                eprintln!("skipping: tmpfs cannot be mounted in a user namespace here");
+                return;
+            }
+            assert!(status.success(), "full-disk child failed: {status}");
+            return;
+        };
+
+        // Inside the namespace: the tmpfs root is world-writable, so the collection directory is
+        // created owner-only as the store requires.
+        let collection_dir = Path::new(&mount_dir).join("collection");
+        fs::create_dir(&collection_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&collection_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+        let store = PrivateHnswOramStore::new(&collection_dir, "text").unwrap();
+        let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+        let original_bucket = store
+            .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+            .unwrap();
+        let verification = PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        // Fill the filesystem completely.
+        let filler_path = Path::new(&mount_dir).join("filler");
+        {
+            use std::io::Write as _;
+            let mut filler = fs_err::File::create(&filler_path).unwrap();
+            let chunk = [0x5a_u8; 4096];
+            loop {
+                match filler.write(&chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+                        break;
+                    }
+                }
+            }
+        }
+
+        let refused = store.commit_writeback_with_signature(
+            &old,
+            &new,
+            bundle.bucket_count(),
+            std::slice::from_ref(&updated_bucket),
+            4096,
+            &signature,
+            verification,
+        );
+        assert!(refused.is_err(), "commit on a full filesystem must fail");
+        assert_eq!(store.read_current_epoch().unwrap(), old);
+        assert_eq!(
+            store
+                .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+                .unwrap(),
+            original_bucket,
+        );
+        assert!(!store.pending_writeback_exists().unwrap());
+
+        fs::remove_file(&filler_path).unwrap();
+        let committed = store
+            .commit_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification,
+            )
+            .unwrap();
+        assert_eq!(committed, new);
+        assert_eq!(store.read_current_epoch().unwrap(), new);
+    }
+
     /// Fault injection (PLAN V2-D5): write failures in the middle of a commit, as on a full
     /// disk, must fail closed and leave the store committable on retry. The file size limit is
     /// process-wide, so the test re-executes itself alone in a child process.
