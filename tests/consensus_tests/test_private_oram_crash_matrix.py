@@ -30,6 +30,7 @@ from .test_private_oram_sessions import (
     _upload_hnsw,
 )
 from .utils import (
+    get_cluster_info,
     get_uri,
     kill_all_processes,
     processes,
@@ -97,9 +98,10 @@ def _serves_epoch(peer_url: str, epoch: int, root_hash: str) -> bool:
             pass
 
 
+@pytest.mark.parametrize("coordinator_role", ["follower", "leader"])
 @pytest.mark.parametrize("crash_point", BEFORE_CAS + AFTER_CAS)
 def test_coordinator_abort_during_replicated_writeback_converges(
-    tmp_path: pathlib.Path, crash_point: str
+    tmp_path: pathlib.Path, crash_point: str, coordinator_role: str
 ):
     peer_urls, peer_dirs, fixture, leader, _ = _start_private_oram_cluster(
         tmp_path,
@@ -113,8 +115,15 @@ def test_coordinator_abort_during_replicated_writeback_converges(
     next_root = hnsw["commit"]["new_root_hash"]
     _upload_hnsw(peer_urls[0], fixture)
 
-    # The coordinator is the peer receiving the commit; peer 0 stays up as the bootstrap.
-    coordinator = 1
+    # The coordinator is the peer receiving the commit. Killing the Raft leader as coordinator
+    # also forces a leader election while the write-back is in flight.
+    peer_ids = [get_cluster_info(peer_url)["peer_id"] for peer_url in peer_urls]
+    leader_index = peer_ids.index(leader)
+    coordinator = (
+        leader_index
+        if coordinator_role == "leader"
+        else next(index for index in range(len(peer_urls)) if index != leader_index)
+    )
     coordinator_url = peer_urls[coordinator]
     # Wait until the coordinator applied the upload's consensus records.
     wait_for(
@@ -148,9 +157,7 @@ def test_coordinator_abort_during_replicated_writeback_converges(
     assert crashed.proc.wait(timeout=60) != 0, f"coordinator did not abort at {crash_point}"
 
     port = crashed.p2p_port
-    bootstrap = next(
-        process for process in processes if get_uri(process.http_port) == peer_urls[0]
-    )
+    bootstrap = next(process for process in processes if process is not crashed)
     bootstrap_uri = get_uri(bootstrap.p2p_port)
     processes.remove(crashed)
     crashed.kill()  # already dead; this releases its reserved ports for the restart
@@ -163,7 +170,11 @@ def test_coordinator_abort_during_replicated_writeback_converges(
     )
     peer_urls[coordinator] = restarted_url
     wait_for_peer_online(restarted_url, path="/cluster")
-    wait_for_uniform_cluster_status(peer_urls, leader)
+    if coordinator_role == "leader":
+        # A new leader was elected while the old one was down.
+        wait_for(lambda: _cluster_agrees_on_a_leader(peer_urls), wait_for_timeout=60)
+    else:
+        wait_for_uniform_cluster_status(peer_urls, leader)
     wait_collection_exists_and_active_on_all_peers(COLLECTION, peer_urls)
 
     if crash_point in BEFORE_CAS:
@@ -187,6 +198,16 @@ def test_coordinator_abort_during_replicated_writeback_converges(
             f"{peer_url} to serve the new epoch after {crash_point}",
             120,
         )
+
+
+def _cluster_agrees_on_a_leader(peer_urls: list[str]) -> bool:
+    try:
+        leaders = {
+            get_cluster_info(peer_url)["raft_info"]["leader"] for peer_url in peer_urls
+        }
+    except Exception:  # noqa: BLE001
+        return False
+    return len(leaders) == 1 and None not in leaders
 
 
 def _commit_succeeds(peer_url: str, fixture: dict) -> bool:

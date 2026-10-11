@@ -5786,7 +5786,10 @@ replicated write-back coordinator (`private_oram_crash_point` in
 prepares, after the consensus CAS, and after the replica finalizes. The peer
 is restarted without the crash point. Before the CAS, every peer must keep
 serving the old epoch and the same commit must succeed after the restart;
-after the CAS, every peer must serve the new epoch. All four cases pass.
+after the CAS, every peer must serve the new epoch. Each point runs twice:
+with a follower as coordinator, and with the Raft leader as coordinator, so
+a leader election happens while the write-back is in flight. All eight cases
+pass.
 Run it with `cargo build -p qdrant --features private-oram-crash-points` and
 `QDRANT_PRIVATE_ORAM_CRASH_TESTS=1 uv run pytest
 consensus_tests/test_private_oram_crash_matrix.py` from `tests/`. The
