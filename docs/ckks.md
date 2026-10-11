@@ -5739,11 +5739,12 @@ base64url, f32/f64/decimal vectors, client resource key). The test uploads
 the index, snapshots the collection, opens a session, commits a replicated
 write-back through a follower, stops the peers and scans every file under
 every peer directory (collection storage, Raft WAL and state, snapshots) and
-every peer log. The uploaded ciphertext must be visible (positive control);
-no sentinel may appear. It passes.
+every peer log, plus every peer's `/metrics` and detailed `/telemetry`
+output. The uploaded ciphertext must be visible (positive control); no
+sentinel may appear. It passes.
 
 Not yet covered: result ORAM payload plaintext (the fixtures use synthetic
-result ciphertext), metrics output, and V2 append mutations.
+result ciphertext) and V2 append mutations.
 
 ### Release gate work: read-only store fault injection
 

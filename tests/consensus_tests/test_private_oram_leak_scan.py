@@ -2,9 +2,10 @@
 
 A three-peer cluster stores a private HNSW index built from distinctive plaintext points,
 snapshots the collection, serves a session read and commits a replicated write-back through a
-follower. After the peers stop, every file under every peer directory (collection storage,
-Raft WAL and state, snapshots) and every peer log must be free of the fixture's plaintext
-node ids, point and fetch tokens, vectors and client resource key.
+follower. Every peer's metrics and telemetry output, and after the peers stop every file under
+every peer directory (collection storage, Raft WAL and state, snapshots) and every peer log,
+must be free of the fixture's plaintext node ids, point and fetch tokens, vectors and client
+resource key.
 """
 
 import pathlib
@@ -92,10 +93,17 @@ def test_private_oram_cluster_storage_and_logs_hold_no_plaintext(
             lambda url=peer_url: _serves_next_epoch(url, hnsw["commit"]["new_root_hash"]),
             wait_for_timeout=60,
         )
+    # Metrics and telemetry responses are scanned like files.
+    exported = []
+    for peer_url in peer_urls:
+        for path in ("/metrics", "/telemetry?details_level=10"):
+            response = requests.get(f"{peer_url}{path}", timeout=30)
+            assert_http_ok(response)
+            exported.append((pathlib.Path(f"{peer_url}{path}"), response.content))
     kill_all_processes()
 
     roots = [*peer_dirs, pathlib.Path(init_pytest_log_folder())]
-    files = [file for root in roots for file in _files_under(root)]
+    files = [file for root in roots for file in _files_under(root)] + exported
     assert any(path.suffix == ".snapshot" for path, _ in files), "no snapshot was written"
 
     # Positive control: the uploaded ciphertext must be visible to the scan.
