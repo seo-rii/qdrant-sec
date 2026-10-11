@@ -2649,6 +2649,12 @@ pub mod consensus_ops {
         ApplyPrivateOramMutation(ApplyPrivateOramMutation),
         ActivatePrivateOramMutationV2(PrivateOramMutationActivationBarrierV2),
         ApplyPrivateOramMutationMaterialV2(ApplyPrivateOramMutationMaterialV2),
+        /// Enrolls a collection into mutation V2 on a cluster where V2 is already active: the
+        /// genesis state is initialized and its authority activated in the same entry. A
+        /// separate variant (not a new meaning of `InitializePrivateOramMutationState`) so a
+        /// binary without enrollment support fails to decode the entry instead of applying it
+        /// differently.
+        EnrollPrivateOramMutationCollectionV2(InitializePrivateOramMutationState),
         CompareAndSwapPrivateOramLayout(CompareAndSwapPrivateOramLayout),
         RequestSnapshot,
         ReportSnapshot {
@@ -2841,6 +2847,11 @@ pub mod consensus_ops {
                     .finish(),
                 ConsensusOperations::InitializePrivateOramMutationState(operation) => f
                     .debug_struct("InitializePrivateOramMutationState")
+                    .field("state_sequence", &operation.state.state_sequence)
+                    .field("index_count", &operation.state.indexes.len())
+                    .finish(),
+                ConsensusOperations::EnrollPrivateOramMutationCollectionV2(operation) => f
+                    .debug_struct("EnrollPrivateOramMutationCollectionV2")
                     .field("state_sequence", &operation.state.state_sequence)
                     .field("index_count", &operation.state.indexes.len())
                     .finish(),

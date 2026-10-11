@@ -1,6 +1,7 @@
 # Private ORAM V2 Collection Enrollment (design draft)
 
-Status: draft for review, not implemented. Today no production path creates a
+Status: draft for review; step 1 (enrollment after activation in consensus)
+is implemented, the route and owner ceremony are not. Today no production path creates a
 collection's V2 consensus state, so `POST .../private-oram/v2/mutation/open`
 always fails on a real deployment (see docs/ckks.md, "multi-process V2
 activation"). This document proposes the missing enrollment path.
@@ -60,6 +61,21 @@ activation"). This document proposes the missing enrollment path.
    digest of the client's sealed append checkpoint set
    (`private_oram_append_client_checkpoint_v2_digest`); the client must escrow
    that checkpoint before enrolling.
+
+## Implementation status
+
+- Step 1 is implemented as a new consensus operation,
+  `ConsensusOperations::EnrollPrivateOramMutationCollectionV2` (carrying an
+  `InitializePrivateOramMutationState`), applied by `apply_enroll_v2` in
+  `persistent.rs`: it requires an activation-enabled format floor and no
+  pending activation, initializes the genesis state like Initialize, tags the
+  raw slot as a legacy authority and activates it with the entry's locator, the
+  floor's format epoch and an enrollment request digest. Re-proposing the same
+  genesis state is a no-op; a different one is refused. A binary without the
+  variant fails to decode the entry and stops instead of diverging. Test:
+  `enrollment_after_activation_initializes_and_activates_the_collection_authority`.
+- Not implemented yet: the dispatcher submit method, the `enroll` route, the
+  owner enrollment ceremony and the client procedure.
 
 ## Risks and open questions
 

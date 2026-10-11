@@ -3118,6 +3118,34 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     .initialize_private_oram_mutation_state(&operation)
                     .map(|()| true),
             },
+            ConsensusOperations::EnrollPrivateOramMutationCollectionV2(operation) => {
+                match context {
+                    NormalEntryApplyContext::CommittedAtCurrentCursor => match self
+                        .persistent
+                        .write()
+                        .enroll_private_oram_mutation_collection_v2_at_applied_entry(
+                            &operation,
+                            entry.term,
+                            entry.index,
+                        ) {
+                        Ok(PrivateOramMutationAtEntryOutcome::Applied) => {
+                            cursor_disposition =
+                                NormalEntryCursorDisposition::Committed(entry.index);
+                            Ok(true)
+                        }
+                        Ok(PrivateOramMutationAtEntryOutcome::Rejected(error)) => {
+                            cursor_disposition =
+                                NormalEntryCursorDisposition::Committed(entry.index);
+                            Err(error)
+                        }
+                        Err(error) => Err(error),
+                    },
+                    #[cfg(test)]
+                    NormalEntryApplyContext::DetachedForTest => Err(StorageError::service_error(
+                        "private ORAM mutation V2 enrollment requires a committed Raft entry",
+                    )),
+                }
+            }
             ConsensusOperations::CompareAndSwapPrivateOramMutationLease(operation) => match context
             {
                 NormalEntryApplyContext::CommittedAtCurrentCursor => match self

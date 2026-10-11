@@ -349,6 +349,11 @@ struct PrivateOramMutationCompletePatch {
 
 enum PrivateOramMutationCommand<'a> {
     Initialize(&'a InitializePrivateOramMutationState),
+    EnrollV2 {
+        operation: &'a InitializePrivateOramMutationState,
+        entry_term: u64,
+        entry_index: u64,
+    },
     CompareAndSwapLease(&'a CompareAndSwapPrivateOramMutationLease),
     ConfirmAuthority(&'a ConfirmPrivateOramMutationAuthorityV2),
     Apply(&'a ApplyPrivateOramMutation),
@@ -513,6 +518,104 @@ impl<'a> PrivateOramMutationPatchView<'a> {
             .insert(key_digest.clone(), operation.state.clone());
         self.private_oram_mutation_lease_slots
             .insert(key_digest, genesis_slot.into());
+        Ok(())
+    }
+
+    /// Enrolls a collection after the cluster activated mutation V2: initializes the genesis
+    /// state exactly as `apply_initialize` does, then tags and activates its authority in the
+    /// same entry, as the activation barrier did for collections initialized before it. Every
+    /// refusal is deterministic (`bad_request`), so the entry is rejected on every replica.
+    fn apply_enroll_v2(
+        &mut self,
+        operation: &InitializePrivateOramMutationState,
+        format_floor: Option<&PrivateOramMutationFormatFloorV2>,
+        activation_pending: bool,
+        entry_term: u64,
+        entry_index: u64,
+    ) -> Result<(), StorageError> {
+        let refused =
+            || StorageError::bad_request("private ORAM mutation V2 enrollment is invalid");
+        let Some(format_floor) = format_floor.filter(|floor| floor.activation_enabled()) else {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation V2 enrollment requires an active mutation V2 cluster",
+            ));
+        };
+        if activation_pending {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation V2 enrollment conflicts with a pending activation",
+            ));
+        }
+        let key_digest = private_oram_mutation_key_digest(&operation.key);
+        if self.private_oram_mutation_states.get(&key_digest) == Some(&operation.state)
+            && self
+                .private_oram_mutation_lease_slots
+                .get(&key_digest)
+                .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+                .is_some_and(|authority| authority.aggregate().is_some())
+        {
+            // A re-proposed enrollment of the same genesis state is already applied.
+            return Ok(());
+        }
+        if self.private_oram_mutation_states.contains_key(&key_digest)
+            || self
+                .private_oram_mutation_lease_slots
+                .contains_key(&key_digest)
+        {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation state initialization precondition failed",
+            ));
+        }
+        self.apply_initialize(operation)?;
+
+        let state = &operation.state;
+        let raw_slot = self
+            .private_oram_mutation_lease_slots
+            .get(&key_digest)
+            .cloned()
+            .ok_or_else(refused)?;
+        let state_record_digest =
+            canonical_private_oram_consensus_state_record_digest(state).map_err(|_| refused())?;
+        let authority_key = private_oram_mutation_authority_key_v2(
+            &state.collection_id,
+            format_floor.consensus_history_id_digest().to_string(),
+            format_floor.raft_group_id_digest().to_string(),
+            private_oram_mutation_collection_lifetime_id_digest_v2(&state.collection_id)
+                .map_err(|_| refused())?,
+        )
+        .map_err(|_| refused())?;
+        let outer_binding_digest = private_oram_mutation_outer_binding_digest_v2(
+            &state.collection_id,
+            &state_record_digest,
+            raw_slot.lease_slot(),
+        )
+        .map_err(|_| refused())?;
+        let legacy = canonical_private_oram_mutation_legacy_authority_from_wire_v2(
+            &raw_slot,
+            &authority_key,
+            &outer_binding_digest,
+        )
+        .map_err(|_| refused())?;
+        let context = private_oram_mutation_activation_context_from_barrier_v2(
+            format_floor.consensus_history_id_digest().to_string(),
+            format_floor.raft_group_id_digest().to_string(),
+            entry_term,
+            entry_index,
+            format_floor.format_epoch(),
+            &private_oram_mutation_enrollment_request_digest_v2(
+                &state_record_digest,
+                entry_term,
+                entry_index,
+            ),
+            &state.collection_id,
+        )
+        .map_err(|_| refused())?;
+        let activated =
+            activate_private_oram_mutation_authority_v2(&legacy, &state.collection_id, context)
+                .map_err(|_| refused())?;
+        self.private_oram_mutation_lease_slots.insert(
+            key_digest,
+            DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(activated),
+        );
         Ok(())
     }
 
@@ -2324,6 +2427,21 @@ impl Persistent {
             PrivateOramMutationCommand::Initialize(operation) => {
                 PrivateOramMutationPatchView::new(&mut next).apply_initialize(operation)
             }
+            PrivateOramMutationCommand::EnrollV2 {
+                operation,
+                entry_term,
+                entry_index,
+            } => {
+                let format_floor = next.private_oram_mutation_format_floor.clone();
+                let activation_pending = next.private_oram_mutation_activation_pending.is_some();
+                PrivateOramMutationPatchView::new(&mut next).apply_enroll_v2(
+                    operation,
+                    format_floor.as_ref(),
+                    activation_pending,
+                    entry_term,
+                    entry_index,
+                )
+            }
             PrivateOramMutationCommand::CompareAndSwapLease(operation) => {
                 PrivateOramMutationPatchView::new(&mut next).apply_compare_and_swap_lease(operation)
             }
@@ -3775,6 +3893,26 @@ impl Persistent {
         .map(|_| ())
     }
 
+    pub(crate) fn enroll_private_oram_mutation_collection_v2_at_applied_entry(
+        &mut self,
+        operation: &InitializePrivateOramMutationState,
+        entry_term: u64,
+        entry_index: EntryId,
+    ) -> Result<PrivateOramMutationAtEntryOutcome, StorageError> {
+        let patch = self.prepare_private_oram_mutation_complete_patch(
+            Some(entry_index),
+            PrivateOramMutationCommand::EnrollV2 {
+                operation,
+                entry_term,
+                entry_index,
+            },
+        )?;
+        self.commit_private_oram_mutation_complete_patch_with_backend(
+            patch,
+            &FilesystemPersistentSaveBackend,
+        )
+    }
+
     pub(crate) fn initialize_private_oram_mutation_state_at_applied_entry(
         &mut self,
         operation: &InitializePrivateOramMutationState,
@@ -5167,6 +5305,24 @@ fn private_oram_floor_persistent_save_error(
             "private ORAM mutation floor save failed",
         ))
     }
+}
+
+const PRIVATE_ORAM_MUTATION_ENROLLMENT_REQUEST_DOMAIN_V2: &[u8] =
+    b"qdrant-sec/private-oram-mutation-enrollment-request/v2";
+
+/// Stands in for the barrier's aggregate activation proof digest when a collection is
+/// activated by its own enrollment entry: binds the genesis state record and the entry.
+fn private_oram_mutation_enrollment_request_digest_v2(
+    state_record_digest: &str,
+    entry_term: u64,
+    entry_index: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PRIVATE_ORAM_MUTATION_ENROLLMENT_REQUEST_DOMAIN_V2);
+    update_length_prefixed(&mut hasher, state_record_digest.as_bytes());
+    hasher.update(entry_term.to_be_bytes());
+    hasher.update(entry_index.to_be_bytes());
+    BASE64URL_NOPAD.encode(&hasher.finalize())
 }
 
 pub(crate) fn private_oram_epoch_key_digest(key: &PrivateOramEpochKey) -> String {
@@ -8228,6 +8384,101 @@ mod tests {
         );
         drop(persistent);
         Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+    }
+
+    #[test]
+    fn enrollment_after_activation_initializes_and_activates_the_collection_authority() {
+        let fixture = private_oram_mutation_fixture();
+        let key_digest = private_oram_mutation_key_digest(&fixture.key);
+        let operation = InitializePrivateOramMutationState {
+            key: fixture.key.clone(),
+            state: fixture.old_state.clone(),
+        };
+        let open_at = |path: &Path, active: bool| {
+            let mut persistent = Persistent::load_or_init(path, true, false, Some(7)).unwrap();
+            install_private_oram_mutation_outer_fixture(&mut persistent, &fixture);
+            if active {
+                // The barrier's Prepare (legacy floor) is durable before its Enable.
+                persistent.private_oram_mutation_format_floor =
+                    Some(mutation_format_floor(1, false, 10));
+                persistent.state.hard_state.commit = 10;
+                persistent.latest_snapshot_meta.index = 10;
+                persistent.apply_progress_queue.set_from_snapshot(10);
+                persistent.save().unwrap();
+                persistent.private_oram_mutation_format_floor =
+                    Some(mutation_format_floor(2, true, 11));
+            }
+            persistent.state.hard_state.commit = 11;
+            persistent.latest_snapshot_meta.index = 11;
+            persistent.apply_progress_queue.set_from_snapshot(11);
+            persistent.save().unwrap();
+            // Entries 12..=15 are committed and waiting to be applied.
+            persistent.state.hard_state.commit = 15;
+            persistent.apply_progress_queue = EntryApplyProgressQueue::new(12, 15);
+            persistent
+        };
+
+        // Without an active mutation V2 cluster, enrollment is a deterministic refusal.
+        let inactive_dir = tempfile::tempdir().unwrap();
+        let mut inactive = open_at(inactive_dir.path(), false);
+        assert!(matches!(
+            inactive
+                .enroll_private_oram_mutation_collection_v2_at_applied_entry(&operation, 2, 12)
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Rejected(StorageError::BadRequest { .. })
+        ));
+        assert!(
+            !inactive
+                .private_oram_mutation_states
+                .contains_key(&key_digest)
+        );
+
+        // On an active cluster the genesis state is initialized and its authority activated.
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistent = open_at(temp.path(), true);
+        assert!(matches!(
+            persistent
+                .enroll_private_oram_mutation_collection_v2_at_applied_entry(&operation, 2, 12)
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        assert_eq!(
+            persistent.private_oram_mutation_states.get(&key_digest),
+            Some(&fixture.old_state)
+        );
+        let authority = persistent
+            .private_oram_mutation_lease_slots
+            .get(&key_digest)
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .expect("enrollment must leave a tagged authority");
+        assert!(authority.aggregate().is_some());
+
+        // Re-proposing the same enrollment is a no-op; a different genesis state is refused.
+        assert!(matches!(
+            persistent
+                .enroll_private_oram_mutation_collection_v2_at_applied_entry(&operation, 2, 13)
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let mut other = operation.clone();
+        other.state.client_state_digest = test_digest(77);
+        assert!(matches!(
+            persistent
+                .enroll_private_oram_mutation_collection_v2_at_applied_entry(&other, 2, 14)
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Rejected(StorageError::BadRequest { .. })
+        ));
+
+        // The enrolled authority survives a reload (snapshot and floor validation).
+        drop(persistent);
+        let reloaded = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        assert!(
+            reloaded
+                .private_oram_mutation_lease_slots
+                .get(&key_digest)
+                .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+                .is_some_and(|authority| authority.aggregate().is_some())
+        );
     }
 
     #[test]
