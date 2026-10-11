@@ -7850,6 +7850,98 @@ mod tests {
         );
     }
 
+    /// Fault injection (PLAN V2-D5): write failures in the middle of a commit, as on a full
+    /// disk, must fail closed and leave the store committable on retry. The file size limit is
+    /// process-wide, so the test re-executes itself alone in a child process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_commit_fails_closed_when_writes_fail_and_retries_cleanly() {
+        const CHILD_ENV: &str = "QDRANT_SEC_PRIVATE_HNSW_STORE_WRITE_FAULT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("private_hnsw_oram_store::tests::writeback_commit_fails_closed_when_writes_fail_and_retries_cleanly")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "write fault child failed: {status}");
+            return;
+        }
+
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+        let original_bucket = store
+            .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+            .unwrap();
+        let verification = PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        let set_file_size_limit = |limit: nix::libc::rlim_t| {
+            let mut current = nix::libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: plain libc calls on valid pointers; this child runs one test thread.
+            unsafe {
+                assert_eq!(
+                    nix::libc::getrlimit(nix::libc::RLIMIT_FSIZE, &mut current),
+                    0
+                );
+                let next = nix::libc::rlimit {
+                    rlim_cur: limit.min(current.rlim_max),
+                    rlim_max: current.rlim_max,
+                };
+                assert_eq!(nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &next), 0);
+            }
+        };
+        // SAFETY: ignoring SIGXFSZ turns an oversized write into an EFBIG error.
+        unsafe {
+            nix::libc::signal(nix::libc::SIGXFSZ, nix::libc::SIG_IGN);
+        }
+
+        set_file_size_limit(64);
+        let refused = store.commit_writeback_with_signature(
+            &old,
+            &new,
+            bundle.bucket_count(),
+            std::slice::from_ref(&updated_bucket),
+            4096,
+            &signature,
+            verification,
+        );
+        set_file_size_limit(nix::libc::RLIM_INFINITY);
+
+        assert!(refused.is_err(), "commit must fail when writes fail");
+        assert_eq!(store.read_current_epoch().unwrap(), old);
+        assert_eq!(
+            store
+                .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+                .unwrap(),
+            original_bucket,
+        );
+        assert!(!store.pending_writeback_exists().unwrap());
+
+        let committed = store
+            .commit_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification,
+            )
+            .unwrap();
+        assert_eq!(committed, new);
+        assert_eq!(store.read_current_epoch().unwrap(), new);
+    }
+
     #[test]
     fn writeback_commit_with_signature_verifies_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();

@@ -5745,6 +5745,11 @@ logs and metrics output, and V2 append mutations.
 attempts a signed write-back commit. The commit must fail, leave the old
 epoch and buckets readable and unchanged, and leave no pending write-back.
 After permissions are restored, the same commit must succeed. The tests skip
-when run as root, because root ignores directory permissions. Disk-full
-(`ENOSPC`) and fsync failures are not injected yet. Raft state saves already
+when run as root, because root ignores directory permissions.
+`writeback_commit_fails_closed_when_writes_fail_and_retries_cleanly` (HNSW
+store, Linux) re-runs itself alone in a child process, ignores `SIGXFSZ` and
+lowers `RLIMIT_FSIZE` to 64 bytes, so every commit write fails with `EFBIG`
+the way writes fail on a full disk; the commit must fail closed and succeed
+after the limit is lifted. Real `ENOSPC` and fsync failures are not injected
+yet. Raft state saves already
 have fsync and publish fault backends (`persistent.rs`).
