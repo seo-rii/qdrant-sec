@@ -5731,10 +5731,19 @@ to be visible both in the store and in the snapshot archive, so an absent
 sentinel cannot come from scanning the wrong files. The test runs in the CI
 private ORAM step.
 
-Not yet covered by this scan: the Raft WAL and state of a distributed
-cluster (consensus records carry only digests, but no test scans them),
-result ORAM payload plaintext (the route fixture uses synthetic ciphertext),
-logs and metrics output, and V2 append mutations.
+`tests/consensus_tests/test_private_oram_leak_scan.py` extends the scan to a
+three-peer cluster: with `QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN=1` the
+`private_oram_cluster_fixture` example builds the index from distinctive
+points and emits their sentinels (node ids, point and fetch tokens raw and
+base64url, f32/f64/decimal vectors, client resource key). The test uploads
+the index, snapshots the collection, opens a session, commits a replicated
+write-back through a follower, stops the peers and scans every file under
+every peer directory (collection storage, Raft WAL and state, snapshots) and
+every peer log. The uploaded ciphertext must be visible (positive control);
+no sentinel may appear. It passes.
+
+Not yet covered: result ORAM payload plaintext (the fixtures use synthetic
+result ciphertext), metrics output, and V2 append mutations.
 
 ### Release gate work: read-only store fault injection
 

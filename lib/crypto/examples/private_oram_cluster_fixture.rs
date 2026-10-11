@@ -99,19 +99,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn hnsw_fixture(
-    collection_id: &str,
-    signing_key: &Ed25519KeyPair,
-    profile: FixtureProfile,
-    result_privacy: ResultPrivacyMode,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let config = PrivateHnswOramClientConfig {
-        tree_height: profile.tree_height,
-        bucket_size: 2,
-        block_size_bytes: profile.hnsw_block_size_bytes,
-        fixed_neighbor_slots: 4,
-    };
-    let points = vec![
+/// `QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN=1` swaps in points whose ids, tokens and vectors are
+/// distinctive byte strings, so a cluster leakage scan can search storage and logs for them.
+fn fixture_points() -> Vec<PrivateHnswBuildPoint> {
+    if env::var("QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN").as_deref() == Ok("1") {
+        return (1_u8..=3)
+            .map(|index| PrivateHnswBuildPoint {
+                node_id: leak_scan_bytes(b"leak-scan-node-id", index),
+                point_token: leak_scan_bytes(b"leak-scan-point-token", index),
+                vector: vec![1234.5678 * f32::from(index), -8765.4321 + f32::from(index)],
+                payload_fetch_token: Some(leak_scan_bytes(b"leak-scan-fetch-token", index)),
+            })
+            .collect();
+    }
+    vec![
         PrivateHnswBuildPoint {
             node_id: [1; 32],
             point_token: [11; 32],
@@ -130,7 +131,73 @@ fn hnsw_fixture(
             vector: vec![0.0, 1.0],
             payload_fetch_token: Some([103; 32]),
         },
-    ];
+    ]
+}
+
+fn leak_scan_bytes(label: &[u8], index: u8) -> [u8; 32] {
+    let mut bytes = [b'#'; 32];
+    bytes[..label.len()].copy_from_slice(label);
+    bytes[31] = b'0' + index;
+    bytes
+}
+
+/// Hex-encoded byte strings that must never appear in server storage, snapshots or logs:
+/// node ids, point and fetch tokens (raw and base64url), vectors (f32, f64, decimal text) and
+/// the client resource key.
+fn plaintext_sentinels(points: &[PrivateHnswBuildPoint]) -> Vec<String> {
+    let mut sentinels = vec![[13_u8; 32].to_vec()];
+    for point in points {
+        for token in [
+            Some(point.node_id),
+            Some(point.point_token),
+            point.payload_fetch_token,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sentinels.push(token.to_vec());
+            sentinels.push(BASE64URL_NOPAD.encode(&token).into_bytes());
+        }
+        sentinels.push(
+            point
+                .vector
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        );
+        sentinels.push(
+            point
+                .vector
+                .iter()
+                .flat_map(|value| f64::from(*value).to_le_bytes())
+                .collect(),
+        );
+        for value in &point.vector {
+            let text = format!("{value}");
+            if text.len() >= 8 {
+                sentinels.push(text.into_bytes());
+            }
+        }
+    }
+    sentinels
+        .into_iter()
+        .map(|bytes| data_encoding::HEXLOWER.encode(&bytes))
+        .collect()
+}
+
+fn hnsw_fixture(
+    collection_id: &str,
+    signing_key: &Ed25519KeyPair,
+    profile: FixtureProfile,
+    result_privacy: ResultPrivacyMode,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let config = PrivateHnswOramClientConfig {
+        tree_height: profile.tree_height,
+        bucket_size: 2,
+        block_size_bytes: profile.hnsw_block_size_bytes,
+        fixed_neighbor_slots: 4,
+    };
+    let points = fixture_points();
     let plaintext = build_private_hnsw_oram_plaintext_index_from_auto_layered_f32_points(
         config,
         DistanceKind::Euclid,
@@ -245,6 +312,7 @@ fn hnsw_fixture(
     )?;
 
     Ok(json!({
+        "plaintext_sentinels": plaintext_sentinels(&points),
         "manifest": manifest,
         "manifest_signature": manifest_signature,
         "buckets": encrypted.buckets,
