@@ -7764,6 +7764,92 @@ mod tests {
         assert_writeback_target_unchanged();
     }
 
+    #[cfg(unix)]
+    fn set_directory_mode(directory: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Fault injection (PLAN V2-D5): a commit on a store whose directories are not writable
+    /// must fail closed (old epoch and buckets intact, no pending write-back) and succeed on
+    /// retry once permissions are restored.
+    #[cfg(unix)]
+    #[test]
+    fn writeback_commit_fails_closed_on_read_only_store_and_retries_cleanly() {
+        if nix::unistd::Uid::effective().is_root() {
+            // Root ignores directory permissions, so the fault cannot be injected.
+            return;
+        }
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+        let original_bucket = store
+            .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+            .unwrap();
+        let verification = PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        // Every store directory becomes read-only; 0o500 keeps traversal and reads working.
+        let mut directories = Vec::new();
+        let mut pending = vec![store.root_path().to_path_buf()];
+        while let Some(path) = pending.pop() {
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                for entry in fs_err::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+                directories.push(path);
+            }
+        }
+        for directory in &directories {
+            set_directory_mode(directory, 0o500);
+        }
+        let refused = store.commit_writeback_with_signature(
+            &old,
+            &new,
+            bundle.bucket_count(),
+            std::slice::from_ref(&updated_bucket),
+            4096,
+            &signature,
+            verification,
+        );
+        let epoch_after_refusal = store.read_current_epoch();
+        let bucket_after_refusal =
+            store.read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096);
+        for directory in directories.iter().rev() {
+            set_directory_mode(directory, 0o700);
+        }
+
+        assert!(refused.is_err(), "commit on a read-only store must fail");
+        assert_eq!(epoch_after_refusal.unwrap(), old);
+        assert_eq!(bucket_after_refusal.unwrap(), original_bucket);
+        assert!(!store.pending_writeback_exists().unwrap());
+
+        let committed = store
+            .commit_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification,
+            )
+            .unwrap();
+        assert_eq!(committed, new);
+        assert_eq!(store.read_current_epoch().unwrap(), new);
+        assert_eq!(
+            store
+                .read_bucket(0, new.index_epoch, bundle.bucket_count(), 4096)
+                .unwrap(),
+            updated_bucket,
+        );
+    }
+
     #[test]
     fn writeback_commit_with_signature_verifies_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();

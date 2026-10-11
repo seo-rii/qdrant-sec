@@ -5735,3 +5735,16 @@ Not yet covered by this scan: the Raft WAL and state of a distributed
 cluster (consensus records carry only digests, but no test scans them),
 result ORAM payload plaintext (the route fixture uses synthetic ciphertext),
 logs and metrics output, and V2 append mutations.
+
+### Release gate work: read-only store fault injection
+
+`writeback_commit_fails_closed_on_read_only_store_and_retries_cleanly`
+(in both `lib/collection/src/private_hnsw_oram_store.rs` and
+`private_result_oram_store.rs`) makes every store directory read-only
+(mode 0o500, which keeps the store's owner-only permission policy) and then
+attempts a signed write-back commit. The commit must fail, leave the old
+epoch and buckets readable and unchanged, and leave no pending write-back.
+After permissions are restored, the same commit must succeed. The tests skip
+when run as root, because root ignores directory permissions. Disk-full
+(`ENOSPC`) and fsync failures are not injected yet. Raft state saves already
+have fsync and publish fault backends (`persistent.rs`).

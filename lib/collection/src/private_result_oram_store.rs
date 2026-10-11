@@ -7003,6 +7003,118 @@ mod tests {
         assert!(err.to_string().contains("must update at least one bucket"));
     }
 
+    /// Fault injection (PLAN V2-D5): a commit on a store whose directories are not writable
+    /// must fail closed (old epoch and buckets intact, no pending write-back) and succeed on
+    /// retry once permissions are restored.
+    #[test]
+    fn writeback_commit_fails_closed_on_read_only_store_and_retries_cleanly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix::unistd::Uid::effective().is_root() {
+            // Root ignores directory permissions, so the fault cannot be injected.
+            return;
+        }
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let bundle = fixture_upload_bundle();
+        let updated_bucket = fixture_bucket(1, 43, b"updated read-only result bucket");
+        let mut next_commitments = bundle.bucket_commitments();
+        next_commitments[1] = updated_bucket.bucket_commitment.clone();
+        let new = PrivateResultOramEpochState {
+            index_epoch: 43,
+            root_hash: PrivateResultOramStore::merkle_root_for_commitments(&next_commitments)
+                .unwrap(),
+        };
+        let plan = PrivateResultOramCommitPlan {
+            old_epoch: bundle.manifest.index_epoch,
+            new_epoch: new.index_epoch,
+            old_root_hash: bundle.manifest.root_hash.clone(),
+            new_root_hash: new.root_hash.clone(),
+            leaf_commitments: next_commitments,
+            updated_buckets: vec![PrivateResultOramClientCommitBucketRef {
+                bucket_id: updated_bucket.bucket_id,
+                ciphertext_sha256: updated_bucket.ciphertext_sha256.clone(),
+            }],
+        };
+        let signature = sign_private_result_oram_commit(
+            &key_pair,
+            PrivateResultOramCommitSignatureContext {
+                collection_id: "collection-uuid-1",
+                key_id: "tenant-a/result-private-rk",
+                rk_id: "tenant-a/result-private-rk",
+                rk_epoch: 7,
+                signing_key_id: "tenant-a/private-result-signing-v1",
+            },
+            &plan,
+        )
+        .unwrap();
+        let verification = || PrivateResultOramSignatureVerification {
+            expected_key_id: "tenant-a/private-result-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old = store.write_initial_upload_bundle(&bundle, 128).unwrap();
+        let original_bucket = store
+            .read_bucket(1, old.index_epoch, bundle.bucket_count(), 128)
+            .unwrap();
+
+        // Every store directory becomes read-only; 0o500 keeps traversal and reads working.
+        let mut directories = Vec::new();
+        let mut pending = vec![store.root_path().to_path_buf()];
+        while let Some(path) = pending.pop() {
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                for entry in fs_err::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+                directories.push(path);
+            }
+        }
+        for directory in &directories {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let refused = store.commit_writeback_with_signature(
+            &old,
+            &new,
+            bundle.bucket_count(),
+            std::slice::from_ref(&updated_bucket),
+            128,
+            &signature,
+            verification(),
+        );
+        let epoch_after_refusal = store.read_current_epoch();
+        let bucket_after_refusal =
+            store.read_bucket(1, old.index_epoch, bundle.bucket_count(), 128);
+        for directory in directories.iter().rev() {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert!(refused.is_err(), "commit on a read-only store must fail");
+        assert_eq!(epoch_after_refusal.unwrap(), old);
+        assert_eq!(bucket_after_refusal.unwrap(), original_bucket);
+        assert!(!store.pending_writeback_exists().unwrap());
+
+        let committed = store
+            .commit_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                128,
+                &signature,
+                verification(),
+            )
+            .unwrap();
+        assert_eq!(committed, new);
+        assert_eq!(store.read_current_epoch().unwrap(), new);
+        assert_eq!(
+            store
+                .read_bucket(1, new.index_epoch, bundle.bucket_count(), 128)
+                .unwrap(),
+            updated_bucket,
+        );
+    }
+
     #[test]
     fn writeback_commit_with_signature_verifies_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
