@@ -5815,3 +5815,25 @@ stays active in consensus, so every peer refuses new private HNSW sessions
 until it expires (300 s; commits renew it for another 300 s). A peer cannot
 tell its own orphaned lease from one held by a live session without a process
 incarnation in the lease record, which would change the consensus format.
+
+### Release gate work: multi-process V2 activation, and the missing V2 enrollment path
+
+`tests/consensus_tests/test_private_oram_v2_activation.py` (Linux) gives
+three peers fixed ids and ports, bootstraps their signing identities with
+`qdrant --bootstrap-private-oram-peer-identity`, pins them in an activation
+authority bundle signed with a test authority key
+(`lib/crypto/examples/private_oram_v2_activation_fixture.rs`, which reads the
+peer pins on stdin and prints the canonical bundle and trust anchor values),
+writes the activation settings into each peer's `config/local.yaml`, starts
+the cluster and calls `POST /cluster/private-oram/mutation-v2/activate` on the
+Raft leader. Every peer must then report mutation V2 as active. It passes.
+
+Finding: a V2 mutation session cannot be opened on a real deployment yet.
+`open` requires the collection's V2 consensus mutation state, lease slot and
+owner enrollment, and the only code that constructs
+`InitializePrivateOramMutationState` or the owner enrollment material is test
+code; no route, ceremony or proposal path creates them. The append protocol
+is therefore covered only by in-process unit and integration tests, and a
+multi-process append test needs a designed V2 collection enrollment path
+first (client-signed genesis state, owner enrollment prepare and activate,
+and a route or operator procedure to propose them).

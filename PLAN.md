@@ -1518,6 +1518,11 @@ Signed fields:
   write-back coordinator를 4개 경계(local prepare/replica prepare/CAS/replica finalize)에서
   `SIGKILL`하는 3-peer process E2E가 통과한다. 죽은 coordinator의 session lease가 최대 300초 동안
   새 session을 막는 점은 known limitation으로 기록했다.
+- 2026-10-11: 3-peer process E2E로 V2 activation(identity bootstrap, signed authority bundle,
+  leader activate, 전 peer Active)이 통과한다(`test_private_oram_v2_activation.py`). 반면 V2
+  collection enrollment(`InitializePrivateOramMutationState`, owner enrollment prepare/activate)를
+  제안하는 production 경로가 없어 실제 binary에서 mutation open/append는 불가능하다. Multi-process
+  append E2E 전에 enrollment 경로 설계가 필요하다.
 
 완료 조건:
 

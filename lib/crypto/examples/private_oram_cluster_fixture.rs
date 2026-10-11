@@ -107,7 +107,7 @@ fn fixture_points() -> Vec<PrivateHnswBuildPoint> {
             .map(|index| PrivateHnswBuildPoint {
                 node_id: leak_scan_bytes(b"leak-scan-node-id", index),
                 point_token: leak_scan_bytes(b"leak-scan-point-token", index),
-                vector: vec![1234.5678 * f32::from(index), -8765.4321 + f32::from(index)],
+                vector: vec![1234.5678 * f32::from(index), -8_765.432 + f32::from(index)],
                 payload_fetch_token: Some(leak_scan_bytes(b"leak-scan-fetch-token", index)),
             })
             .collect();
