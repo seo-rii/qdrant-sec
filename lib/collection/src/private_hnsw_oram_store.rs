@@ -4900,9 +4900,11 @@ fn write_json_atomic_with_limit<T: Serialize>(
         file.flush().map_err(|_| {
             CollectionError::service_error("failed to flush private HNSW ORAM temp file")
         })?;
-        file.sync_all().map_err(|_| {
-            CollectionError::service_error("failed to sync private HNSW ORAM temp file")
-        })?;
+        sync_fault_injected()
+            .and_then(|()| file.sync_all())
+            .map_err(|_| {
+                CollectionError::service_error("failed to sync private HNSW ORAM temp file")
+            })?;
         drop(file);
         sync_dir(temp_dir)?;
         fs::rename(&temp_path, target)
@@ -5124,8 +5126,29 @@ fn sync_dir(path: &Path) -> CollectionResult<()> {
     let file = File::open(path).map_err(|_| {
         CollectionError::service_error("failed to open private HNSW ORAM directory for sync")
     })?;
-    file.sync_all()
+    sync_fault_injected()
+        .and_then(|()| file.sync_all())
         .map_err(|_| CollectionError::service_error("failed to sync private HNSW ORAM directory"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fsync fault: (syncs seen so far, 1-based index of the sync that fails).
+    static SYNC_FAULT: std::cell::Cell<(u32, Option<u32>)> = const { std::cell::Cell::new((0, None)) };
+}
+
+/// Fails the configured sync of this thread (test builds only); a no-op otherwise.
+fn sync_fault_injected() -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let (seen, fail_at) = SYNC_FAULT.get();
+        let seen = seen + 1;
+        SYNC_FAULT.set((seen, fail_at));
+        if fail_at == Some(seen) {
+            return Err(std::io::Error::other("injected fsync failure"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8076,6 +8099,93 @@ mod tests {
             .unwrap();
         assert_eq!(committed, new);
         assert_eq!(store.read_current_epoch().unwrap(), new);
+    }
+
+    /// Fault injection (PLAN V2-D5): every fsync of a signed commit (temp files and
+    /// directories) fails in turn. After each failure the store must hold the old epoch with no
+    /// pending write-back (and a retry commits), keep a pending write-back that recovery
+    /// finishes, or already hold the new epoch; it must never be left stuck.
+    #[test]
+    fn signed_commit_survives_an_fsync_failure_at_every_sync() {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let verification = PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+        let mut covered = 0;
+        for fail_at in 1_u32.. {
+            let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+            let temp = TempDir::new().unwrap();
+            let store = fixture_store(&temp);
+            let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+
+            SYNC_FAULT.set((0, Some(fail_at)));
+            let result = store.commit_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification,
+            );
+            let (syncs, _) = SYNC_FAULT.get();
+            SYNC_FAULT.set((0, None));
+            if syncs < fail_at {
+                // The commit performed fewer syncs than `fail_at`: every sync was covered.
+                assert_eq!(result.unwrap(), new);
+                break;
+            }
+            assert!(
+                result.is_err(),
+                "sync {fail_at} failed but the commit reported success"
+            );
+            covered += 1;
+
+            let current = store.read_current_epoch().unwrap();
+            if store.pending_writeback_exists().unwrap() {
+                let recovered = store
+                    .recover_pending_writeback_with_signature(4096, verification)
+                    .unwrap_or_else(|error| {
+                        panic!("recovery after a failed sync {fail_at} failed: {error}")
+                    });
+                assert_eq!(
+                    recovered,
+                    Some(new.clone()),
+                    "recovery after sync {fail_at}"
+                );
+            } else if current == old {
+                let committed = store
+                    .commit_writeback_with_signature(
+                        &old,
+                        &new,
+                        bundle.bucket_count(),
+                        std::slice::from_ref(&updated_bucket),
+                        4096,
+                        &signature,
+                        verification,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("retry after a failed sync {fail_at} failed: {error}")
+                    });
+                assert_eq!(committed, new);
+            } else {
+                assert_eq!(
+                    current, new,
+                    "unexpected epoch after a failed sync {fail_at}"
+                );
+            }
+            assert_eq!(store.read_current_epoch().unwrap(), new);
+            assert_eq!(
+                store
+                    .read_bucket(0, new.index_epoch, bundle.bucket_count(), 4096)
+                    .unwrap(),
+                updated_bucket,
+                "bucket after a failed sync {fail_at}",
+            );
+            assert!(!store.pending_writeback_exists().unwrap());
+        }
+        assert!(covered > 5, "only {covered} syncs were exercised");
     }
 
     /// Process kill matrix (PLAN V2-D5): a child process aborts (like `SIGKILL`, no unwinding)

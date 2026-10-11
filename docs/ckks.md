@@ -5765,7 +5765,14 @@ real `ENOSPC`: the child runs under `unshare -Urm` on a 512 KiB tmpfs, fills
 it after the upload, expects the commit to fail closed (old epoch and bucket
 intact, no pending write-back), frees the space and expects the retry to
 succeed. It skips where unprivileged user namespaces are unavailable (some
-CI kernels restrict them). fsync failures are still not injected. Raft state saves already
+CI kernels restrict them).
+`signed_commit_survives_an_fsync_failure_at_every_sync` makes each fsync of
+a signed commit (temp files and directories, through a test-only fault in the
+store's two sync helpers) fail in turn. After every failure the store holds
+the old epoch with no pending write-back and a retry commits, or keeps the
+pending write-back and recovery finishes it, or already holds the new epoch.
+This checks logical recovery only: after a real fsync error the kernel may
+already have dropped the dirty pages, which no user-space test can model. Raft state saves already
 have fsync and publish fault backends (`persistent.rs`).
 
 ### Release gate work: store-level process kill matrix
