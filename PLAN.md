@@ -1507,8 +1507,9 @@ Signed fields:
   matrix, 두 supervisor/leader-change concurrency E2E, disk-full/permission/fsync injection과
   end-to-end snapshot/WAL binary sentinel scan이다.
 - 2026-10-11: private HNSW upload + collection snapshot의 storage/snapshot/temp binary sentinel
-  scan(`private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels`)이 추가됐다. Distributed
-  Raft WAL, result ORAM payload plaintext, logs/metrics, V2 append mutation scan은 남아 있다.
+  scan(`private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels`)과 3-peer cluster의
+  storage/Raft WAL/snapshot/log scan(`test_private_oram_leak_scan.py`)이 추가됐다. Result ORAM
+  payload plaintext, metrics, V2 append mutation scan은 남아 있다.
 - 2026-10-11: HNSW/result ORAM store의 read-only directory fault, HNSW store의
   `RLIMIT_FSIZE` write-failure fault, HNSW signed commit의 5개 durable boundary child-process
   abort matrix와 같은 result ORAM store matrix가 추가됐다. Owner journal abort matrix, 전체 Qdrant process kill과
