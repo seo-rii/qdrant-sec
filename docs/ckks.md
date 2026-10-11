@@ -5768,6 +5768,9 @@ return the original bucket or fail closed for an overwritten one) or the new
 epoch with the new bucket, must keep the pending write-back, and must finish
 the commit through `recover_pending_writeback_with_signature`.
 
-Still open for the V2-E gate: the same matrix for the result ORAM store and
-the owner journal, kills of a whole Qdrant process across Raft apply, and the
-leader/supervisor concurrency E2E.
+The result ORAM store has the same matrix
+(`private_result_oram_store.rs`, `private_result_store_crash_point`).
+
+Still open for the V2-E gate: the same matrix for the owner journal, kills of
+a whole Qdrant process across Raft apply, and the leader/supervisor
+concurrency E2E.

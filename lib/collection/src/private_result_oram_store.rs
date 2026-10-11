@@ -86,6 +86,22 @@ impl Debug for PrivateResultOramStore {
     }
 }
 
+/// Test-only process crash points for the commit kill matrix: when the environment names
+/// this point, the process aborts there (no unwinding, no destructors), like a kill.
+#[cfg(test)]
+const PRIVATE_RESULT_STORE_CRASH_POINT_ENV: &str = "QDRANT_SEC_PRIVATE_RESULT_STORE_CRASH_POINT";
+
+#[cfg(test)]
+fn private_result_store_crash_point(name: &str) {
+    if std::env::var(PRIVATE_RESULT_STORE_CRASH_POINT_ENV).is_ok_and(|point| point == name) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn private_result_store_crash_point(_name: &str) {}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateResultOramEpochState {
@@ -1658,6 +1674,7 @@ impl PrivateResultOramStore {
                 },
                 None,
             )?;
+            private_result_store_crash_point("after_prepare");
             self.commit_prepared_writeback_with_signature_and_consensus_under_owner_lock(
                 token,
                 max_ciphertext_bytes,
@@ -1918,7 +1935,9 @@ impl PrivateResultOramStore {
                 max_ciphertext_bytes,
             )?;
         }
+        private_result_store_crash_point("after_bucket_writes");
         self.write_merkle_tree_under_owner_lock(token, &pending.merkle_tree)?;
+        private_result_store_crash_point("after_merkle_write");
         if current == pending.old {
             self.compare_and_swap_epoch_under_owner_lock(
                 token,
@@ -1927,6 +1946,7 @@ impl PrivateResultOramStore {
                 Some(&consensus_writeback.writeback_digest),
             )?;
         }
+        private_result_store_crash_point("after_epoch_cas");
 
         if self.read_current_epoch()? != pending.new
             || self.read_merkle_tree()? != pending.merkle_tree
@@ -1949,6 +1969,7 @@ impl PrivateResultOramStore {
             }
         }
         self.write_completed_writeback_record_under_owner_lock(token, &consensus_writeback)?;
+        private_result_store_crash_point("after_completed_record");
         self.remove_pending_writeback_record_under_owner_lock(token)?;
         Ok(pending.new)
     }
@@ -7001,6 +7022,168 @@ mod tests {
             .commit_writeback(&old, &new, bundle.bucket_count(), &[], 128)
             .unwrap_err();
         assert!(err.to_string().contains("must update at least one bucket"));
+    }
+
+    /// Process kill matrix (PLAN V2-D5): a child process aborts (like `SIGKILL`, no unwinding)
+    /// at each durable boundary of a signed commit. Afterwards the store must show exactly
+    /// the old or the new epoch with matching buckets, and pending write-back recovery must
+    /// finish the commit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signed_commit_survives_process_abort_at_every_durable_boundary() {
+        const CHILD_STORE_ENV: &str = "QDRANT_SEC_PRIVATE_RESULT_CRASH_CHILD_STORE";
+        const CHILD_INPUT_ENV: &str = "QDRANT_SEC_PRIVATE_RESULT_CRASH_CHILD_INPUT";
+        type CommitInput = (
+            PrivateResultOramEpochState,
+            PrivateResultOramEpochState,
+            u64,
+            PrivateResultOramBucket,
+            PrivateResultOramSignature,
+        );
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let verification = || PrivateResultOramSignatureVerification {
+            expected_key_id: "tenant-a/private-result-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        if let (Some(store_dir), Some(input_path)) = (
+            std::env::var_os(CHILD_STORE_ENV),
+            std::env::var_os(CHILD_INPUT_ENV),
+        ) {
+            let (old, new, bucket_count, updated_bucket, signature): CommitInput =
+                serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+            let store = PrivateResultOramStore::new(store_dir);
+            let _ = store.commit_writeback_with_signature(
+                &old,
+                &new,
+                bucket_count,
+                std::slice::from_ref(&updated_bucket),
+                128,
+                &signature,
+                verification(),
+            );
+            panic!("the configured crash point was not reached");
+        }
+
+        for crash_point in [
+            "after_prepare",
+            "after_bucket_writes",
+            "after_merkle_write",
+            "after_epoch_cas",
+            "after_completed_record",
+        ] {
+            let bundle = fixture_upload_bundle();
+            let updated_bucket = fixture_bucket(1, 43, b"crash matrix result bucket");
+            let mut next_commitments = bundle.bucket_commitments();
+            next_commitments[1] = updated_bucket.bucket_commitment.clone();
+            let new = PrivateResultOramEpochState {
+                index_epoch: 43,
+                root_hash: PrivateResultOramStore::merkle_root_for_commitments(&next_commitments)
+                    .unwrap(),
+            };
+            let plan = PrivateResultOramCommitPlan {
+                old_epoch: bundle.manifest.index_epoch,
+                new_epoch: new.index_epoch,
+                old_root_hash: bundle.manifest.root_hash.clone(),
+                new_root_hash: new.root_hash.clone(),
+                leaf_commitments: next_commitments,
+                updated_buckets: vec![PrivateResultOramClientCommitBucketRef {
+                    bucket_id: updated_bucket.bucket_id,
+                    ciphertext_sha256: updated_bucket.ciphertext_sha256.clone(),
+                }],
+            };
+            let signature = sign_private_result_oram_commit(
+                &key_pair,
+                PrivateResultOramCommitSignatureContext {
+                    collection_id: "collection-uuid-1",
+                    key_id: "tenant-a/result-private-rk",
+                    rk_id: "tenant-a/result-private-rk",
+                    rk_epoch: 7,
+                    signing_key_id: "tenant-a/private-result-signing-v1",
+                },
+                &plan,
+            )
+            .unwrap();
+            let temp = TempDir::new().unwrap();
+            let store = fixture_store(&temp);
+            let old = store.write_initial_upload_bundle(&bundle, 128).unwrap();
+            let original_bucket = store
+                .read_bucket(1, old.index_epoch, bundle.bucket_count(), 128)
+                .unwrap();
+            let input: CommitInput = (
+                old.clone(),
+                new.clone(),
+                bundle.bucket_count(),
+                updated_bucket.clone(),
+                signature,
+            );
+            let input_path = temp.path().join("crash-child-input.json");
+            fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
+            drop(store);
+
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("private_result_oram_store::tests::signed_commit_survives_process_abort_at_every_durable_boundary")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_STORE_ENV, temp.path())
+                .env(CHILD_INPUT_ENV, &input_path)
+                .env(PRIVATE_RESULT_STORE_CRASH_POINT_ENV, crash_point)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                assert_eq!(
+                    status.signal(),
+                    Some(nix::libc::SIGABRT),
+                    "child did not abort at {crash_point}: {status}",
+                );
+            }
+
+            let store = fixture_store(&temp);
+            let current = store.read_current_epoch().unwrap();
+            if current == old {
+                // Between the bucket writes and the epoch CAS the old epoch refuses the
+                // overwritten bucket instead of serving it; it must never serve other data.
+                if let Ok(bucket) =
+                    store.read_bucket(1, old.index_epoch, bundle.bucket_count(), 128)
+                {
+                    assert_eq!(
+                        bucket, original_bucket,
+                        "old epoch served a changed bucket after a crash at {crash_point}",
+                    );
+                }
+            } else {
+                assert_eq!(
+                    current, new,
+                    "unexpected epoch after a crash at {crash_point}"
+                );
+                assert_eq!(
+                    store
+                        .read_bucket(1, new.index_epoch, bundle.bucket_count(), 128)
+                        .unwrap(),
+                    updated_bucket,
+                    "new epoch served a stale bucket after a crash at {crash_point}",
+                );
+            }
+            assert!(
+                store.pending_writeback_exists().unwrap(),
+                "pending write-back missing after a crash at {crash_point}",
+            );
+
+            let recovered = store
+                .recover_pending_writeback_with_signature(128, verification())
+                .unwrap();
+            assert_eq!(recovered, Some(new.clone()), "recovery after {crash_point}");
+            assert_eq!(store.read_current_epoch().unwrap(), new);
+            assert_eq!(
+                store
+                    .read_bucket(1, new.index_epoch, bundle.bucket_count(), 128)
+                    .unwrap(),
+                updated_bucket,
+            );
+            assert!(!store.pending_writeback_exists().unwrap());
+        }
     }
 
     /// Fault injection (PLAN V2-D5): a commit on a store whose directories are not writable
