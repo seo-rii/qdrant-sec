@@ -5753,3 +5753,21 @@ the way writes fail on a full disk; the commit must fail closed and succeed
 after the limit is lifted. Real `ENOSPC` and fsync failures are not injected
 yet. Raft state saves already
 have fsync and publish fault backends (`persistent.rs`).
+
+### Release gate work: store-level process kill matrix
+
+`signed_commit_survives_process_abort_at_every_durable_boundary`
+(`lib/collection/src/private_hnsw_oram_store.rs`, Linux) runs a signed
+write-back commit in a child process that aborts (no unwinding, no
+destructors, like a kill) at each durable boundary: after the pending
+write-back is prepared, after the bucket writes, after the Merkle tree
+write, after the epoch CAS, and after the completion record. Crash points
+are compiled only into test builds (`private_hnsw_store_crash_point`).
+After each abort, the reopened store must show the old epoch (whose reads
+return the original bucket or fail closed for an overwritten one) or the new
+epoch with the new bucket, must keep the pending write-back, and must finish
+the commit through `recover_pending_writeback_with_signature`.
+
+Still open for the V2-E gate: the same matrix for the result ORAM store and
+the owner journal, kills of a whole Qdrant process across Raft apply, and the
+leader/supervisor concurrency E2E.

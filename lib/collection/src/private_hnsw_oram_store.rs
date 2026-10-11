@@ -83,6 +83,22 @@ impl Debug for PrivateHnswOramStore {
     }
 }
 
+/// Test-only process crash points for the commit kill matrix: when the environment names
+/// this point, the process aborts there (no unwinding, no destructors), like a kill.
+#[cfg(test)]
+const PRIVATE_HNSW_STORE_CRASH_POINT_ENV: &str = "QDRANT_SEC_PRIVATE_HNSW_STORE_CRASH_POINT";
+
+#[cfg(test)]
+fn private_hnsw_store_crash_point(name: &str) {
+    if std::env::var(PRIVATE_HNSW_STORE_CRASH_POINT_ENV).is_ok_and(|point| point == name) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn private_hnsw_store_crash_point(_name: &str) {}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateHnswOramEpochState {
@@ -1756,6 +1772,7 @@ impl PrivateHnswOramStore {
                 },
                 None,
             )?;
+            private_hnsw_store_crash_point("after_prepare");
             self.commit_prepared_writeback_with_signature_and_consensus_under_owner_lock(
                 lock,
                 max_ciphertext_bytes,
@@ -2015,7 +2032,9 @@ impl PrivateHnswOramStore {
                 max_ciphertext_bytes,
             )?;
         }
+        private_hnsw_store_crash_point("after_bucket_writes");
         self.write_merkle_tree_under_owner_lock(lock, &pending.merkle_tree)?;
+        private_hnsw_store_crash_point("after_merkle_write");
         if current == pending.old {
             self.compare_and_swap_epoch_with_writeback_digest_under_owner_lock(
                 lock,
@@ -2024,6 +2043,7 @@ impl PrivateHnswOramStore {
                 Some(&consensus_writeback.writeback_digest),
             )?;
         }
+        private_hnsw_store_crash_point("after_epoch_cas");
 
         if self.read_current_epoch()? != pending.new
             || self.read_merkle_tree()? != pending.merkle_tree
@@ -2046,6 +2066,7 @@ impl PrivateHnswOramStore {
             }
         }
         self.write_completed_writeback_record_under_owner_lock(lock, &consensus_writeback)?;
+        private_hnsw_store_crash_point("after_completed_record");
         self.remove_pending_writeback_record_under_owner_lock(lock)?;
         Ok(pending.new)
     }
@@ -7940,6 +7961,137 @@ mod tests {
             .unwrap();
         assert_eq!(committed, new);
         assert_eq!(store.read_current_epoch().unwrap(), new);
+    }
+
+    /// Process kill matrix (PLAN V2-D5): a child process aborts (like `SIGKILL`, no unwinding)
+    /// at each durable boundary of a signed commit. Afterwards the store must show exactly
+    /// the old or the new epoch with matching buckets, and pending write-back recovery must
+    /// finish the commit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signed_commit_survives_process_abort_at_every_durable_boundary() {
+        const CHILD_STORE_ENV: &str = "QDRANT_SEC_PRIVATE_HNSW_CRASH_CHILD_STORE";
+        const CHILD_INPUT_ENV: &str = "QDRANT_SEC_PRIVATE_HNSW_CRASH_CHILD_INPUT";
+        type CommitInput = (
+            PrivateHnswOramEpochState,
+            PrivateHnswOramEpochState,
+            u64,
+            PrivateHnswOramBucket,
+            PrivateHnswOramSignature,
+        );
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
+        let verification = PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: key_pair.public_key().as_ref(),
+        };
+
+        if let (Some(store_dir), Some(input_path)) = (
+            std::env::var_os(CHILD_STORE_ENV),
+            std::env::var_os(CHILD_INPUT_ENV),
+        ) {
+            let (old, new, bucket_count, updated_bucket, signature): CommitInput =
+                serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+            let store = PrivateHnswOramStore::new(store_dir, "text").unwrap();
+            let _ = store.commit_writeback_with_signature(
+                &old,
+                &new,
+                bucket_count,
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification,
+            );
+            panic!("the configured crash point was not reached");
+        }
+
+        for crash_point in [
+            "after_prepare",
+            "after_bucket_writes",
+            "after_merkle_write",
+            "after_epoch_cas",
+            "after_completed_record",
+        ] {
+            let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+            let temp = TempDir::new().unwrap();
+            let store = fixture_store(&temp);
+            let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+            let original_bucket = store
+                .read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+                .unwrap();
+            let input: CommitInput = (
+                old.clone(),
+                new.clone(),
+                bundle.bucket_count(),
+                updated_bucket.clone(),
+                signature,
+            );
+            let input_path = temp.path().join("crash-child-input.json");
+            fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
+            drop(store);
+
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("private_hnsw_oram_store::tests::signed_commit_survives_process_abort_at_every_durable_boundary")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_STORE_ENV, temp.path())
+                .env(CHILD_INPUT_ENV, &input_path)
+                .env(PRIVATE_HNSW_STORE_CRASH_POINT_ENV, crash_point)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                assert_eq!(
+                    status.signal(),
+                    Some(nix::libc::SIGABRT),
+                    "child did not abort at {crash_point}: {status}",
+                );
+            }
+
+            let store = fixture_store(&temp);
+            let current = store.read_current_epoch().unwrap();
+            if current == old {
+                // Between the bucket writes and the epoch CAS the old epoch refuses the
+                // overwritten bucket instead of serving it; it must never serve other data.
+                if let Ok(bucket) =
+                    store.read_bucket(0, old.index_epoch, bundle.bucket_count(), 4096)
+                {
+                    assert_eq!(
+                        bucket, original_bucket,
+                        "old epoch served a changed bucket after a crash at {crash_point}",
+                    );
+                }
+            } else {
+                assert_eq!(
+                    current, new,
+                    "unexpected epoch after a crash at {crash_point}"
+                );
+                assert_eq!(
+                    store
+                        .read_bucket(0, new.index_epoch, bundle.bucket_count(), 4096)
+                        .unwrap(),
+                    updated_bucket,
+                    "new epoch served a stale bucket after a crash at {crash_point}",
+                );
+            }
+            assert!(
+                store.pending_writeback_exists().unwrap(),
+                "pending write-back missing after a crash at {crash_point}",
+            );
+
+            let recovered = store
+                .recover_pending_writeback_with_signature(4096, verification)
+                .unwrap();
+            assert_eq!(recovered, Some(new.clone()), "recovery after {crash_point}");
+            assert_eq!(store.read_current_epoch().unwrap(), new);
+            assert_eq!(
+                store
+                    .read_bucket(0, new.index_epoch, bundle.bucket_count(), 4096)
+                    .unwrap(),
+                updated_bucket,
+            );
+            assert!(!store.pending_writeback_exists().unwrap());
+        }
     }
 
     #[test]

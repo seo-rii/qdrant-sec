@@ -1509,6 +1509,10 @@ Signed fields:
 - 2026-10-11: private HNSW upload + collection snapshot의 storage/snapshot/temp binary sentinel
   scan(`private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels`)이 추가됐다. Distributed
   Raft WAL, result ORAM payload plaintext, logs/metrics, V2 append mutation scan은 남아 있다.
+- 2026-10-11: HNSW/result ORAM store의 read-only directory fault, HNSW store의
+  `RLIMIT_FSIZE` write-failure fault, HNSW signed commit의 5개 durable boundary child-process
+  abort matrix가 추가됐다. Result ORAM/owner journal abort matrix, 전체 Qdrant process kill과
+  leader/supervisor concurrency E2E, 실제 `ENOSPC`/fsync injection은 남아 있다.
 
 완료 조건:
 
