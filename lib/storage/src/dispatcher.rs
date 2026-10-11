@@ -65,6 +65,30 @@ use crate::{
     TableOfContent,
 };
 
+/// Environment variable naming the private ORAM crash point at which the process aborts.
+#[cfg(feature = "private-oram-crash-points")]
+pub const PRIVATE_ORAM_CRASH_POINT_ENV: &str = "QDRANT_PRIVATE_ORAM_CRASH_POINT";
+
+/// Test-only process kill point (feature `private-oram-crash-points`): kills the process with
+/// `SIGKILL` (no unwinding, destructors or core dump, like `kill -9`) when
+/// `QDRANT_PRIVATE_ORAM_CRASH_POINT` names this point. A no-op in every other build.
+#[cfg(feature = "private-oram-crash-points")]
+pub fn private_oram_crash_point(name: &str) {
+    if std::env::var(PRIVATE_ORAM_CRASH_POINT_ENV).is_ok_and(|point| point == name) {
+        log::error!("killing the process at private ORAM crash point {name}");
+        #[cfg(unix)]
+        // SAFETY: sends SIGKILL to this process; no memory is touched.
+        unsafe {
+            nix::libc::kill(nix::libc::getpid(), nix::libc::SIGKILL);
+        }
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "private-oram-crash-points"))]
+#[inline(always)]
+pub fn private_oram_crash_point(_name: &str) {}
+
 /// How many times an unresolved private ORAM epoch CAS is re-proposed before the writeback is
 /// left prepared for recovery.
 const PRIVATE_ORAM_EPOCH_CAS_RESOLVE_ATTEMPTS: usize = 3;
@@ -966,6 +990,7 @@ impl Dispatcher {
         })?;
         validate_private_oram_writeback_digest(expected_digest)?;
         prepare_local()?;
+        private_oram_crash_point("replicated_writeback_after_local_prepare");
 
         let replica_acks = match prepare_replicas().await {
             Ok(replica_acks) => replica_acks,
@@ -977,6 +1002,7 @@ impl Dispatcher {
                 return Err(prepare_error);
             }
         };
+        private_oram_crash_point("replicated_writeback_after_replica_prepare");
         if let Err(ack_error) = validate_private_oram_replica_prepare_acks(
             required_replica_peers,
             &replica_acks,
@@ -1009,7 +1035,9 @@ impl Dispatcher {
         // The CAS committed, so consensus already serves the new epoch: the local finalize is
         // correct whatever the replicas report. Skipping it when a replica failed left the
         // coordinator itself behind consensus until session recovery.
+        private_oram_crash_point("replicated_writeback_after_cas");
         let replicas_finalized = finalize_replicas().await;
+        private_oram_crash_point("replicated_writeback_after_replica_finalize");
         let local_finalized = finalize_local();
         replicas_finalized?;
         local_finalized

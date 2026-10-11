@@ -33,6 +33,9 @@ tracing-tracy = ["tracing", "dep:tracing-tracy"]
 tokio-tracing = ["tokio/tracing"]
 stacktrace = ["rstack-self"]
 chaos-testing = []
+# Test-only process abort points in private ORAM write-back coordination; never enable in
+# production builds (see tests/consensus_tests/test_private_oram_crash_matrix.py).
+private-oram-crash-points = ["storage/private-oram-crash-points"]
 data-consistency-check = ["collection/data-consistency-check"]
 gpu = ["gpu/gpu", "segment/gpu"]
 deb = []

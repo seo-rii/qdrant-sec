@@ -1513,6 +1513,10 @@ Signed fields:
   `RLIMIT_FSIZE` write-failure fault, HNSW signed commit의 5개 durable boundary child-process
   abort matrix와 같은 result ORAM store matrix가 추가됐다. Owner journal abort matrix, 전체 Qdrant process kill과
   leader/supervisor concurrency E2E, 실제 `ENOSPC`/fsync injection은 남아 있다.
+- 2026-10-11: `private-oram-crash-points` feature와 `test_private_oram_crash_matrix.py`로 replicated
+  write-back coordinator를 4개 경계(local prepare/replica prepare/CAS/replica finalize)에서
+  `SIGKILL`하는 3-peer process E2E가 통과한다. 죽은 coordinator의 session lease가 최대 300초 동안
+  새 session을 막는 점은 known limitation으로 기록했다.
 
 완료 조건:
 

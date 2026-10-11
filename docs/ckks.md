@@ -5774,3 +5774,27 @@ The result ORAM store has the same matrix
 Still open for the V2-E gate: the same matrix for the owner journal, kills of
 a whole Qdrant process across Raft apply, and the leader/supervisor
 concurrency E2E.
+
+### Release gate work: whole-process kill matrix for replicated write-backs
+
+`tests/consensus_tests/test_private_oram_crash_matrix.py` starts a three-peer
+cluster (replication factor 3) whose binary is built with the test-only
+`private-oram-crash-points` feature, uploads a private HNSW index and sends a
+commit to a peer that is killed with `SIGKILL` at one of four points of the
+replicated write-back coordinator (`private_oram_crash_point` in
+`lib/storage/src/dispatcher.rs`): after the local prepare, after the replica
+prepares, after the consensus CAS, and after the replica finalizes. The peer
+is restarted without the crash point. Before the CAS, every peer must keep
+serving the old epoch and the same commit must succeed after the restart;
+after the CAS, every peer must serve the new epoch. All four cases pass.
+Run it with `cargo build -p qdrant --features private-oram-crash-points` and
+`QDRANT_PRIVATE_ORAM_CRASH_TESTS=1 uv run pytest
+consensus_tests/test_private_oram_crash_matrix.py` from `tests/`. The
+feature is never enabled in release builds; it also lets the test shorten
+session leases (`QDRANT_PRIVATE_ORAM_TEST_SESSION_LEASE_SECS`).
+
+Known limitation found by this test: a killed coordinator's session lease
+stays active in consensus, so every peer refuses new private HNSW sessions
+until it expires (300 s; commits renew it for another 300 s). A peer cannot
+tell its own orphaned lease from one held by a live session without a process
+incarnation in the lease record, which would change the consensus format.

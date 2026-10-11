@@ -159,7 +159,18 @@ rotate the affected RKs and run the payload migration. Client-side zero-trust
 data is not exposed by server key compromise, but rotate client signing keys
 if the client environment is suspect.
 
-## 6. Cluster parity settings to verify before any restore
+## 6. Coordinator crash during a write-back
+
+If the peer coordinating a private HNSW write-back dies, the cluster
+converges on its own (covered by `test_private_oram_crash_matrix.py`): before
+the consensus CAS the old epoch stays authoritative, and after it every peer
+serves the new epoch once the restarted peer recovers. Until the dead
+coordinator's session lease expires (up to 300 s after its last renewal),
+every peer refuses new private HNSW sessions with "private ORAM session lease
+is already active". Restart the peer, wait for the lease to expire, then let
+the client retry the write-back from a new session.
+
+## 7. Cluster parity settings to verify before any restore
 
 - Every peer must have identical runtime crypto settings. Shard transfer,
   replication and restore fail closed on a mismatched or missing runtime
@@ -174,7 +185,7 @@ if the client environment is suspect.
   materials and backends, so only client-held keys matter for those
   collections.
 
-## 7. Open gaps (tracked in PLAN V2-E and the docs/ckks.md review passes)
+## 8. Open gaps (tracked in PLAN V2-E and the docs/ckks.md review passes)
 
 - Multi-process crash matrix for RF=1 external restore, leader/supervisor
   change concurrency, disk-full/permission/fsync injection and end-to-end

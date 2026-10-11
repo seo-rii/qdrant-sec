@@ -863,6 +863,12 @@ fn validate_live_install_transfer_lease(
 const PRIVATE_ORAM_SESSION_LEASE_HASH_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-session-lease-id/v1";
 const PRIVATE_ORAM_SESSION_LEASE_RENEW_SECS: u64 = 300;
+
+/// Lease renewal length; crash-point test builds shorten it together with the session lease.
+fn private_oram_session_lease_renew_secs() -> u64 {
+    crate::common::private_hnsw::test_session_lease_override()
+        .unwrap_or(PRIVATE_ORAM_SESSION_LEASE_RENEW_SECS)
+}
 const PRIVATE_ORAM_TRANSFER_RESERVATION_SECS: u64 = 3_600;
 const PRIVATE_ORAM_TRANSFER_RESERVATION_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_ORAM_TRANSFER_RESERVATION_APPLY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1967,7 +1973,7 @@ fn private_oram_renewal_expiry(
     now_unix: u64,
 ) -> Result<u64, StorageError> {
     let ttl_expiry = now_unix
-        .checked_add(PRIVATE_ORAM_SESSION_LEASE_RENEW_SECS)
+        .checked_add(private_oram_session_lease_renew_secs())
         .ok_or_else(|| StorageError::service_error("private ORAM session lease overflowed"))?;
     let monotonic_expiry = current
         .expires_at_unix

@@ -57,6 +57,27 @@ const ORAM_OPTION: &str = "oram";
 const FIXED_BUDGET_OPTION: &str = "fixed_budget";
 const ZERO_TRUST_PROFILE_STRICT: &str = "strict";
 const SESSION_LEASE_SECS: u64 = 300;
+
+/// Test builds with the `private-oram-crash-points` feature may shorten private ORAM session
+/// leases through `QDRANT_PRIVATE_ORAM_TEST_SESSION_LEASE_SECS`, so the process kill matrix can
+/// observe a crashed coordinator's lease expiring. `None` in every other build.
+pub(crate) fn test_session_lease_override() -> Option<u64> {
+    #[cfg(feature = "private-oram-crash-points")]
+    {
+        std::env::var("QDRANT_PRIVATE_ORAM_TEST_SESSION_LEASE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+    }
+    #[cfg(not(feature = "private-oram-crash-points"))]
+    {
+        None
+    }
+}
+
+fn session_lease_secs() -> u64 {
+    test_session_lease_override().unwrap_or(SESSION_LEASE_SECS)
+}
 const MAX_SESSION_COUNT: usize = 1024;
 const PRIVATE_HNSW_ORAM_LEAF_LABEL_B64_LEN: usize = 11;
 const PRIVATE_HNSW_ORAM_ROOT_HASH_B64_LEN: usize = 43;
@@ -3726,7 +3747,7 @@ fn current_unix_secs() -> StorageResult<u64> {
 }
 
 fn session_lease_expires_unix(now_unix: u64) -> StorageResult<u64> {
-    now_unix.checked_add(SESSION_LEASE_SECS).ok_or_else(|| {
+    now_unix.checked_add(session_lease_secs()).ok_or_else(|| {
         StorageError::service_error("private HNSW ORAM session lease calculation overflowed")
     })
 }
