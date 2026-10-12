@@ -1591,6 +1591,277 @@ mod private_result_oram_rest_tests {
         );
     }
 
+    /// Leakage scan (PLAN V2-D5): result ORAM buckets sealed from distinctive payload plaintext,
+    /// uploaded, rewritten by a signed commit and captured in a collection snapshot must leave no
+    /// payload bytes, fetch or point token, or client key bytes under the storage, snapshot or
+    /// temp directories.
+    #[test]
+    fn private_result_oram_payloads_store_no_plaintext_sentinels() {
+        let _guard = route_e2e_guard();
+        let fixture = PrivateResultRouteFixture::build();
+        let settings = fixture.settings();
+        let resource_key = [0x5a_u8; 32];
+        let keys = qdrant_sec::PrivateResultOramClientKeys::derive_from_resource_key_with_context(
+            &qdrant_sec::SecretKey::from_bytes(resource_key),
+            COLLECTION_ID,
+            KEY_ID,
+            RK_EPOCH,
+        )
+        .unwrap();
+        let config =
+            qdrant_sec::private_result_oram_client_config_from_manifest(&fixture.manifest).unwrap();
+        let base_context = qdrant_sec::PrivateResultOramBucketAeadBaseContext {
+            collection_id: COLLECTION_ID,
+            key_id: KEY_ID,
+            rk_id: KEY_ID,
+            rk_epoch: RK_EPOCH,
+        };
+        // Blocks 0-2 are uploaded; block 3 is written by the commit.
+        let blocks = (0..4_u8)
+            .map(|index| qdrant_sec::PrivateResultOramPayloadBlockPlaintext {
+                version: qdrant_sec::PRIVATE_RESULT_ORAM_PAYLOAD_BLOCK_VERSION,
+                payload_fetch_token: format!("qdrant-sec-result-fetch-token-{index:02}")
+                    .into_bytes()
+                    .try_into()
+                    .unwrap(),
+                point_token: format!("qdrant-sec-result-point-token-{index:02}")
+                    .into_bytes()
+                    .try_into()
+                    .unwrap(),
+                payload: format!("{{\"body\":\"qdrant-sec-result-leak-payload-{index:02}\"}}")
+                    .into_bytes(),
+                deleted: false,
+                generation: 1,
+            })
+            .collect::<Vec<_>>();
+        let seal = |bucket_id: u64,
+                    index_epoch: u64,
+                    contents: Vec<Option<qdrant_sec::PrivateResultOramPayloadBlockPlaintext>>| {
+            qdrant_sec::seal_private_result_oram_plaintext_bucket(
+                &keys,
+                base_context,
+                index_epoch,
+                &qdrant_sec::PrivateResultOramPlaintextBucket {
+                    bucket_id,
+                    blocks: contents,
+                },
+                config,
+            )
+            .unwrap()
+        };
+
+        let mut manifest = fixture.manifest.clone();
+        let buckets = (0..manifest.bucket_count)
+            .map(|bucket_id| {
+                let mut contents = vec![None; config.bucket_size];
+                if bucket_id < 3 {
+                    contents[0] = Some(blocks[bucket_id as usize].clone());
+                }
+                seal(bucket_id, BASE_EPOCH, contents)
+            })
+            .collect::<Vec<_>>();
+        let mut commitments = buckets
+            .iter()
+            .map(|bucket| bucket.bucket_commitment.clone())
+            .collect::<Vec<_>>();
+        manifest.root_hash = private_result_oram_merkle_root_for_commitments(&commitments).unwrap();
+        let manifest_signature = fixture.sign_manifest(&manifest);
+
+        let updated_bucket = seal(
+            0,
+            NEXT_EPOCH,
+            vec![Some(blocks[3].clone()), Some(blocks[0].clone())],
+        );
+        commitments[0] = updated_bucket.bucket_commitment.clone();
+        let new_root_hash = private_result_oram_merkle_root_for_commitments(&commitments).unwrap();
+        let commit_signature = sign_private_result_oram_commit(
+            &fixture.signing_key,
+            PrivateResultOramCommitSignatureContext {
+                collection_id: &manifest.collection_id,
+                key_id: &manifest.key_id,
+                rk_id: &manifest.rk_id,
+                rk_epoch: manifest.rk_epoch,
+                signing_key_id: SIGNING_KEY_ID,
+            },
+            &PrivateResultOramCommitPlan {
+                old_epoch: BASE_EPOCH,
+                new_epoch: NEXT_EPOCH,
+                old_root_hash: manifest.root_hash.clone(),
+                new_root_hash: new_root_hash.clone(),
+                leaf_commitments: commitments,
+                updated_buckets: vec![PrivateResultOramClientCommitBucketRef {
+                    bucket_id: updated_bucket.bucket_id,
+                    ciphertext_sha256: updated_bucket.ciphertext_sha256.clone(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let (temp, dispatcher) = test_dispatcher();
+        actix_web::rt::System::new().block_on(async {
+            create_private_result_collection(&dispatcher).await;
+            let auth = Auth::new_internal(Access::full("private result ORAM leakage scan"));
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            do_upload_private_result_oram_manifest(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                manifest.clone(),
+                manifest_signature,
+            )
+            .await
+            .unwrap();
+            do_upload_private_result_oram_buckets(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                BASE_EPOCH,
+                manifest.root_hash.clone(),
+                buckets.clone(),
+            )
+            .await
+            .unwrap();
+            let session = do_open_private_result_oram_session(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                "tenant-a/leak-scan-sdk".to_string(),
+                BASE_EPOCH,
+                true,
+            )
+            .await
+            .unwrap();
+            let committed = do_commit_private_result_oram_buckets(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                &session.session_id,
+                BASE_EPOCH,
+                NEXT_EPOCH,
+                manifest.root_hash.clone(),
+                new_root_hash.clone(),
+                vec![updated_bucket.clone()],
+                commit_signature,
+            )
+            .await
+            .unwrap();
+            assert_eq!(committed.index_epoch, NEXT_EPOCH);
+            assert!(
+                do_close_private_result_oram_session(
+                    toc,
+                    &auth,
+                    &settings,
+                    COLLECTION_NAME,
+                    &session.session_id,
+                )
+                .await
+                .unwrap()
+            );
+            crate::common::collections::do_create_snapshot(toc.clone(), &auth, COLLECTION_NAME)
+                .await
+                .unwrap();
+        });
+
+        let mut files = Vec::new();
+        let mut pending = vec![temp.path().to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            } else if metadata.is_file() {
+                files.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+        let contains = |haystack: &[u8], needle: &[u8]| {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        let is_snapshot = |path: &std::path::Path| {
+            path.extension()
+                .is_some_and(|extension| extension == "snapshot")
+        };
+
+        // Positive control: the committed ciphertext must be visible in the store and in the
+        // snapshot, or an absent sentinel would prove nothing.
+        for (label, ciphertext) in [
+            ("uploaded", buckets[1].ciphertext.as_bytes()),
+            ("committed", updated_bucket.ciphertext.as_bytes()),
+        ] {
+            assert!(
+                files
+                    .iter()
+                    .any(|(path, bytes)| !is_snapshot(path) && contains(bytes, ciphertext)),
+                "{label} bucket ciphertext not found in storage; the scan reads the wrong files",
+            );
+            assert!(
+                files
+                    .iter()
+                    .any(|(path, bytes)| is_snapshot(path) && contains(bytes, ciphertext)),
+                "{label} bucket ciphertext not found in the snapshot archive",
+            );
+        }
+
+        let mut sentinels: Vec<(String, Vec<u8>)> = vec![
+            ("client resource key".to_string(), resource_key.to_vec()),
+            (
+                "bucket AEAD key".to_string(),
+                keys.bucket_aead_key().as_bytes().to_vec(),
+            ),
+            (
+                "payload marker".to_string(),
+                b"qdrant-sec-result-leak-payload".to_vec(),
+            ),
+        ];
+        for (index, block) in blocks.iter().enumerate() {
+            for (name, bytes) in [
+                ("payload", block.payload.clone()),
+                ("fetch token", block.payload_fetch_token.to_vec()),
+                ("point token", block.point_token.to_vec()),
+            ] {
+                sentinels.push((
+                    format!("{name} {index} (base64url)"),
+                    BASE64URL_NOPAD.encode(&bytes).into_bytes(),
+                ));
+                sentinels.push((format!("{name} {index}"), bytes));
+            }
+        }
+        // One pass per file: every 8-byte window is looked up among the sentinel prefixes and
+        // only a prefix hit compares the whole sentinel (preallocated WAL files are large).
+        let mut by_prefix: HashMap<[u8; 8], Vec<&(String, Vec<u8>)>> = HashMap::new();
+        for sentinel in &sentinels {
+            let prefix: [u8; 8] = sentinel.1[..8].try_into().unwrap();
+            by_prefix.entry(prefix).or_default().push(sentinel);
+        }
+        for (path, bytes) in &files {
+            for offset in 0..bytes.len().saturating_sub(7) {
+                let window: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                if window == [0; 8] {
+                    continue;
+                }
+                let Some(candidates) = by_prefix.get(&window) else {
+                    continue;
+                };
+                for (label, sentinel) in candidates {
+                    assert!(
+                        !bytes[offset..].starts_with(sentinel),
+                        "plaintext sentinel '{label}' leaked into {}",
+                        path.display(),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn private_result_oram_common_ops_require_write_access_for_mutations() {
         let _guard = route_e2e_guard();

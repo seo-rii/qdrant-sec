@@ -5743,8 +5743,20 @@ every peer log, plus every peer's `/metrics` and detailed `/telemetry`
 output. The uploaded ciphertext must be visible (positive control); no
 sentinel may appear. It passes.
 
-Not yet covered: result ORAM payload plaintext (the fixtures use synthetic
-result ciphertext) and V2 append mutations.
+`private_result_oram_payloads_store_no_plaintext_sentinels`
+(`src/actix/api/private_result_oram_api.rs`) covers result ORAM payload
+plaintext on a single node: it seals real payload blocks (distinctive JSON
+payloads, fetch and point tokens) with the client's bucket AEAD key, uploads
+them, commits a write-back that re-seals a bucket with a new payload, closes
+the session and snapshots the collection. The uploaded and committed
+ciphertext must be visible in the store and in the snapshot archive (positive
+control); no payload, token (raw or base64url), resource key or derived
+bucket key bytes may appear in any file. The test runs in the CI private ORAM
+step.
+
+Not yet covered: result ORAM payload plaintext on a multi-peer cluster (the
+cluster fixture still uses synthetic result ciphertext) and V2 append
+mutations.
 
 ### Release gate work: read-only store fault injection
 
