@@ -5793,9 +5793,19 @@ the commit through `recover_pending_writeback_with_signature`.
 The result ORAM store has the same matrix
 (`private_result_oram_store.rs`, `private_result_store_crash_point`).
 
-Still open for the V2-E gate: the same matrix for the owner journal, kills of
-a whole Qdrant process across Raft apply, and the leader/supervisor
-concurrency E2E.
+The owner journal has the same matrix
+(`journal_survives_process_abort_at_every_durable_boundary` in
+`private_oram_owner_journal.rs`, `private_oram_owner_journal_crash_point`):
+a child aborts after the prepare candidate is synced, after it is renamed
+into place, after a Finalized or AbortedOld terminal candidate is synced, and
+after that terminal record is renamed into place. The reopened journal must
+hold the previous or the next durable state, the candidate directories the
+child left behind must not block an exact retry, and the other terminal phase
+stays refused. The V2 prestage lifecycle store (install, adoption, cleanup)
+is covered only by the in-process `leave_*_for_test` stop points so far.
+
+Still open for the V2-E gate: kills of a whole Qdrant process across Raft
+apply, and the leader/supervisor concurrency E2E.
 
 ### Release gate work: whole-process kill matrix for replicated write-backs
 

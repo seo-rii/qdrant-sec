@@ -55,6 +55,23 @@ pub const PRIVATE_ORAM_OWNER_JOURNAL_DESCRIPTOR_VERSION: u16 = 1;
 pub const PRIVATE_ORAM_OWNER_JOURNAL_STATE_VERSION: u16 = 1;
 pub const PRIVATE_ORAM_OWNER_FINAL_BUCKET_FRAME_VERSION: u16 = 1;
 
+/// Test-only process crash points for the owner journal kill matrix: when the environment
+/// names this point, the process aborts there (no unwinding, no destructors), like a kill.
+#[cfg(test)]
+const PRIVATE_ORAM_OWNER_JOURNAL_CRASH_POINT_ENV: &str =
+    "QDRANT_SEC_PRIVATE_ORAM_OWNER_JOURNAL_CRASH_POINT";
+
+#[cfg(test)]
+fn private_oram_owner_journal_crash_point(name: &str) {
+    if std::env::var(PRIVATE_ORAM_OWNER_JOURNAL_CRASH_POINT_ENV).is_ok_and(|point| point == name) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn private_oram_owner_journal_crash_point(_name: &str) {}
+
 const OWNER_STORE_TEMP_DIR: &str = "temp";
 const ACTIVE_DIR: &str = "active";
 const ACTIVE_TEMP_DIR: &str = "temp";
@@ -6582,6 +6599,7 @@ impl PrivateOramOwnerJournal {
         sync_private_directory(&candidate_temp).map_err(|_| PrivateOramOwnerJournalError::Io)?;
         sync_private_directory(candidate.path()).map_err(|_| PrivateOramOwnerJournalError::Io)?;
         let candidate_file = open_private_directory(candidate.path())?;
+        private_oram_owner_journal_crash_point("prepare_candidate_synced");
 
         validate_open_directory_at_path(root_file, &self.root)?;
         let candidate_name = candidate
@@ -6590,6 +6608,7 @@ impl PrivateOramOwnerJournal {
             .ok_or(PrivateOramOwnerJournalError::Corrupt)?;
         match rename_directory_noreplace(root_file, candidate_name, OsStr::new(ACTIVE_DIR)) {
             Ok(()) => {
+                private_oram_owner_journal_crash_point("prepare_active_installed");
                 validate_open_directory_at_path(&root_file, &self.root)
                     .map_err(|_| PrivateOramOwnerJournalError::Indeterminate)?;
                 let installed = self
@@ -6699,6 +6718,7 @@ impl PrivateOramOwnerJournal {
         sync_private_directory(candidate.path()).map_err(|_| PrivateOramOwnerJournalError::Io)?;
         let candidate_directory = open_private_directory(candidate.path())?;
         sync_open_directory(&temp).map_err(|_| PrivateOramOwnerJournalError::Io)?;
+        private_oram_owner_journal_crash_point("terminal_candidate_synced");
 
         validate_open_directory_at_path(root, &self.root)?;
         validate_open_directory_at_path(&active, &active_path)?;
@@ -6709,6 +6729,7 @@ impl PrivateOramOwnerJournal {
             .ok_or(PrivateOramOwnerJournalError::Corrupt)?;
         match rename_entry_noreplace(&temp, candidate_name, &active, OsStr::new(TERMINAL_DIR)) {
             Ok(()) => {
+                private_oram_owner_journal_crash_point("terminal_installed");
                 let installed_terminal_path =
                     open_directory_entry_path(&active, OsStr::new(TERMINAL_DIR))
                         .map_err(|_| PrivateOramOwnerJournalError::Indeterminate)?;
@@ -9674,6 +9695,152 @@ mod tests {
             store.prepare_reservation_fence_v1(&conflicting, &lifecycle),
             Err(PrivateOramOwnerJournalError::ConcurrentMutation)
         );
+    }
+
+    /// Process kill matrix (PLAN V2-E gate): a child process aborts (like `SIGKILL`, no
+    /// unwinding, no tempdir cleanup) at each durable boundary of a journal prepare and of a
+    /// Finalized or AbortedOld terminal record. Afterwards the journal must hold either the
+    /// previous durable state or the next one, never a partial one, and an exact retry must
+    /// finish the transition despite the candidate directories the child left behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journal_survives_process_abort_at_every_durable_boundary() {
+        const CHILD_ROOT_ENV: &str = "QDRANT_SEC_PRIVATE_ORAM_OWNER_JOURNAL_CRASH_CHILD_ROOT";
+        const CHILD_PHASE_ENV: &str = "QDRANT_SEC_PRIVATE_ORAM_OWNER_JOURNAL_CRASH_CHILD_PHASE";
+        const MARKER: u8 = 140;
+
+        fn record_terminal(
+            journal: &PrivateOramOwnerJournal,
+            desired: &ValidatedOwnerJournal,
+            finalize: bool,
+        ) -> Result<PrivateOramOwnerJournalSnapshotV1, PrivateOramOwnerJournalError> {
+            let descriptor_digest = desired.snapshot.descriptor.descriptor_digest.clone();
+            let parent_descriptor_digest =
+                desired.snapshot.descriptor.parent_descriptor_digest.clone();
+            let consensus_authority_record_digest = digest(MARKER.wrapping_add(20));
+            let reconciliation_authority_digest = digest(MARKER.wrapping_add(21));
+            let canonical_index_states = canonical_index_states(desired, MARKER.wrapping_add(22));
+            if finalize {
+                journal
+                    .record_finalized(PrivateOramOwnerJournalFinalizeContextV1 {
+                        expected_journal_descriptor_digest: &descriptor_digest,
+                        parent_descriptor_digest: &parent_descriptor_digest,
+                        authenticated_owner_peer_id: 7,
+                        consensus_authority_record_digest: &consensus_authority_record_digest,
+                        reconciliation_authority_digest: &reconciliation_authority_digest,
+                        canonical_index_states: &canonical_index_states,
+                    })
+                    .map(|(snapshot, _)| snapshot)
+            } else {
+                journal
+                    .record_aborted_old(PrivateOramOwnerJournalAbortOldContextV1 {
+                        expected_journal_descriptor_digest: &descriptor_digest,
+                        parent_descriptor_digest: &parent_descriptor_digest,
+                        authenticated_owner_peer_id: 7,
+                        consensus_authority_record_digest: &consensus_authority_record_digest,
+                        reconciliation_authority_digest: &reconciliation_authority_digest,
+                        canonical_index_states: &canonical_index_states,
+                    })
+                    .map(|(snapshot, _)| snapshot)
+            }
+        }
+
+        if let (Some(hnsw_root), Some(phase)) = (
+            std::env::var_os(CHILD_ROOT_ENV),
+            std::env::var_os(CHILD_PHASE_ENV),
+        ) {
+            let journal = PrivateOramOwnerJournal::new(hnsw_root);
+            let desired = validated_fixture(MARKER, true);
+            let _ = journal.prepare_validated(desired.clone());
+            let _ = record_terminal(&journal, &desired, phase == "finalize");
+            panic!("the configured crash point was not reached");
+        }
+
+        for (crash_point, finalize) in [
+            ("prepare_candidate_synced", true),
+            ("prepare_active_installed", true),
+            ("terminal_candidate_synced", true),
+            ("terminal_installed", true),
+            ("terminal_candidate_synced", false),
+            ("terminal_installed", false),
+        ] {
+            let fixture = fixture();
+            let desired = validated_fixture(MARKER, true);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("private_oram_owner_journal::tests::journal_survives_process_abort_at_every_durable_boundary")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ROOT_ENV, &fixture.hnsw_root)
+                .env(CHILD_PHASE_ENV, if finalize { "finalize" } else { "abort_old" })
+                .env(PRIVATE_ORAM_OWNER_JOURNAL_CRASH_POINT_ENV, crash_point)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                assert_eq!(
+                    status.signal(),
+                    Some(nix::libc::SIGABRT),
+                    "child did not abort at {crash_point}: {status}",
+                );
+            }
+
+            let expected_phase = if finalize {
+                PrivateOramOwnerJournalPhaseV1::Finalized
+            } else {
+                PrivateOramOwnerJournalPhaseV1::AbortedOld
+            };
+            let reopened = fixture.journal.inspect_structural().unwrap();
+            match crash_point {
+                "prepare_candidate_synced" => {
+                    assert!(reopened.is_none(), "a stranded candidate became active");
+                }
+                "prepare_active_installed" | "terminal_candidate_synced" => {
+                    let reopened = reopened.unwrap();
+                    assert_eq!(
+                        reopened, desired.snapshot,
+                        "prepared state after {crash_point}"
+                    );
+                }
+                "terminal_installed" => {
+                    let phase = reopened.unwrap().terminal.unwrap().phase;
+                    assert_eq!(phase, expected_phase, "terminal phase after {crash_point}");
+                }
+                _ => unreachable!(),
+            }
+
+            // An exact prepare retry replays the prepared record; once a terminal record exists
+            // it is refused as a new mutation instead.
+            match fixture.journal.prepare_validated(desired.clone()) {
+                Ok((prepared, _)) => {
+                    assert_ne!(crash_point, "terminal_installed");
+                    assert_eq!(
+                        prepared, desired.snapshot,
+                        "prepare retry after {crash_point}"
+                    );
+                }
+                Err(error) => assert_eq!(
+                    (crash_point, error),
+                    (
+                        "terminal_installed",
+                        PrivateOramOwnerJournalError::ConcurrentMutation
+                    ),
+                ),
+            }
+            let finished = record_terminal(&fixture.journal, &desired, finalize)
+                .unwrap_or_else(|error| panic!("terminal retry after {crash_point}: {error:?}"));
+            assert_eq!(finished.terminal.as_ref().unwrap().phase, expected_phase);
+            assert_eq!(
+                fixture.journal.inspect_structural().unwrap().unwrap(),
+                finished
+            );
+            // The other terminal phase stays refused after recovery.
+            assert_eq!(
+                record_terminal(&fixture.journal, &desired, !finalize).unwrap_err(),
+                PrivateOramOwnerJournalError::InvalidTransition,
+                "terminal substitution after {crash_point}",
+            );
+        }
     }
 
     fn active_path(fixture: &JournalFixture) -> PathBuf {

@@ -175,7 +175,7 @@ jobs:
             cargo test --locked "$@" 2>&1 | tee -a private-oram-tests.log
             return "${PIPESTATUS[0]}"
           }
-          run_tests -p collection --lib -- private_hnsw_oram_store private_result_oram_store private_oram_owner_store_adapter || status=1
+          run_tests -p collection --lib -- private_hnsw_oram_store private_result_oram_store private_oram_owner_store_adapter private_oram_owner_journal || status=1
           run_tests -p storage --lib -- private_oram consensus_manager consensus::persistent dispatcher || status=1
           run_tests -p qdrant --bin qdrant -- private_hnsw private_result_oram private_oram qdrant_internal_api || status=1
           if [ "$status" -ne 0 ]; then
