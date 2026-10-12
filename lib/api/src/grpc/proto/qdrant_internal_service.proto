@@ -65,6 +65,16 @@ service QdrantInternal {
       ResolvePrivateOramMutationOwnerReservationV3Request)
       returns (ResolvePrivateOramMutationOwnerReservationV3Response) {}
 
+  // Create this owner's empty owner store for a V2 enrollment and report its signer.
+  rpc DescribePrivateOramMutationOwnerStoreV2(
+      DescribePrivateOramMutationOwnerStoreV2Request)
+      returns (DescribePrivateOramMutationOwnerStoreV2Response) {}
+
+  // Sign this owner's genesis commitment for its committed prepared V2 enrollment.
+  rpc SignPrivateOramMutationOwnerEnrollmentV2(
+      SignPrivateOramMutationOwnerEnrollmentV2Request)
+      returns (SignPrivateOramMutationOwnerEnrollmentV2Response) {}
+
   // Idempotently install one complete signed encrypted index on a replica.
   rpc InstallPrivateOramIndex(InstallPrivateOramIndexRequest)
       returns (InstallPrivateOramIndexResponse) {}
@@ -300,6 +310,32 @@ message PreparePrivateOramMutationOwnerReservationV3Response {
   bytes prepare_canonical_json = 1;
   // Exact canonical JSON for the owner's PrivateOramPeerRecoveryPublicKeyV1.
   bytes owner_public_key_canonical_json = 2;
+}
+
+message DescribePrivateOramMutationOwnerStoreV2Request {
+  string collection_name = 1;
+  string vector_name = 2;
+  // Pinned owner signing key used to resolve the vector-local HNSW owner context.
+  string owner_signing_key_id = 3;
+}
+
+message DescribePrivateOramMutationOwnerStoreV2Response {
+  // Exact canonical JSON for the owner's qdrant_sec::PrivateOramOwnerCleanupSignerV1.
+  bytes owner_signer_canonical_json = 1;
+  // Exact canonical JSON for the owner store's qdrant_sec::PrivateOramOwnerLifecycleStateV1.
+  bytes lifecycle_state_canonical_json = 2;
+}
+
+message SignPrivateOramMutationOwnerEnrollmentV2Request {
+  string collection_name = 1;
+  string vector_name = 2;
+  // Pinned owner signing key used to resolve the vector-local HNSW owner context.
+  string owner_signing_key_id = 3;
+}
+
+message SignPrivateOramMutationOwnerEnrollmentV2Response {
+  // Exact canonical JSON for qdrant_sec::PrivateOramOwnerEnrollmentGenesisCommitmentV1.
+  bytes commitment_canonical_json = 1;
 }
 
 message ResolvePrivateOramMutationOwnerReservationV3Request {

@@ -1209,6 +1209,48 @@ impl Dispatcher {
         Ok((owner_peer_ids, layout_digest))
     }
 
+    /// The consensus layout a V2 enrollment binds: the recorded layout, or, for a collection
+    /// that has none yet, generation 1 of its stable shard layout over the current epochs of
+    /// `keys` (which must hold no V1 session lease). The flag tells whether it is recorded.
+    pub async fn private_oram_enrollment_layout(
+        &self,
+        collection_name: &CollectionName,
+        collection_id: &str,
+        keys: &[PrivateOramEpochKey],
+    ) -> Result<(PrivateOramConsensusLayout, bool), StorageError> {
+        let layout_key = PrivateOramLayoutKey {
+            collection_id: collection_id.to_string(),
+        };
+        if let Some(layout) = self.private_oram_consensus_layout(&layout_key)? {
+            return Ok((layout, true));
+        }
+        let mut states = Vec::with_capacity(keys.len());
+        for key in keys {
+            if self.private_oram_consensus_session_lease(key)?.is_some() {
+                return Err(StorageError::bad_request(
+                    "private ORAM enrollment layout conflicts with an active session lease",
+                ));
+            }
+            let state = self.private_oram_consensus_epoch(key)?.ok_or_else(|| {
+                StorageError::bad_request("private ORAM enrollment index state is incomplete")
+            })?;
+            states.push((key.clone(), state));
+        }
+        let index_state_digest = canonical_private_oram_index_state_digest(collection_id, &states)?;
+        let (owner_peer_ids, layout_digest) = self
+            .private_oram_stable_shard_layout_digest(collection_name, collection_id)
+            .await?;
+        Ok((
+            PrivateOramConsensusLayout {
+                generation: 1,
+                owner_peer_ids,
+                layout_digest,
+                index_state_digest,
+            },
+            false,
+        ))
+    }
+
     pub async fn private_oram_reserved_layout_candidate(
         &self,
         collection_name: &CollectionName,

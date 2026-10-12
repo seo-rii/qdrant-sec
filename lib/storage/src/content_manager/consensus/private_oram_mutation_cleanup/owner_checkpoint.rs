@@ -11,10 +11,12 @@ use std::fmt::{self, Debug, Formatter};
 
 use data_encoding::BASE64URL_NOPAD;
 use qdrant_sec::{
-    PrivateOramOwnerCleanupSignerV1, PrivateOramOwnerCleanupTerminalStateV1,
-    PrivateOramOwnerEnrollmentGenesisCommitmentV1, PrivateOramOwnerEnrollmentPreparedV1,
-    PrivateOramOwnerLifecycleStateV1, PrivateOramOwnerLifecycleStatusAttestationV1,
-    PrivateOramOwnerReservationPrepareV1, private_oram_owner_lifecycle_state_root_v1,
+    PRIVATE_ORAM_OWNER_ENROLLMENT_PROTOCOL_VERSION_V1, PrivateOramOwnerCleanupSignerV1,
+    PrivateOramOwnerCleanupTerminalStateV1, PrivateOramOwnerEnrollmentGenesisCommitmentV1,
+    PrivateOramOwnerEnrollmentPreparedV1, PrivateOramOwnerLifecycleStateV1,
+    PrivateOramOwnerLifecycleStatusAttestationV1, PrivateOramOwnerReservationPrepareV1,
+    prepare_private_oram_owner_enrollment_v1, private_oram_owner_lifecycle_genesis_state_v1,
+    private_oram_owner_lifecycle_state_root_v1,
     validate_private_oram_owner_enrollment_genesis_commitment_v1,
     validate_private_oram_owner_enrollment_prepared_v1,
     validate_private_oram_owner_lifecycle_signer_v1,
@@ -757,6 +759,108 @@ pub(crate) fn activate_private_oram_owner_enrollment_transition_v1(
         .sort_by(|left, right| left.owner_enrollment_id.cmp(&right.owner_enrollment_id));
     advance_table_sequence(&mut next)?;
     Ok(next)
+}
+
+/// The next owner enrollment step for a collection whose owner roster is `owner_peer_ids`
+/// (docs/private-oram-v2-enrollment.md): owners enroll one at a time, in peer id order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PrivateOramOwnerEnrollmentNextStepV1 {
+    /// Every roster owner holds an enrollment checkpoint.
+    Complete,
+    /// The owner has neither a pending enrollment nor a checkpoint.
+    Prepare { owner_peer_id: u64 },
+    /// The owner's prepared enrollment is committed and awaits its genesis commitment.
+    Activate {
+        prepared: Box<PrivateOramOwnerEnrollmentPreparedV1>,
+    },
+}
+
+pub(crate) fn private_oram_owner_enrollment_next_step_v1(
+    table: &PrivateOramOwnerCheckpointTableV1,
+    owner_peer_ids: &[u64],
+) -> Result<PrivateOramOwnerEnrollmentNextStepV1, PrivateOramMutationJournalError> {
+    validate_private_oram_owner_checkpoint_table_v1(table)?;
+    let roster = owner_peer_ids.iter().copied().collect::<BTreeSet<_>>();
+    if roster.is_empty()
+        || roster.len() != owner_peer_ids.len()
+        || table
+            .pending_enrollments
+            .iter()
+            .any(|pending| !roster.contains(&pending.prepared.owner_peer_id))
+        || table
+            .checkpoints
+            .iter()
+            .any(|checkpoint| !roster.contains(&checkpoint.owner_peer_id))
+        || !table.active_leases.is_empty()
+        || !table.repair_pending_owner_enrollment_ids.is_empty()
+    {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    if let Some(pending) = table.pending_enrollments.first() {
+        return Ok(PrivateOramOwnerEnrollmentNextStepV1::Activate {
+            prepared: Box::new(pending.prepared.clone()),
+        });
+    }
+    Ok(roster
+        .into_iter()
+        .find(|owner_peer_id| {
+            !table
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_peer_id == *owner_peer_id)
+        })
+        .map_or(
+            PrivateOramOwnerEnrollmentNextStepV1::Complete,
+            |owner_peer_id| PrivateOramOwnerEnrollmentNextStepV1::Prepare { owner_peer_id },
+        ))
+}
+
+/// The prepared enrollment of one owner, scoped to the table's activation. `membership_epoch`
+/// is used only while the table has no roster epoch yet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn private_oram_owner_enrollment_prepared_for_table_v1(
+    table: &PrivateOramOwnerCheckpointTableV1,
+    collection_id: &str,
+    membership_epoch: u64,
+    owner_peer_id: u64,
+    owner_signer: PrivateOramOwnerCleanupSignerV1,
+    owner_store_incarnation_digest: String,
+    owner_enrollment_id: String,
+    enrollment_operation_id: String,
+    authority_registry_digest: String,
+    owner_registry_digest: String,
+) -> Result<PrivateOramOwnerEnrollmentPreparedV1, PrivateOramMutationJournalError> {
+    validate_private_oram_owner_checkpoint_table_v1(table)?;
+    if private_oram_collection_id_digest_v2(collection_id)? != table.collection_key_digest {
+        return Err(PrivateOramMutationJournalError::InvalidInput(
+            "collection_id",
+        ));
+    }
+    let expected_genesis_state =
+        private_oram_owner_lifecycle_genesis_state_v1(owner_store_incarnation_digest.clone())
+            .map_err(|_| PrivateOramMutationJournalError::InvalidInput("owner_store"))?;
+    prepare_private_oram_owner_enrollment_v1(PrivateOramOwnerEnrollmentPreparedV1 {
+        version: PRIVATE_ORAM_OWNER_ENROLLMENT_PROTOCOL_VERSION_V1,
+        consensus_history_id_digest: table.consensus_history_id_digest.clone(),
+        raft_group_id_digest: table.raft_group_id_digest.clone(),
+        collection_id: collection_id.to_string(),
+        collection_lifetime_id_digest: table.collection_lifetime_id_digest.clone(),
+        collection_incarnation_digest: table.collection_incarnation_digest.clone(),
+        activation_anchor_digest: table.activation_anchor_digest.clone(),
+        capability_epoch: table.capability_epoch,
+        protocol_capability_digest: table.protocol_capability_digest.clone(),
+        membership_epoch: table.roster_membership_epoch.unwrap_or(membership_epoch),
+        owner_enrollment_id,
+        owner_peer_id,
+        owner_signer,
+        owner_store_incarnation_digest,
+        expected_genesis_state,
+        authority_registry_digest,
+        owner_registry_digest,
+        enrollment_operation_id,
+        prepared_record_digest: String::new(),
+    })
+    .map_err(|_| PrivateOramMutationJournalError::InvalidInput("owner_enrollment"))
 }
 
 pub(crate) fn private_oram_owner_checkpoint_reservation_context_v1(

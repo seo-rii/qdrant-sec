@@ -2076,6 +2076,24 @@ pub fn build_private_hnsw_oram_plaintext_index_from_blocks(
     })
 }
 
+/// Reserves `reserved_physical_slots` empty slots of a plaintext build as free headroom
+/// instead of counting them as dummy nodes. Sealing counts every empty slot as a dummy, which
+/// leaves an index at full occupancy; an index that will enroll into private ORAM mutation V2
+/// must keep the immutable manifest's reserved physical slots free (the sealed bytes do not
+/// change, only the declared occupancy).
+pub fn reserve_private_hnsw_oram_physical_slots(
+    build: &mut PrivateHnswPlaintextIndexBuild,
+    reserved_physical_slots: u64,
+) -> Result<(), PrivateHnswClientError> {
+    if reserved_physical_slots == 0 || reserved_physical_slots > build.dummy_node_count {
+        return Err(PrivateHnswClientError::InvalidBuildConfig(
+            "reserved_physical_slots",
+        ));
+    }
+    build.dummy_node_count -= reserved_physical_slots;
+    Ok(())
+}
+
 pub fn build_private_hnsw_oram_plaintext_index_from_f32_points(
     config: PrivateHnswOramClientConfig,
     distance: DistanceKind,
@@ -8897,6 +8915,13 @@ mod tests {
                 - 3
         );
         assert_eq!(build.state.position(&near.node_id), Some(1));
+
+        let full = build.dummy_node_count;
+        let mut reserved = build.clone();
+        reserve_private_hnsw_oram_physical_slots(&mut reserved, 2).unwrap();
+        assert_eq!(reserved.dummy_node_count, full - 2);
+        assert!(reserve_private_hnsw_oram_physical_slots(&mut reserved.clone(), 0).is_err());
+        assert!(reserve_private_hnsw_oram_physical_slots(&mut reserved.clone(), full - 1).is_err());
 
         let store = RefCell::new(
             build

@@ -2799,6 +2799,22 @@ impl PrivateOramOwnerPrestageStoreV2 {
         ))
     }
 
+    /// Creates the owner store namespace if needed and returns its lifecycle state. Owner
+    /// enrollment (docs/private-oram-v2-enrollment.md) requires the genesis state.
+    pub fn ensure_lifecycle_state_v2(
+        &self,
+    ) -> Result<PrivateOramOwnerLifecycleStateV1, PrivateOramOwnerJournalError> {
+        self.ensure_layout()?;
+        let (owner_temp, root) = self.open_lifecycle_root_namespaces()?;
+        let _lock = lock_private_oram_owner_lifecycle_root_shared(
+            &owner_temp,
+            self.owner_temp_path()?,
+            &root,
+            &self.root,
+        )?;
+        self.load_superblock_locked(&root)?.lifecycle_state()
+    }
+
     pub fn inspect_lifecycle_v2(
         &self,
         intent_key: &str,

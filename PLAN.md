@@ -1523,6 +1523,16 @@ Signed fields:
   collection enrollment(`InitializePrivateOramMutationState`, owner enrollment prepare/activate)를
   제안하는 production 경로가 없어 실제 binary에서 mutation open/append는 불가능하다. Multi-process
   append E2E 전에 enrollment 경로 설계가 필요하다.
+- 2026-10-12: V2 collection enrollment 경로를 구현했다(`docs/private-oram-v2-enrollment.md`).
+  `EnrollPrivateOramMutationCollectionV2` consensus op(activation 이후 genesis 초기화와 authority
+  activation), `POST .../v2/mutation/enrollment-template`와 `.../enroll` route, leader가 layout
+  roster의 owner를 하나씩 등록하는 owner enrollment ceremony(internal RPC
+  `DescribePrivateOramMutationOwnerStoreV2`/`SignPrivateOramMutationOwnerEnrollmentV2`)가 있다.
+  Pinned single-peer process E2E(`test_private_oram_v2_enrollment.py`)가 activation, upload,
+  V1 write-back, template, client 서명, enroll, owner checkpoint, V2 session open까지 통과한다.
+  V1 build가 빈 slot을 모두 dummy로 선언해 V2 capacity(reserved slot ≥ 1)를 만족할 수 없던
+  문제는 `reserve_private_hnsw_oram_physical_slots`로 해결했다. TLS cluster의 multi-owner
+  enrollment와 V2 append E2E는 남아 있다.
 
 완료 조건:
 

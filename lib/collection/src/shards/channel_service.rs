@@ -6,15 +6,15 @@ use api::grpc::private_oram_chunking::encode_private_oram_install_chunks;
 use api::grpc::qdrant::qdrant_internal_client::QdrantInternalClient;
 use api::grpc::qdrant::{
     AdoptPrivateOramMutationOwnerV2Request, CompletePrivateOramWritebackRequest,
-    InstallPrivateOramIndexRequest, InstallPrivateOramIndexResponse,
-    InstallPrivateOramLiveReplicaRequest, InstallPrivateOramLiveReplicaResponse,
-    InstallPrivateOramOwnerRecoveryCapsuleV2Request,
+    DescribePrivateOramMutationOwnerStoreV2Request, InstallPrivateOramIndexRequest,
+    InstallPrivateOramIndexResponse, InstallPrivateOramLiveReplicaRequest,
+    InstallPrivateOramLiveReplicaResponse, InstallPrivateOramOwnerRecoveryCapsuleV2Request,
     PreparePrivateOramMutationOwnerReservationV3Request, PreparePrivateOramWritebackRequest,
     PrestagePrivateOramMutationOwnerV2Request, PrestagePrivateOramMutationOwnerV2Response,
     RecoverPrivateOramMutationOwnerRequest, RequestPrivateOramReshardingResumeRequest,
     RequestPrivateOramReshardingResumeResponse, RequestPrivateOramShardRecoveryRequest,
     RequestPrivateOramShardRecoveryResponse, ResolvePrivateOramMutationOwnerReservationV3Request,
-    WaitOnConsensusCommitRequest,
+    SignPrivateOramMutationOwnerEnrollmentV2Request, WaitOnConsensusCommitRequest,
 };
 use api::grpc::transport_channel_pool::{AddTimeout, DEFAULT_RETRIES, TransportChannelPool};
 use futures::future::try_join_all;
@@ -28,17 +28,18 @@ use qdrant_sec::{
     PRIVATE_ORAM_OWNER_PRESTAGE_RECEIPT_MAX_CANONICAL_BYTES_V2, PrivateOramOwnerAdoptionRequestV1,
     PrivateOramOwnerAdoptionResponseV1, PrivateOramOwnerCapsuleInstallRequestV2,
     PrivateOramOwnerCapsuleInstallResponseV2, PrivateOramOwnerCleanupSignerV1,
-    PrivateOramOwnerLifecycleStateV1, PrivateOramOwnerPrestageRequestV2,
-    PrivateOramOwnerPrestageResponseV2, PrivateOramOwnerReservationPrepareChallengeV1,
-    PrivateOramOwnerReservationPrepareV1, PrivateOramOwnerReservationResolutionDispositionV1,
-    PrivateOramPeerRecoveryPublicKeyV1, PrivateOramPeerRecoveryRequestV2,
-    PrivateOramPeerRecoverySignatureV2, PrivateOramPeerRecoveryTerminalV2,
-    SignedPrivateOramOwnerReservationResolutionReceiptV1,
+    PrivateOramOwnerEnrollmentGenesisCommitmentV1, PrivateOramOwnerLifecycleStateV1,
+    PrivateOramOwnerPrestageRequestV2, PrivateOramOwnerPrestageResponseV2,
+    PrivateOramOwnerReservationPrepareChallengeV1, PrivateOramOwnerReservationPrepareV1,
+    PrivateOramOwnerReservationResolutionDispositionV1, PrivateOramPeerRecoveryPublicKeyV1,
+    PrivateOramPeerRecoveryRequestV2, PrivateOramPeerRecoverySignatureV2,
+    PrivateOramPeerRecoveryTerminalV2, SignedPrivateOramOwnerReservationResolutionReceiptV1,
     VerifiedPrivateOramOwnerCapsuleInstallAttestationV2,
     VerifiedPrivateOramOwnerCapsuleInstallResponseV2,
     VerifiedPrivateOramOwnerPrestageAttestationV2, VerifiedPrivateOramOwnerPrestageResponseV2,
     VerifiedPrivateOramOwnerReservationPrepareV1, VerifiedPrivateOramPeerRecoveryResponseV2,
     decode_private_oram_owner_capsule_install_attestation_v2,
+    decode_private_oram_owner_enrollment_genesis_commitment_v1,
     decode_private_oram_owner_prestage_attestation_v2,
     decode_private_oram_owner_reservation_prepare_v1,
     decode_signed_private_oram_owner_reservation_resolution_receipt_v1,
@@ -327,6 +328,27 @@ pub struct ChannelService {
 
     /// Alternative API key, works the same as `api_key`. Intended for rolling key updates.
     pub alt_api_key: Option<String>,
+}
+
+const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_RESPONSE_BYTES_V2: usize = 64 * 1024;
+
+fn validate_private_oram_owner_enrollment_names_v2(
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> CollectionResult<()> {
+    if collection_name.is_empty()
+        || collection_name.len() > PRIVATE_ORAM_OWNER_RESERVATION_RESOURCE_NAME_MAX_BYTES_V1
+        || vector_name.is_empty()
+        || vector_name.len() > PRIVATE_ORAM_OWNER_RESERVATION_RESOURCE_NAME_MAX_BYTES_V1
+        || owner_signing_key_id.is_empty()
+        || owner_signing_key_id.len() > PRIVATE_ORAM_OWNER_RESERVATION_SIGNING_KEY_ID_MAX_BYTES_V1
+    {
+        return Err(CollectionError::service_error(
+            "private ORAM owner enrollment request is invalid",
+        ));
+    }
+    Ok(())
 }
 
 impl ChannelService {
@@ -1424,6 +1446,148 @@ impl ChannelService {
             )));
         }
         Ok(Some(signed_receipt))
+    }
+
+    /// Asks an owner to create its empty owner store for a V2 enrollment. The caller checks
+    /// the returned signer against the owner's pin and the state against the genesis state.
+    pub async fn describe_private_oram_mutation_owner_store_v2(
+        &self,
+        peer_id: PeerId,
+        collection_name: &str,
+        vector_name: &str,
+        owner_signing_key_id: &str,
+    ) -> CollectionResult<(
+        PrivateOramOwnerCleanupSignerV1,
+        PrivateOramOwnerLifecycleStateV1,
+    )> {
+        validate_private_oram_owner_enrollment_names_v2(
+            collection_name,
+            vector_name,
+            owner_signing_key_id,
+        )?;
+        let wire_request = DescribePrivateOramMutationOwnerStoreV2Request {
+            collection_name: collection_name.to_string(),
+            vector_name: vector_name.to_string(),
+            owner_signing_key_id: owner_signing_key_id.to_string(),
+        };
+        let address = self.private_oram_owner_enrollment_address_v2(peer_id)?;
+        let response = self
+            .channel_pool
+            .with_channel_timeout(
+                &address,
+                |channel| {
+                    let mut client = QdrantInternalClient::new(channel).max_decoding_message_size(
+                        PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_RESPONSE_BYTES_V2,
+                    );
+                    let request = wire_request.clone();
+                    async move {
+                        client
+                            .describe_private_oram_mutation_owner_store_v2(Request::new(request))
+                            .await
+                    }
+                },
+                None,
+                DEFAULT_RETRIES,
+            )
+            .await
+            .map_err(|_| {
+                CollectionError::service_error(format!(
+                    "private ORAM owner store description failed on peer {peer_id}"
+                ))
+            })?
+            .into_inner();
+        let invalid = || {
+            CollectionError::service_error(
+                "private ORAM owner store description response is invalid",
+            )
+        };
+        let signer: PrivateOramOwnerCleanupSignerV1 =
+            serde_json::from_slice(&response.owner_signer_canonical_json).map_err(|_| invalid())?;
+        let lifecycle_state: PrivateOramOwnerLifecycleStateV1 =
+            serde_json::from_slice(&response.lifecycle_state_canonical_json)
+                .map_err(|_| invalid())?;
+        if self.id_to_address.read().get(&peer_id) != Some(&address) {
+            return Err(CollectionError::service_error(format!(
+                "private ORAM owner enrollment authority changed on peer {peer_id}"
+            )));
+        }
+        Ok((signer, lifecycle_state))
+    }
+
+    /// Asks an owner to sign the genesis commitment of its committed prepared enrollment. The
+    /// caller verifies the commitment against the committed prepared record before proposing.
+    pub async fn sign_private_oram_mutation_owner_enrollment_v2(
+        &self,
+        peer_id: PeerId,
+        collection_name: &str,
+        vector_name: &str,
+        owner_signing_key_id: &str,
+    ) -> CollectionResult<PrivateOramOwnerEnrollmentGenesisCommitmentV1> {
+        validate_private_oram_owner_enrollment_names_v2(
+            collection_name,
+            vector_name,
+            owner_signing_key_id,
+        )?;
+        let wire_request = SignPrivateOramMutationOwnerEnrollmentV2Request {
+            collection_name: collection_name.to_string(),
+            vector_name: vector_name.to_string(),
+            owner_signing_key_id: owner_signing_key_id.to_string(),
+        };
+        let address = self.private_oram_owner_enrollment_address_v2(peer_id)?;
+        let response = self
+            .channel_pool
+            .with_channel_timeout(
+                &address,
+                |channel| {
+                    let mut client = QdrantInternalClient::new(channel).max_decoding_message_size(
+                        PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_RESPONSE_BYTES_V2,
+                    );
+                    let request = wire_request.clone();
+                    async move {
+                        client
+                            .sign_private_oram_mutation_owner_enrollment_v2(Request::new(request))
+                            .await
+                    }
+                },
+                None,
+                DEFAULT_RETRIES,
+            )
+            .await
+            .map_err(|_| {
+                CollectionError::service_error(format!(
+                    "private ORAM owner enrollment signing failed on peer {peer_id}"
+                ))
+            })?
+            .into_inner();
+        let commitment = decode_private_oram_owner_enrollment_genesis_commitment_v1(
+            &response.commitment_canonical_json,
+        )
+        .map_err(|_| {
+            CollectionError::service_error("private ORAM owner enrollment response is invalid")
+        })?;
+        if commitment.owner_peer_id != peer_id
+            || self.id_to_address.read().get(&peer_id) != Some(&address)
+        {
+            return Err(CollectionError::service_error(format!(
+                "private ORAM owner enrollment authority changed on peer {peer_id}"
+            )));
+        }
+        Ok(commitment)
+    }
+
+    fn private_oram_owner_enrollment_address_v2(&self, peer_id: PeerId) -> CollectionResult<Uri> {
+        let address = self
+            .id_to_address
+            .read()
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| CollectionError::service_error("Address for peer ID is not found."))?;
+        if !self.channel_pool.tls_configured() || address.scheme_str() != Some("https") {
+            return Err(CollectionError::service_error(
+                "private ORAM owner enrollment requires a configured TLS endpoint",
+            ));
+        }
+        Ok(address)
     }
 
     #[allow(clippy::too_many_arguments)]

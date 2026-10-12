@@ -9,11 +9,13 @@ use api::grpc::private_oram_chunking::{
 use api::grpc::qdrant_internal_server::QdrantInternal;
 use api::grpc::{
     AdoptPrivateOramMutationOwnerV2Request, AdoptPrivateOramMutationOwnerV2Response,
-    CompletePrivateOramWritebackRequest, CompletePrivateOramWritebackResponse, GetAuditLogRequest,
-    GetAuditLogResponse, GetConsensusCommitRequest, GetConsensusCommitResponse,
-    GetTelemetryRequest, GetTelemetryResponse, InstallPrivateOramIndexRequest,
-    InstallPrivateOramIndexResponse, InstallPrivateOramLiveReplicaRequest,
-    InstallPrivateOramLiveReplicaResponse, InstallPrivateOramOwnerRecoveryCapsuleV2Request,
+    CompletePrivateOramWritebackRequest, CompletePrivateOramWritebackResponse,
+    DescribePrivateOramMutationOwnerStoreV2Request,
+    DescribePrivateOramMutationOwnerStoreV2Response, GetAuditLogRequest, GetAuditLogResponse,
+    GetConsensusCommitRequest, GetConsensusCommitResponse, GetTelemetryRequest,
+    GetTelemetryResponse, InstallPrivateOramIndexRequest, InstallPrivateOramIndexResponse,
+    InstallPrivateOramLiveReplicaRequest, InstallPrivateOramLiveReplicaResponse,
+    InstallPrivateOramOwnerRecoveryCapsuleV2Request,
     InstallPrivateOramOwnerRecoveryCapsuleV2Response, PeerTelemetry,
     PreparePrivateOramMutationOwnerReservationV3Request,
     PreparePrivateOramMutationOwnerReservationV3Response, PreparePrivateOramWritebackRequest,
@@ -25,7 +27,9 @@ use api::grpc::{
     RecoverPrivateOramMutationOwnerResponse, RequestPrivateOramReshardingResumeRequest,
     RequestPrivateOramReshardingResumeResponse, RequestPrivateOramShardRecoveryRequest,
     RequestPrivateOramShardRecoveryResponse, ResolvePrivateOramMutationOwnerReservationV3Request,
-    ResolvePrivateOramMutationOwnerReservationV3Response, WaitOnConsensusCommitRequest,
+    ResolvePrivateOramMutationOwnerReservationV3Response,
+    SignPrivateOramMutationOwnerEnrollmentV2Request,
+    SignPrivateOramMutationOwnerEnrollmentV2Response, WaitOnConsensusCommitRequest,
     WaitOnConsensusCommitResponse, install_private_oram_index_request,
     install_private_oram_live_replica_request,
 };
@@ -479,7 +483,40 @@ pub struct QdrantInternalService {
 /// deadlock; a saturated lock is reported as a retryable unavailability instead.
 const PRIVATE_ORAM_REPLICATION_LOCK_WAIT: Duration = Duration::from_secs(30);
 
+fn validate_private_oram_owner_enrollment_request_v2(
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> Result<(), Status> {
+    if collection_name.is_empty()
+        || collection_name.len() > 255
+        || vector_name.is_empty()
+        || vector_name.len() > 255
+        || owner_signing_key_id.is_empty()
+        || owner_signing_key_id.len() > 256
+    {
+        return Err(Status::invalid_argument(
+            "private ORAM owner enrollment request is invalid",
+        ));
+    }
+    Ok(())
+}
+
 impl QdrantInternalService {
+    fn private_oram_owner_enrollment_identity_v2(
+        &self,
+    ) -> Result<&PrivateOramPeerRecoveryIdentity, Status> {
+        let identity = self.private_oram_peer_identity.as_deref().ok_or_else(|| {
+            Status::failed_precondition("private ORAM mutation V2 is not configured")
+        })?;
+        if identity.peer_id() != self.toc.this_peer_id {
+            return Err(Status::failed_precondition(
+                "private ORAM owner identity does not match this peer",
+            ));
+        }
+        Ok(identity)
+    }
+
     async fn acquire_private_oram_replication_lock(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, ()>, Status> {
@@ -4484,6 +4521,76 @@ impl QdrantInternal for QdrantInternalService {
             PreparePrivateOramMutationOwnerReservationV3Response {
                 prepare_canonical_json,
                 owner_public_key_canonical_json,
+            },
+        ))
+    }
+
+    async fn describe_private_oram_mutation_owner_store_v2(
+        &self,
+        request: Request<DescribePrivateOramMutationOwnerStoreV2Request>,
+    ) -> Result<Response<DescribePrivateOramMutationOwnerStoreV2Response>, Status> {
+        let identity = self.private_oram_owner_enrollment_identity_v2()?;
+        let wire = request.into_inner();
+        validate_private_oram_owner_enrollment_request_v2(
+            &wire.collection_name,
+            &wire.vector_name,
+            &wire.owner_signing_key_id,
+        )?;
+        let (owner_signer, lifecycle_state) =
+            private_oram_mutation::describe_private_oram_owner_store_v2(
+                &self.toc,
+                &self.settings,
+                &self.consensus_state,
+                identity,
+                &wire.collection_name,
+                &wire.vector_name,
+                &wire.owner_signing_key_id,
+            )
+            .await
+            .map_err(Status::from)?;
+        let encode_failed =
+            |_| Status::internal("private ORAM owner store description encoding failed");
+        Ok(Response::new(
+            DescribePrivateOramMutationOwnerStoreV2Response {
+                owner_signer_canonical_json: serde_json::to_vec(&owner_signer)
+                    .map_err(encode_failed)?,
+                lifecycle_state_canonical_json: serde_json::to_vec(&lifecycle_state)
+                    .map_err(encode_failed)?,
+            },
+        ))
+    }
+
+    async fn sign_private_oram_mutation_owner_enrollment_v2(
+        &self,
+        request: Request<SignPrivateOramMutationOwnerEnrollmentV2Request>,
+    ) -> Result<Response<SignPrivateOramMutationOwnerEnrollmentV2Response>, Status> {
+        let identity = self.private_oram_owner_enrollment_identity_v2()?;
+        let wire = request.into_inner();
+        validate_private_oram_owner_enrollment_request_v2(
+            &wire.collection_name,
+            &wire.vector_name,
+            &wire.owner_signing_key_id,
+        )?;
+        let _replication_lock = self.acquire_private_oram_replication_lock().await?;
+        let commitment = private_oram_mutation::sign_private_oram_owner_enrollment_v2(
+            &self.toc,
+            &self.settings,
+            &self.consensus_state,
+            identity,
+            &wire.collection_name,
+            &wire.vector_name,
+            &wire.owner_signing_key_id,
+        )
+        .await
+        .map_err(Status::from)?;
+        let commitment_canonical_json =
+            qdrant_sec::encode_private_oram_owner_enrollment_genesis_commitment_v1(&commitment)
+                .map_err(|_| {
+                    Status::internal("private ORAM owner enrollment commitment encoding failed")
+                })?;
+        Ok(Response::new(
+            SignPrivateOramMutationOwnerEnrollmentV2Response {
+                commitment_canonical_json,
             },
         ))
     }

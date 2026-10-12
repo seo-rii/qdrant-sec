@@ -29,6 +29,7 @@ use qdrant_sec::{
     PrivateOramOwnerCapsuleInstallAttestationStatementV2,
     PrivateOramOwnerCapsuleInstallAttestationV2, PrivateOramOwnerCapsuleInstallRequestV2,
     PrivateOramOwnerCapsuleInstallResponseV2, PrivateOramOwnerCleanupSignerV1,
+    PrivateOramOwnerEnrollmentGenesisCommitmentV1, PrivateOramOwnerEnrollmentPreparedV1,
     PrivateOramOwnerLifecycleStateV1, PrivateOramOwnerPrestageAttestationStatementV2,
     PrivateOramOwnerPrestageAttestationV2, PrivateOramOwnerPrestageRequestV2,
     PrivateOramOwnerPrestageResponseV2, PrivateOramOwnerReservationPrepareChallengeV1,
@@ -42,6 +43,7 @@ use qdrant_sec::{
     sign_private_oram_owner_capsule_install_attestation_v2,
     sign_private_oram_owner_capsule_install_request_v2,
     sign_private_oram_owner_capsule_install_response_v2,
+    sign_private_oram_owner_enrollment_genesis_commitment_v1,
     sign_private_oram_owner_prestage_attestation_v2, sign_private_oram_owner_prestage_request_v2,
     sign_private_oram_owner_prestage_response_v2, sign_private_oram_owner_reservation_prepare_v1,
     sign_private_oram_owner_reservation_resolution_receipt_v1,
@@ -305,6 +307,20 @@ impl PrivateOramPeerRecoveryIdentity {
             self.owner_cleanup_signer()?,
         )
         .map_err(|_| PrivateOramPeerIdentityError::CryptographicValidationFailed)
+    }
+
+    /// Signs this owner's genesis commitment for a committed prepared enrollment.
+    pub(crate) fn sign_owner_enrollment_genesis(
+        &self,
+        prepared: &PrivateOramOwnerEnrollmentPreparedV1,
+    ) -> Result<PrivateOramOwnerEnrollmentGenesisCommitmentV1, PrivateOramPeerIdentityError> {
+        if prepared.owner_peer_id != self.peer_id
+            || prepared.owner_signer != self.owner_cleanup_signer()?
+        {
+            return Err(PrivateOramPeerIdentityError::PeerIdMismatch);
+        }
+        sign_private_oram_owner_enrollment_genesis_commitment_v1(&self.key_pair, prepared)
+            .map_err(|_| PrivateOramPeerIdentityError::CryptographicValidationFailed)
     }
 
     pub(crate) fn sign_owner_reservation_resolution(

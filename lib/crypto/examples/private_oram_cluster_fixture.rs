@@ -14,10 +14,10 @@ use qdrant_sec::{
     encode_private_hnsw_oram_leaf_label, plan_private_hnsw_oram_commit_for_manifest,
     private_hnsw_bucket_commitment, private_result_oram_bucket_ciphertext_bytes,
     private_result_oram_bucket_commitment, private_result_oram_merkle_root_for_commitments,
-    seal_private_hnsw_oram_plaintext_index, sign_private_hnsw_oram_commit,
-    sign_private_hnsw_oram_manifest, sign_private_hnsw_oram_read_paths_for_manifest_context,
-    sign_private_result_oram_commit, sign_private_result_oram_manifest,
-    sign_private_result_oram_read_buckets,
+    reserve_private_hnsw_oram_physical_slots, seal_private_hnsw_oram_plaintext_index,
+    sign_private_hnsw_oram_commit, sign_private_hnsw_oram_manifest,
+    sign_private_hnsw_oram_read_paths_for_manifest_context, sign_private_result_oram_commit,
+    sign_private_result_oram_manifest, sign_private_result_oram_read_buckets,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::json;
@@ -198,7 +198,7 @@ fn hnsw_fixture(
         fixed_neighbor_slots: 4,
     };
     let points = fixture_points();
-    let plaintext = build_private_hnsw_oram_plaintext_index_from_auto_layered_f32_points(
+    let mut plaintext = build_private_hnsw_oram_plaintext_index_from_auto_layered_f32_points(
         config,
         DistanceKind::Euclid,
         2,
@@ -207,6 +207,11 @@ fn hnsw_fixture(
         &points,
         &[0, 1, 2],
     )?;
+    // `QDRANT_PRIVATE_ORAM_FIXTURE_RESERVED_SLOTS=<n>` keeps n physical slots free, as an index
+    // that will enroll into private ORAM mutation V2 must.
+    if let Ok(reserved) = env::var("QDRANT_PRIVATE_ORAM_FIXTURE_RESERVED_SLOTS") {
+        reserve_private_hnsw_oram_physical_slots(&mut plaintext, reserved.parse()?)?;
+    }
     let keys = PrivateHnswClientKeys::derive_from_resource_key_with_context(
         &SecretKey::from_bytes([13; 32]),
         collection_id,

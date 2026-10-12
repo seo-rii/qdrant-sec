@@ -1,7 +1,8 @@
 # Private ORAM V2 Collection Enrollment (design draft)
 
-Status: draft for review; steps 1 (enrollment after activation in consensus)
-and 2 (the genesis route) are implemented, the owner ceremony is not. Today no production path creates a
+Status: steps 1 (enrollment after activation in consensus), 2 (the genesis
+route) and 3 (the owner enrollment ceremony) are implemented; the client
+procedure is exercised by `tests/consensus_tests/test_private_oram_v2_enrollment.py`. Today no production path creates a
 collection's V2 consensus state, so `POST .../private-oram/v2/mutation/open`
 always fails on a real deployment (see docs/ckks.md, "multi-process V2
 activation"). This document proposes the missing enrollment path.
@@ -56,8 +57,10 @@ activation"). This document proposes the missing enrollment path.
    digest. Then it asks the owner over internal gRPC to create its empty owner
    namespace durably and return the signed genesis commitment, and proposes
    Activated. It re-reads the aggregate digest before every proposal.
-4. **Client procedure.** Upload V1 index, perform one V1 write-back per index,
-   call `enroll`, then open/append. The genesis `client_state_digest` is the
+4. **Client procedure.** Build the V1 index with free headroom
+   (`reserve_private_hnsw_oram_physical_slots`), upload it, perform one V1
+   write-back per index, read `enrollment-template`, sign the immutable manifest
+   and genesis state, call `enroll`, then open/append. The genesis `client_state_digest` is the
    digest of the client's sealed append checkpoint set
    (`private_oram_append_client_checkpoint_v2_digest`); the client must escrow
    that checkpoint before enrolling.
@@ -89,14 +92,50 @@ activation"). This document proposes the missing enrollment path.
   session registry (`PrivateHnswSessionOwner::PairedMutation`) and never takes the
   consensus V1 session lease that enrolled collections refuse, so enrollment does
   not block it.
-- Not implemented yet: the owner enrollment ceremony and the client procedure.
+- Step 3: after proposing the genesis state (or on a retry of the same one),
+  the route runs `run_private_oram_owner_enrollment_v2`. Each step re-reads
+  committed state through `ConsensusManager::private_oram_mutation_v2_owner_enrollment_step`:
+  - `Prepare { owner }`: the owner creates its empty owner store namespace
+    (`PrivateOramOwnerPrestageStoreV2::ensure_lifecycle_state_v2`) and reports
+    its signer and lifecycle state (`DescribePrivateOramMutationOwnerStoreV2`,
+    or a local call when the owner is the leader). The leader requires the
+    genesis lifecycle state and the owner's pinned activation-manifest signer,
+    and proposes Prepared with fresh enrollment and operation ids. The
+    membership epoch is the layout generation; the authority and owner
+    registry digests are the activation manifest digest and the layout digest.
+  - `Activate { owner }`: the owner reads its committed prepared record,
+    checks its owner store is still exactly the named empty store, and signs
+    the genesis commitment with its peer identity
+    (`SignPrivateOramMutationOwnerEnrollmentV2`). The leader verifies the
+    commitment against the committed prepared record and proposes Activated.
+  - `Complete`: every owner in `layout.owner_peer_ids` holds an enrollment
+    checkpoint. Owners enroll one at a time, in peer id order.
+  Remote owner calls require a TLS internal endpoint, like the other owner RPCs.
+- `POST /collections/{c}/private-oram/v2/mutation/enrollment-template`
+  (`{vector_name}`) returns the layout generation and digest and each index's
+  consensus epoch, root and write-back digest, which the client binds into its
+  genesis state, plus whether the collection is already enrolled.
+
+## Findings from the cluster test
+
+- A V1 build counts every empty slot as a dummy node, so every uploaded index
+  declares full occupancy. The V2 immutable manifest needs
+  `logical_capacity == logical + dummy` and at least one reserved physical slot,
+  so such an index can never enroll. Clients that intend to enroll reserve
+  headroom before sealing with `reserve_private_hnsw_oram_physical_slots`; the
+  sealed bytes are unchanged, only the declared dummy count drops.
+- A collection without layout transitions has no consensus layout record. The
+  template reports generation 1 of its stable shard layout over the current
+  index epochs (`Dispatcher::private_oram_enrollment_layout`), and `enroll`
+  records exactly that layout before proposing the genesis state.
+- `tests/consensus_tests/test_private_oram_v2_enrollment.py` covers a pinned
+  single peer that is both leader and owner (owner RPCs need TLS). A
+  multi-owner run needs a TLS test cluster.
 
 ## Risks and open questions
 
 - The floor-aware Initialize is new consensus behavior: needs the version gate,
   snapshot acceptance review (`plan_private_oram_mutation_authority_floor_acceptance_v2`)
   and a restart/replay test.
-- How the owner's peer-identity key signs genesis commitments locally (key
-  custody in the owner store) is not wired yet.
 - Non-empty legacy owner stores: import is undefined; enrollment requires an
   empty owner namespace.

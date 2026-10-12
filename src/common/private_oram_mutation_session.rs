@@ -34,11 +34,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::content_manager::consensus_manager::PrivateOramMutationV2ActivationStatus;
 use storage::content_manager::consensus_ops::{
-    InitializePrivateOramMutationState, PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
-    PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
-    PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2, PrivateOramEpochKey,
-    PrivateOramIndexKind, PrivateOramLayoutKey, PrivateOramMutationKey,
-    PrivateOramMutationLeaseSlotV2,
+    CompareAndSwapPrivateOramLayout, InitializePrivateOramMutationState,
+    PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION, PrivateOramConsensusCollectionIndexStateV2,
+    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusLayout,
+    PrivateOramConsensusTransitionV2, PrivateOramEpochKey, PrivateOramIndexKind,
+    PrivateOramLayoutKey, PrivateOramMutationKey, PrivateOramMutationLeaseSlotV2,
 };
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::private_oram_mutation_journal::{
@@ -58,6 +58,7 @@ use super::private_hnsw::{
     do_read_private_hnsw_paths_for_paired_mutation,
     release_private_hnsw_session_for_paired_mutation, resolve_private_hnsw_context_from_snapshot,
 };
+use super::private_oram_mutation::run_private_oram_owner_enrollment_v2;
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_result_oram::{
     PrivateResultOramReadBucketsResponse, PrivateResultOramSessionResponse,
@@ -185,6 +186,53 @@ impl Debug for PrivateOramMutationEnrollInputV2 {
             .field("vector_name", &"[redacted]")
             .field("immutable_manifest", &"[redacted]")
             .field("genesis_state", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateOramMutationEnrollmentTemplateInputV2 {
+    pub vector_name: String,
+}
+
+impl Debug for PrivateOramMutationEnrollmentTemplateInputV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationEnrollmentTemplateInputV2")
+            .field("vector_name", &"[redacted]")
+            .finish()
+    }
+}
+
+/// The consensus values a client binds into its signed genesis state.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationEnrollmentTemplateV2 {
+    pub collection_id: String,
+    pub layout_generation: u64,
+    pub layout_digest: String,
+    pub enrolled: bool,
+    pub indexes: Vec<PrivateOramMutationEnrollmentTemplateIndexV2>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationEnrollmentTemplateIndexV2 {
+    pub kind: PrivateOramIndexKindV2,
+    pub index_name: String,
+    pub index_epoch: u64,
+    pub root_hash: String,
+    pub writeback_digest: Option<String>,
+}
+
+impl Debug for PrivateOramMutationEnrollmentTemplateV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationEnrollmentTemplateV2")
+            .field("collection_id", &"[redacted]")
+            .field("layout_generation", &self.layout_generation)
+            .field("layout_digest", &"[redacted]")
+            .field("enrolled", &self.enrolled)
+            .field("index_count", &self.indexes.len())
             .finish()
     }
 }
@@ -1918,11 +1966,13 @@ pub(crate) async fn do_open_private_oram_mutation_session_v2(
 /// docs/private-oram-v2-enrollment.md). The client signs the immutable manifest and the
 /// genesis state with its pinned owner key; the server verifies both, recomputes every
 /// digest, checks them against the live V1 manifests and the consensus epochs and layout,
-/// and proposes the genesis state. Re-enrolling the same genesis state succeeds.
+/// and proposes the genesis state. It then enrolls every owner in the layout roster. A retry
+/// with the same genesis state resumes the owner enrollment.
 pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
     dispatcher: &Dispatcher,
     auth: &Auth,
     settings: &Settings,
+    identity: &PrivateOramPeerRecoveryIdentity,
     collection_name: &str,
     input: PrivateOramMutationEnrollInputV2,
 ) -> StorageResult<PrivateOramMutationEnrollResponseV2> {
@@ -1969,12 +2019,8 @@ pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
     let key = PrivateOramMutationKey {
         collection_id: collection_id.clone(),
     };
-    let layout = dispatcher
-        .private_oram_consensus_layout(&PrivateOramLayoutKey {
-            collection_id: collection_id.clone(),
-        })?
-        .ok_or_else(invalid_enrollment)?;
     let mut indexes = Vec::with_capacity(input.genesis_state.state.indexes.len());
+    let mut epoch_keys = Vec::with_capacity(input.genesis_state.state.indexes.len());
     for signed in &input.genesis_state.state.indexes {
         let (index_kind, index_name) = match signed.kind {
             PrivateOramIndexKindV2::Hnsw => (PrivateOramIndexKind::Hnsw, signed.index_name.clone()),
@@ -1997,6 +2043,7 @@ pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
         {
             return Err(invalid_enrollment());
         }
+        epoch_keys.push(epoch_key);
         indexes.push(PrivateOramConsensusCollectionIndexStateV2 {
             index_kind,
             index_name,
@@ -2005,6 +2052,9 @@ pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
             dummy_count: signed.dummy_count,
         });
     }
+    let (layout, layout_recorded) = dispatcher
+        .private_oram_enrollment_layout(&collection.name().to_string(), &collection_id, &epoch_keys)
+        .await?;
     let genesis = &input.genesis_state.state;
     if layout.generation != genesis.layout_generation
         || layout.layout_digest != genesis.layout_digest
@@ -2023,22 +2073,86 @@ pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
         client_state_digest: genesis.client_state_digest.clone(),
         last_transition: PrivateOramConsensusTransitionV2::Genesis,
     };
-    match dispatcher.private_oram_consensus_mutation_state(&key)? {
-        Some(current) if current == state => return Ok(response),
+    let already_enrolled = match dispatcher.private_oram_consensus_mutation_state(&key)? {
+        Some(current) if current == state => true,
         Some(_) => {
             return Err(StorageError::bad_request(
                 "collection is already enrolled in private ORAM mutation V2",
             ));
         }
-        None => {}
+        None => false,
+    };
+    if !already_enrolled {
+        if !layout_recorded {
+            // A collection without layout transitions has no recorded layout yet; record the
+            // exact layout the client signed before its genesis state binds it.
+            dispatcher
+                .submit_private_oram_layout_cas(
+                    CompareAndSwapPrivateOramLayout {
+                        key: PrivateOramLayoutKey {
+                            collection_id: collection_id.clone(),
+                        },
+                        expected: None,
+                        new: layout,
+                    },
+                    None,
+                )
+                .await?;
+        }
+        propose_private_oram_genesis_state_v2(
+            dispatcher,
+            toc,
+            auth,
+            settings,
+            collection_name,
+            &input,
+            &collection_id,
+            leader,
+            InitializePrivateOramMutationState {
+                key: key.clone(),
+                state,
+            },
+        )
+        .await?;
     }
+
+    let consensus = dispatcher.consensus_state().ok_or_else(|| {
+        StorageError::service_error("private ORAM mutation V2 enrollment requires distributed mode")
+    })?;
+    run_private_oram_owner_enrollment_v2(
+        toc,
+        settings,
+        consensus,
+        identity,
+        collection_name,
+        &input.vector_name,
+        &input.immutable_manifest.manifest.owner_signing_key_id,
+        &key,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn propose_private_oram_genesis_state_v2(
+    dispatcher: &Dispatcher,
+    toc: &storage::content_manager::toc::TableOfContent,
+    auth: &Auth,
+    settings: &Settings,
+    collection_name: &str,
+    input: &PrivateOramMutationEnrollInputV2,
+    collection_id: &str,
+    leader: PrivateOramMutationLeaderTokenV2,
+    operation: InitializePrivateOramMutationState,
+) -> StorageResult<()> {
+    let genesis = &input.genesis_state.state;
 
     // Bind the signed manifest and genesis state to the live V1 indexes through the same
     // paired read sessions an open uses; they are released before the proposal.
     {
         let _reservation =
-            PrivateOramMutationOpenReservation::acquire(&collection_id, current_unix_secs()?)?;
-        let mut opened = PrivateOramOpenedIndexSessions::new(&collection_id, &input.vector_name);
+            PrivateOramMutationOpenReservation::acquire(collection_id, current_unix_secs()?)?;
+        let mut opened = PrivateOramOpenedIndexSessions::new(collection_id, &input.vector_name);
         let hnsw_session = do_open_private_hnsw_session_for_paired_mutation(
             toc,
             auth,
@@ -2084,12 +2198,80 @@ pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
         return Err(invalid_enrollment());
     }
     dispatcher
-        .submit_private_oram_mutation_enroll_v2(
-            InitializePrivateOramMutationState { key, state },
-            None,
-        )
+        .submit_private_oram_mutation_enroll_v2(operation, None)
+        .await
+}
+
+/// Reports the consensus layout and index epochs an enrolling client binds into its signed
+/// genesis state. Every value is a digest or counter the owner already holds or can derive.
+pub(crate) async fn private_oram_mutation_enrollment_template_v2(
+    dispatcher: &Dispatcher,
+    auth: &Auth,
+    collection_name: &str,
+    input: PrivateOramMutationEnrollmentTemplateInputV2,
+) -> StorageResult<PrivateOramMutationEnrollmentTemplateV2> {
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_enrollment_template_v2",
+    )?;
+    let verification_pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &verification_pass);
+    let collection = toc.get_collection(&pass).await?;
+    let collection_id = collection
+        .config_snapshot()
+        .await
+        .stable_crypto_id(collection.name())?;
+    let mut indexes = Vec::with_capacity(2);
+    let mut epoch_keys = Vec::with_capacity(2);
+    for (kind, index_kind, index_name) in [
+        (
+            PrivateOramIndexKindV2::Hnsw,
+            PrivateOramIndexKind::Hnsw,
+            input.vector_name.clone(),
+        ),
+        (
+            PrivateOramIndexKindV2::Result,
+            PrivateOramIndexKind::ResultPayload,
+            String::new(),
+        ),
+    ] {
+        let epoch_key = PrivateOramEpochKey {
+            collection_id: collection_id.clone(),
+            index_kind,
+            index_name: index_name.clone(),
+        };
+        match (kind, dispatcher.private_oram_consensus_epoch(&epoch_key)?) {
+            (_, Some(epoch)) => {
+                epoch_keys.push(epoch_key);
+                indexes.push(PrivateOramMutationEnrollmentTemplateIndexV2 {
+                    kind,
+                    // Empty for the result index, whose V2 name the client chooses.
+                    index_name,
+                    index_epoch: epoch.index_epoch,
+                    root_hash: epoch.root_hash,
+                    writeback_digest: epoch.writeback_digest,
+                });
+            }
+            (PrivateOramIndexKindV2::Hnsw, None) => return Err(invalid_enrollment()),
+            (PrivateOramIndexKindV2::Result, None) => {}
+        }
+    }
+    let (layout, _recorded) = dispatcher
+        .private_oram_enrollment_layout(&collection.name().to_string(), &collection_id, &epoch_keys)
         .await?;
-    Ok(response)
+    let enrolled = dispatcher
+        .private_oram_consensus_mutation_state(&PrivateOramMutationKey {
+            collection_id: collection_id.clone(),
+        })?
+        .is_some();
+    Ok(PrivateOramMutationEnrollmentTemplateV2 {
+        collection_id,
+        layout_generation: layout.generation,
+        layout_digest: layout.layout_digest,
+        enrolled,
+        indexes,
+    })
 }
 
 fn validate_enroll_crypto_material(

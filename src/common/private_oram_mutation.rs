@@ -17,8 +17,10 @@ use qdrant_sec::{
     PRIVATE_ORAM_OWNER_RESERVATION_RESOLUTION_VERSION_V1,
     PrivateOramAppendOwnerPrestageValidationContextV2, PrivateOramOwnerAdoptionRequestV1,
     PrivateOramOwnerCapsuleInstallAttestationStatementV2, PrivateOramOwnerCapsuleInstallRequestV2,
-    PrivateOramOwnerPrestagePackageV2, PrivateOramOwnerReservationPrepareChallengeV1,
-    PrivateOramOwnerReservationPrepareV1, PrivateOramOwnerReservationResolutionDispositionV1,
+    PrivateOramOwnerCleanupSignerV1, PrivateOramOwnerEnrollmentGenesisCommitmentV1,
+    PrivateOramOwnerLifecycleStateV1, PrivateOramOwnerPrestagePackageV2,
+    PrivateOramOwnerReservationPrepareChallengeV1, PrivateOramOwnerReservationPrepareV1,
+    PrivateOramOwnerReservationResolutionDispositionV1,
     PrivateOramOwnerReservationResolutionReceiptV1, PrivateOramVisiblePointRecordV1,
     ResultPrivacyMode, SignedPrivateOramOwnerReservationResolutionReceiptV1,
     VerifiedPrivateOramOwnerAdoptionRequestV1, VerifiedPrivateOramOwnerPrestageRequestV2,
@@ -27,7 +29,7 @@ use qdrant_sec::{
     new_private_oram_owner_capsule_install_challenge_nonce_v2,
     new_private_oram_owner_prestage_challenge_nonce_v2,
     new_private_oram_peer_recovery_challenge_nonce_v2, private_oram_immutable_manifest_v2_digest,
-    private_oram_owner_capsule_canonical_sha256_v2,
+    private_oram_owner_capsule_canonical_sha256_v2, private_oram_owner_lifecycle_genesis_state_v1,
     private_oram_owner_prestage_attestation_statement_v2, private_oram_owner_prestage_request_v2,
     private_oram_owner_prestage_response_v2, private_oram_owner_prestage_roster_digest_v2,
     private_oram_signed_state_v2_digest, private_oram_staged_insert_frame_v1_digest,
@@ -40,9 +42,9 @@ use qdrant_sec::{
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use storage::content_manager::consensus_manager::{
-    PrivateOramOwnerReservationPrepareContextV3, PrivateOramPeerRecoverySignerPairPin,
-    PrivateOramPeerRecoverySignerPin, PrivateOramReservationChallengeDispositionKindV3,
-    PrivateOramReservationChallengeDispositionV3,
+    PrivateOramOwnerEnrollmentStepV2, PrivateOramOwnerReservationPrepareContextV3,
+    PrivateOramPeerRecoverySignerPairPin, PrivateOramPeerRecoverySignerPin,
+    PrivateOramReservationChallengeDispositionKindV3, PrivateOramReservationChallengeDispositionV3,
 };
 use storage::content_manager::consensus_ops::{
     PrivateOramConsensusLayout, PrivateOramLayoutKey, PrivateOramMutationKey,
@@ -85,6 +87,8 @@ use super::private_result_oram::{
 use crate::settings::Settings;
 
 const PRIVATE_ORAM_RECOVERY_READINESS_WAIT: Duration = Duration::from_secs(60);
+/// Two proposals (prepared, activated) per owner, bounded by the owner table capacity.
+const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS: usize = 2 * 1_024 + 1;
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_ATTEMPTS: usize = 240;
 
@@ -200,6 +204,236 @@ pub(crate) async fn prepare_private_oram_owner_reservation_v3(
     )
     .map_err(|_| invalid_owner_prestage())?;
     Ok(prepare)
+}
+
+/// Resolves this owner's store for an enrolled collection whose layout lists it as an owner.
+async fn resolve_private_oram_enrollment_owner_store_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> StorageResult<(PrivateOramMutationKey, PrivateOramOwnerPrestageStoreV2)> {
+    let auth = Auth::new_internal(Access::full("private ORAM owner enrollment"));
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_owner_enrollment_v2",
+    )?;
+    let collection = toc.get_collection(&pass).await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+        settings,
+        collection.name(),
+        collection.path(),
+        &config,
+        vector_name,
+        owner_signing_key_id,
+    )?;
+    if hnsw_context.collection_crypto_id() != collection_id {
+        return Err(invalid_owner_enrollment());
+    }
+    let key = PrivateOramMutationKey { collection_id };
+    let layout = consensus
+        .private_oram_layout(&PrivateOramLayoutKey {
+            collection_id: key.collection_id.clone(),
+        })
+        .ok_or_else(invalid_owner_enrollment)?;
+    let signer_pin = consensus.private_oram_peer_recovery_signer_pin(identity.peer_id())?;
+    if consensus.private_oram_mutation_state(&key).is_none()
+        || !layout.owner_peer_ids.contains(&identity.peer_id())
+        || signer_pin.signer() != identity.public_key()
+    {
+        return Err(invalid_owner_enrollment());
+    }
+    let hnsw_store = PrivateHnswOramStore::new(collection.path(), vector_name)?;
+    Ok((
+        key,
+        PrivateOramOwnerPrestageStoreV2::new(hnsw_store.root_path()),
+    ))
+}
+
+/// Creates this owner's empty owner store for an enrolled collection and reports the owner
+/// signer and the store's lifecycle state (genesis for an empty store).
+pub(crate) async fn describe_private_oram_owner_store_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> StorageResult<(
+    PrivateOramOwnerCleanupSignerV1,
+    PrivateOramOwnerLifecycleStateV1,
+)> {
+    let (_key, owner_store) = resolve_private_oram_enrollment_owner_store_v2(
+        toc,
+        settings,
+        consensus,
+        identity,
+        collection_name,
+        vector_name,
+        owner_signing_key_id,
+    )
+    .await?;
+    let lifecycle_state = owner_store
+        .ensure_lifecycle_state_v2()
+        .map_err(|_| invalid_owner_enrollment())?;
+    let signer = identity
+        .owner_cleanup_signer()
+        .map_err(|_| invalid_owner_enrollment())?;
+    Ok((signer, lifecycle_state))
+}
+
+/// Signs this owner's genesis commitment for its committed prepared enrollment, after checking
+/// that its owner store is still exactly the empty store the prepared record names.
+pub(crate) async fn sign_private_oram_owner_enrollment_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> StorageResult<PrivateOramOwnerEnrollmentGenesisCommitmentV1> {
+    let (key, owner_store) = resolve_private_oram_enrollment_owner_store_v2(
+        toc,
+        settings,
+        consensus,
+        identity,
+        collection_name,
+        vector_name,
+        owner_signing_key_id,
+    )
+    .await?;
+    let prepared = consensus
+        .private_oram_mutation_v2_pending_owner_enrollment(&key, identity.peer_id())?
+        .ok_or_else(|| StorageError::PreconditionFailed {
+            description: "private ORAM owner enrollment is not pending for this owner".to_string(),
+        })?;
+    let lifecycle_state = owner_store
+        .ensure_lifecycle_state_v2()
+        .map_err(|_| invalid_owner_enrollment())?;
+    if lifecycle_state != prepared.expected_genesis_state {
+        return Err(invalid_owner_enrollment());
+    }
+    identity
+        .sign_owner_enrollment_genesis(&prepared)
+        .map_err(|_| invalid_owner_enrollment())
+}
+
+/// Walks the owner enrollment ceremony of an enrolled collection until every owner in its
+/// layout roster holds an enrollment checkpoint (docs/private-oram-v2-enrollment.md). Every step
+/// re-reads committed state, so an interrupted or repeated ceremony resumes where it stopped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_private_oram_owner_enrollment_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+    key: &PrivateOramMutationKey,
+) -> StorageResult<()> {
+    let coordinator_peer_id = identity.peer_id();
+    for _ in 0..PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS {
+        let operation = match consensus.private_oram_mutation_v2_owner_enrollment_step(key)? {
+            PrivateOramOwnerEnrollmentStepV2::Complete => return Ok(()),
+            PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id } => {
+                let (owner_signer, lifecycle_state) = if owner_peer_id == coordinator_peer_id {
+                    describe_private_oram_owner_store_v2(
+                        toc,
+                        settings,
+                        consensus,
+                        identity,
+                        collection_name,
+                        vector_name,
+                        owner_signing_key_id,
+                    )
+                    .await?
+                } else {
+                    toc.get_channel_service()
+                        .describe_private_oram_mutation_owner_store_v2(
+                            owner_peer_id,
+                            collection_name,
+                            vector_name,
+                            owner_signing_key_id,
+                        )
+                        .await
+                        .map_err(|_| owner_enrollment_unreachable(owner_peer_id))?
+                };
+                let genesis = private_oram_owner_lifecycle_genesis_state_v1(
+                    lifecycle_state.owner_store_incarnation_digest.clone(),
+                )
+                .map_err(|_| invalid_owner_enrollment())?;
+                if lifecycle_state != genesis {
+                    return Err(StorageError::PreconditionFailed {
+                        description: format!(
+                            "private ORAM owner store on peer {owner_peer_id} is not empty"
+                        ),
+                    });
+                }
+                consensus.private_oram_mutation_v2_owner_enrollment_prepare_operation(
+                    key,
+                    owner_peer_id,
+                    owner_signer,
+                    lifecycle_state.owner_store_incarnation_digest,
+                )?
+            }
+            PrivateOramOwnerEnrollmentStepV2::Activate { owner_peer_id } => {
+                let commitment = if owner_peer_id == coordinator_peer_id {
+                    sign_private_oram_owner_enrollment_v2(
+                        toc,
+                        settings,
+                        consensus,
+                        identity,
+                        collection_name,
+                        vector_name,
+                        owner_signing_key_id,
+                    )
+                    .await?
+                } else {
+                    toc.get_channel_service()
+                        .sign_private_oram_mutation_owner_enrollment_v2(
+                            owner_peer_id,
+                            collection_name,
+                            vector_name,
+                            owner_signing_key_id,
+                        )
+                        .await
+                        .map_err(|_| owner_enrollment_unreachable(owner_peer_id))?
+                };
+                consensus
+                    .private_oram_mutation_v2_owner_enrollment_activate_operation(&commitment)?
+            }
+        };
+        if !consensus
+            .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
+            .await?
+        {
+            return Err(StorageError::service_error(
+                "private ORAM owner enrollment step was not applied",
+            ));
+        }
+    }
+    Err(StorageError::service_error(
+        "private ORAM owner enrollment did not complete",
+    ))
+}
+
+fn invalid_owner_enrollment() -> StorageError {
+    StorageError::bad_request("private ORAM owner enrollment is invalid")
+}
+
+fn owner_enrollment_unreachable(owner_peer_id: u64) -> StorageError {
+    StorageError::service_error(format!(
+        "private ORAM owner enrollment failed on peer {owner_peer_id}"
+    ))
 }
 
 pub(crate) async fn resolve_private_oram_owner_reservation_v3(

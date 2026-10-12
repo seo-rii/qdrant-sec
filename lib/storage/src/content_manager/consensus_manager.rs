@@ -33,6 +33,7 @@ use qdrant_sec::{
     package_private_oram_mixed_version_activation_proof_v1,
     private_oram_consensus_configuration_member_ids_v1,
     try_private_oram_consensus_configuration_digest_v1,
+    validate_private_oram_owner_enrollment_genesis_commitment_v1,
     validate_private_oram_owner_reservation_prepare_challenge_v1,
     validate_private_oram_peer_activation_challenge_v1_shape,
     validate_private_oram_peer_activation_observation_v1_shape,
@@ -90,7 +91,12 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::authority:
     private_oram_mutation_reservation_outcome_acknowledgement_v1,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::format::PrivateOramMutationFormatFloorV2;
-use crate::content_manager::consensus::private_oram_mutation_cleanup::owner_checkpoint::private_oram_owner_checkpoint_reservation_binding_v1;
+use crate::content_manager::consensus::private_oram_mutation_cleanup::owner_checkpoint::{
+    PrivateOramOwnerCheckpointTableV1, PrivateOramOwnerEnrollmentNextStepV1,
+    private_oram_owner_checkpoint_reservation_binding_v1,
+    private_oram_owner_enrollment_next_step_v1,
+    private_oram_owner_enrollment_prepared_for_table_v1,
+};
 use crate::content_manager::consensus::private_oram_mutation_cleanup::{
     PrivateOramMutationCleanupExpectationV2, PrivateOramMutationCleanupLifecycleV2,
     PrivateOramMutationClearedPendingArchivePermitV2, PrivateOramRaftApplyLocatorV2,
@@ -437,6 +443,21 @@ impl TryFrom<&[u8]> for SnapshotData {
     fn try_from(bytes: &[u8]) -> Result<SnapshotData, Self::Error> {
         serde_cbor::from_slice(bytes)
     }
+}
+
+/// The next owner enrollment step of an enrolled collection (docs/private-oram-v2-enrollment.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateOramOwnerEnrollmentStepV2 {
+    /// Every owner in the layout roster holds an enrollment checkpoint.
+    Complete,
+    /// Ask the owner for its signer and empty owner store, then propose the prepared record.
+    Prepare { owner_peer_id: u64 },
+    /// Ask the owner to sign the committed prepared record, then propose the activation.
+    Activate { owner_peer_id: u64 },
+}
+
+fn random_private_oram_enrollment_id() -> String {
+    data_encoding::BASE64URL_NOPAD.encode(&rand::random::<[u8; 32]>())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1754,6 +1775,157 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 })?,
             ),
         ))
+    }
+
+    /// The next owner enrollment step of an enrolled collection: owners in the layout roster
+    /// enroll one at a time (docs/private-oram-v2-enrollment.md).
+    pub fn private_oram_mutation_v2_owner_enrollment_step(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Result<PrivateOramOwnerEnrollmentStepV2, StorageError> {
+        self.private_oram_mutation_v2_expected_aggregate_digest(key)?;
+        let persistent = self.persistent.read();
+        Ok(
+            match Self::private_oram_mutation_v2_owner_enrollment_next_step(&persistent, key)?.0 {
+                PrivateOramOwnerEnrollmentNextStepV1::Complete => {
+                    PrivateOramOwnerEnrollmentStepV2::Complete
+                }
+                PrivateOramOwnerEnrollmentNextStepV1::Prepare { owner_peer_id } => {
+                    PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id }
+                }
+                PrivateOramOwnerEnrollmentNextStepV1::Activate { prepared } => {
+                    PrivateOramOwnerEnrollmentStepV2::Activate {
+                        owner_peer_id: prepared.owner_peer_id,
+                    }
+                }
+            },
+        )
+    }
+
+    fn private_oram_mutation_v2_owner_enrollment_next_step(
+        persistent: &Persistent,
+        key: &PrivateOramMutationKey,
+    ) -> Result<
+        (
+            PrivateOramOwnerEnrollmentNextStepV1,
+            PrivateOramOwnerCheckpointTableV1,
+            PrivateOramConsensusLayout,
+        ),
+        StorageError,
+    > {
+        let table = persistent.private_oram_mutation_v2_owner_checkpoint_table(key)?;
+        let layout = persistent
+            .private_oram_layout(&PrivateOramLayoutKey {
+                collection_id: key.collection_id.clone(),
+            })
+            .ok_or_else(|| StorageError::PreconditionFailed {
+                description: "private ORAM owner enrollment layout is missing".to_string(),
+            })?;
+        let step = private_oram_owner_enrollment_next_step_v1(&table, &layout.owner_peer_ids)
+            .map_err(|_| StorageError::PreconditionFailed {
+                description: "private ORAM owner checkpoints do not match the layout roster"
+                    .to_string(),
+            })?;
+        Ok((step, table, layout))
+    }
+
+    /// Authors the prepared enrollment of `owner_peer_id` from the owner's pinned signer and
+    /// its empty owner store. Fresh enrollment and operation ids are drawn for every call.
+    pub fn private_oram_mutation_v2_owner_enrollment_prepare_operation(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: u64,
+        owner_signer: PrivateOramOwnerCleanupSignerV1,
+        owner_store_incarnation_digest: String,
+    ) -> Result<ConsensusOperations, StorageError> {
+        self.private_oram_mutation_v2_expected_aggregate_digest(key)?;
+        let prepared = {
+            let persistent = self.persistent.read();
+            let (step, table, layout) =
+                Self::private_oram_mutation_v2_owner_enrollment_next_step(&persistent, key)?;
+            if step != (PrivateOramOwnerEnrollmentNextStepV1::Prepare { owner_peer_id }) {
+                return Err(StorageError::PreconditionFailed {
+                    description: "private ORAM owner enrollment step changed".to_string(),
+                });
+            }
+            let activation = persistent
+                .private_oram_activation_authority
+                .as_ref()
+                .ok_or_else(|| {
+                    StorageError::bad_request("private ORAM V2 activation authority is missing")
+                })?;
+            let pinned = activation
+                .manifest()
+                .peers
+                .binary_search_by_key(&owner_peer_id, |peer| peer.peer_id)
+                .ok()
+                .map(|index| &activation.manifest().peers[index]);
+            if pinned.is_none_or(|pin| {
+                qdrant_sec::private_oram_owner_cleanup_signer_from_peer_key_v1(&pin.signer)
+                    .ok()
+                    .as_ref()
+                    != Some(&owner_signer)
+            }) {
+                return Err(StorageError::bad_request(
+                    "private ORAM owner enrollment signer is not the owner's pinned identity",
+                ));
+            }
+            private_oram_owner_enrollment_prepared_for_table_v1(
+                &table,
+                &key.collection_id,
+                layout.generation,
+                owner_peer_id,
+                owner_signer,
+                owner_store_incarnation_digest,
+                random_private_oram_enrollment_id(),
+                random_private_oram_enrollment_id(),
+                activation.manifest_digest().to_string(),
+                layout.layout_digest.clone(),
+            )
+            .map_err(|_| StorageError::bad_request("private ORAM owner enrollment is invalid"))?
+        };
+        self.private_oram_mutation_v2_owner_enrollment_prepared_operation(&prepared)
+    }
+
+    /// The committed prepared enrollment awaiting `owner_peer_id`'s genesis commitment.
+    pub fn private_oram_mutation_v2_pending_owner_enrollment(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: u64,
+    ) -> Result<Option<PrivateOramOwnerEnrollmentPreparedV1>, StorageError> {
+        self.private_oram_mutation_v2_expected_aggregate_digest(key)?;
+        let persistent = self.persistent.read();
+        Ok(
+            match Self::private_oram_mutation_v2_owner_enrollment_next_step(&persistent, key)?.0 {
+                PrivateOramOwnerEnrollmentNextStepV1::Activate { prepared }
+                    if prepared.owner_peer_id == owner_peer_id =>
+                {
+                    Some(*prepared)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    /// Activates the pending enrollment with the owner's signed genesis commitment.
+    pub fn private_oram_mutation_v2_owner_enrollment_activate_operation(
+        &self,
+        commitment: &PrivateOramOwnerEnrollmentGenesisCommitmentV1,
+    ) -> Result<ConsensusOperations, StorageError> {
+        let key = PrivateOramMutationKey {
+            collection_id: commitment.collection_id.clone(),
+        };
+        let prepared = self
+            .private_oram_mutation_v2_pending_owner_enrollment(&key, commitment.owner_peer_id)?
+            .ok_or_else(|| StorageError::PreconditionFailed {
+                description: "private ORAM owner enrollment is not pending".to_string(),
+            })?;
+        let _verified =
+            validate_private_oram_owner_enrollment_genesis_commitment_v1(commitment, &prepared)
+                .map_err(|_| {
+                    StorageError::bad_request("private ORAM owner enrollment commitment is invalid")
+                })?;
+        self.private_oram_mutation_v2_owner_enrollment_activated_operation(commitment)
     }
 
     #[doc(hidden)]

@@ -10171,6 +10171,176 @@ mod tests {
     }
 
     #[test]
+    fn owner_enrollment_steps_walk_the_layout_roster_to_reservable_checkpoints() {
+        use qdrant_sec::{
+            encode_private_oram_owner_enrollment_genesis_commitment_v1,
+            encode_private_oram_owner_enrollment_prepared_v1, private_oram_owner_cleanup_signer_v1,
+            sign_private_oram_owner_enrollment_genesis_commitment_v1,
+        };
+        use ring::signature::Ed25519KeyPair;
+
+        use crate::content_manager::consensus::private_oram_mutation_cleanup::owner_checkpoint::{
+            PrivateOramOwnerEnrollmentNextStepV1, private_oram_owner_enrollment_next_step_v1,
+            private_oram_owner_enrollment_prepared_for_table_v1,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut fixture = private_oram_mutation_fixture();
+        fixture.layout.owner_peer_ids = vec![7, 9];
+        let barrier = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+        let (_, trust_anchor, bundle) = private_oram_activation_authority_fixture_v1_for_test();
+        let mut persistent =
+            Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+            )
+            .unwrap();
+        let expected = persistent
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        persistent
+            .compare_and_swap_private_oram_activation_authority(expected, &bundle, &trust_anchor)
+            .unwrap();
+        persistent
+            .set_peer_address_by_id(barrier.peer_addresses.clone())
+            .unwrap();
+        persistent
+            .apply_state_update(|state| {
+                state.conf_state = barrier.conf_state.clone();
+                state.hard_state.term = barrier.current_term;
+                state.hard_state.commit = barrier.base_index + 8;
+            })
+            .unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        persistent
+            .set_unapplied_entries(barrier.base_index + 1, barrier.base_index + 8)
+            .unwrap();
+        for (offset, operation) in [
+            (1, &barrier.prepare_operation),
+            (2, &barrier.enable_operation),
+        ] {
+            assert!(matches!(
+                persistent
+                    .activate_private_oram_mutation_v2_at_applied_entry(
+                        operation,
+                        barrier.current_term,
+                        barrier.base_index + offset,
+                        barrier.base_entry_term,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+        }
+
+        let roster = fixture.layout.owner_peer_ids.clone();
+        let next_step = |persistent: &Persistent| {
+            private_oram_owner_enrollment_next_step_v1(
+                &persistent
+                    .private_oram_mutation_v2_owner_checkpoint_table(&fixture.key)
+                    .unwrap(),
+                &roster,
+            )
+            .unwrap()
+        };
+        let mut entry_index = barrier.base_index + 3;
+        for (owner_peer_id, seed) in [(7_u64, 71_u8), (9, 91)] {
+            let owner_key = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+            assert_eq!(
+                next_step(&persistent),
+                PrivateOramOwnerEnrollmentNextStepV1::Prepare { owner_peer_id }
+            );
+            let prepared = private_oram_owner_enrollment_prepared_for_table_v1(
+                &persistent
+                    .private_oram_mutation_v2_owner_checkpoint_table(&fixture.key)
+                    .unwrap(),
+                &fixture.key.collection_id,
+                fixture.layout.generation,
+                owner_peer_id,
+                private_oram_owner_cleanup_signer_v1(&owner_key, 1).unwrap(),
+                test_digest(seed),
+                test_digest(seed.wrapping_add(1)),
+                test_digest(seed.wrapping_add(2)),
+                test_digest(60),
+                fixture.layout.layout_digest.clone(),
+            )
+            .unwrap();
+            let prepare = ApplyPrivateOramMutationMaterialV2::owner_enrollment_prepared(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                String::from_utf8(
+                    encode_private_oram_owner_enrollment_prepared_v1(&prepared).unwrap(),
+                )
+                .unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &prepare,
+                        barrier.current_term,
+                        entry_index,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+            entry_index += 1;
+            assert_eq!(
+                next_step(&persistent),
+                PrivateOramOwnerEnrollmentNextStepV1::Activate {
+                    prepared: Box::new(prepared.clone())
+                }
+            );
+
+            let commitment =
+                sign_private_oram_owner_enrollment_genesis_commitment_v1(&owner_key, &prepared)
+                    .unwrap();
+            let activate = ApplyPrivateOramMutationMaterialV2::owner_enrollment_activated(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                String::from_utf8(
+                    encode_private_oram_owner_enrollment_genesis_commitment_v1(&commitment)
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &activate,
+                        barrier.current_term,
+                        entry_index,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+            entry_index += 1;
+        }
+        assert_eq!(
+            next_step(&persistent),
+            PrivateOramOwnerEnrollmentNextStepV1::Complete
+        );
+        let table = persistent
+            .private_oram_mutation_v2_owner_checkpoint_table(&fixture.key)
+            .unwrap();
+        assert_eq!(
+            table
+                .checkpoints()
+                .iter()
+                .map(|checkpoint| checkpoint.owner_peer_id())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([7, 9])
+        );
+        // A roster that no longer matches the checkpoints is not a valid enrollment state.
+        assert!(private_oram_owner_enrollment_next_step_v1(&table, &[7]).is_err());
+    }
+
+    #[test]
     fn private_oram_v3_reservation_challenge_finalizes_after_restart() {
         use qdrant_sec::{
             PRIVATE_ORAM_OWNER_RESERVATION_PREPARE_VERSION_V1,
