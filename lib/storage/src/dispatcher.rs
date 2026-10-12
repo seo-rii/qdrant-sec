@@ -36,9 +36,10 @@ use crate::content_manager::collection_meta_ops::AliasOperations;
 use crate::content_manager::consensus_manager::ConsensusProposalOutcome;
 use crate::content_manager::consensus_ops::{
     CompareAndSwapPrivateOramEpoch, CompareAndSwapPrivateOramLayout,
-    CompareAndSwapPrivateOramSessionLease, PrivateOramCollectionLayoutTransition,
-    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusEpoch, PrivateOramConsensusLayout,
-    PrivateOramEpochKey, PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryOperation,
+    CompareAndSwapPrivateOramSessionLease, InitializePrivateOramMutationState,
+    PrivateOramCollectionLayoutTransition, PrivateOramConsensusCollectionStateV2,
+    PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramEpochKey,
+    PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryOperation,
     PrivateOramExternalRecoveryState, PrivateOramIndexKind, PrivateOramLayoutIndexStateBinding,
     PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding, PrivateOramMutationKey,
     PrivateOramMutationLease, PrivateOramMutationLeaseSlotV2,
@@ -683,6 +684,32 @@ impl Dispatcher {
         if !applied {
             return Err(StorageError::service_error(
                 "private ORAM consensus session lease CAS was not applied",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Proposes the enrollment of a collection into mutation V2 on an active V2 cluster. A
+    /// re-proposal of the genesis state that is already enrolled applies as a no-op.
+    pub async fn submit_private_oram_mutation_enroll_v2(
+        &self,
+        operation: InitializePrivateOramMutationState,
+        wait_timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error(
+                "private ORAM mutation V2 enrollment requires distributed mode",
+            )
+        })?;
+        let applied = consensus_state
+            .propose_consensus_op_with_await(
+                ConsensusOperations::EnrollPrivateOramMutationCollectionV2(operation),
+                wait_timeout,
+            )
+            .await?;
+        if !applied {
+            return Err(StorageError::service_error(
+                "private ORAM mutation V2 enrollment was not applied",
             ));
         }
         Ok(())

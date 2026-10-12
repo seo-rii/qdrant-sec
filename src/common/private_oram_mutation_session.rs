@@ -34,8 +34,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::content_manager::consensus_manager::PrivateOramMutationV2ActivationStatus;
 use storage::content_manager::consensus_ops::{
-    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusLayout, PrivateOramIndexKind,
-    PrivateOramLayoutKey, PrivateOramMutationKey, PrivateOramMutationLeaseSlotV2,
+    InitializePrivateOramMutationState, PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
+    PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
+    PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2, PrivateOramEpochKey,
+    PrivateOramIndexKind, PrivateOramLayoutKey, PrivateOramMutationKey,
+    PrivateOramMutationLeaseSlotV2,
 };
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::private_oram_mutation_journal::{
@@ -163,6 +166,43 @@ pub(crate) struct PrivateOramMutationOpenInputV2 {
     pub mutation_id: String,
     pub immutable_manifest: PrivateOramImmutableManifestBundleV2,
     pub old_state: PrivateOramSignedStateBundleV2,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateOramMutationEnrollInputV2 {
+    pub client_id: String,
+    pub vector_name: String,
+    pub immutable_manifest: PrivateOramImmutableManifestBundleV2,
+    pub genesis_state: PrivateOramSignedStateBundleV2,
+}
+
+impl Debug for PrivateOramMutationEnrollInputV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationEnrollInputV2")
+            .field("client_id", &"[redacted]")
+            .field("vector_name", &"[redacted]")
+            .field("immutable_manifest", &"[redacted]")
+            .field("genesis_state", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationEnrollResponseV2 {
+    pub manifest_digest: String,
+    pub genesis_state_digest: String,
+}
+
+impl Debug for PrivateOramMutationEnrollResponseV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationEnrollResponseV2")
+            .field("manifest_digest", &"[redacted]")
+            .field("genesis_state_digest", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -1874,6 +1914,228 @@ pub(crate) async fn do_open_private_oram_mutation_session_v2(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Enrolls an uploaded collection into mutation V2 on a cluster where V2 is active (see
+/// docs/private-oram-v2-enrollment.md). The client signs the immutable manifest and the
+/// genesis state with its pinned owner key; the server verifies both, recomputes every
+/// digest, checks them against the live V1 manifests and the consensus epochs and layout,
+/// and proposes the genesis state. Re-enrolling the same genesis state succeeds.
+pub(crate) async fn do_enroll_private_oram_mutation_collection_v2(
+    dispatcher: &Dispatcher,
+    auth: &Auth,
+    settings: &Settings,
+    collection_name: &str,
+    input: PrivateOramMutationEnrollInputV2,
+) -> StorageResult<PrivateOramMutationEnrollResponseV2> {
+    let leader = current_active_mutation_leader_token(dispatcher)?;
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_enroll_v2",
+    )?;
+    let verification_pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &verification_pass);
+    let collection = toc.get_collection(&pass).await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+        settings,
+        collection.name(),
+        collection.path(),
+        &config,
+        &input.vector_name,
+        &input.immutable_manifest.manifest.owner_signing_key_id,
+    )?;
+    if hnsw_context.collection_crypto_id() != collection_id {
+        return Err(invalid_enrollment());
+    }
+    let signature_verification = PrivateOramSignatureVerification {
+        expected_key_id: &input.immutable_manifest.manifest.owner_signing_key_id,
+        public_key: hnsw_context.public_key(),
+    };
+    validate_enroll_crypto_material(&collection_id, &input, signature_verification)?;
+    let manifest_digest =
+        private_oram_immutable_manifest_v2_digest(&input.immutable_manifest.manifest)
+            .map_err(|_| invalid_enrollment())?;
+    let genesis_state_digest = private_oram_signed_state_v2_digest(&input.genesis_state.state)
+        .map_err(|_| invalid_enrollment())?;
+    if input.genesis_state.state.manifest_digest != manifest_digest {
+        return Err(invalid_enrollment());
+    }
+    let response = PrivateOramMutationEnrollResponseV2 {
+        manifest_digest: manifest_digest.clone(),
+        genesis_state_digest: genesis_state_digest.clone(),
+    };
+
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let layout = dispatcher
+        .private_oram_consensus_layout(&PrivateOramLayoutKey {
+            collection_id: collection_id.clone(),
+        })?
+        .ok_or_else(invalid_enrollment)?;
+    let mut indexes = Vec::with_capacity(input.genesis_state.state.indexes.len());
+    for signed in &input.genesis_state.state.indexes {
+        let (index_kind, index_name) = match signed.kind {
+            PrivateOramIndexKindV2::Hnsw => (PrivateOramIndexKind::Hnsw, signed.index_name.clone()),
+            PrivateOramIndexKindV2::Result => (PrivateOramIndexKind::ResultPayload, String::new()),
+        };
+        let epoch_key = PrivateOramEpochKey {
+            collection_id: collection_id.clone(),
+            index_kind,
+            index_name: index_name.clone(),
+        };
+        let epoch = dispatcher
+            .private_oram_consensus_epoch(&epoch_key)?
+            .ok_or_else(invalid_enrollment)?;
+        if epoch.index_epoch != signed.index_epoch
+            || epoch.root_hash != signed.root_hash
+            || epoch.writeback_digest.as_deref() != Some(&signed.last_writeback_digest)
+            || dispatcher
+                .private_oram_consensus_session_lease(&epoch_key)?
+                .is_some()
+        {
+            return Err(invalid_enrollment());
+        }
+        indexes.push(PrivateOramConsensusCollectionIndexStateV2 {
+            index_kind,
+            index_name,
+            epoch,
+            logical_count: signed.logical_count,
+            dummy_count: signed.dummy_count,
+        });
+    }
+    let genesis = &input.genesis_state.state;
+    if layout.generation != genesis.layout_generation
+        || layout.layout_digest != genesis.layout_digest
+    {
+        return Err(invalid_enrollment());
+    }
+    let state = PrivateOramConsensusCollectionStateV2 {
+        version: PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
+        collection_id: collection_id.clone(),
+        manifest_digest,
+        layout_generation: genesis.layout_generation,
+        layout_digest: genesis.layout_digest.clone(),
+        state_sequence: 0,
+        signed_state_digest: genesis_state_digest,
+        indexes,
+        client_state_digest: genesis.client_state_digest.clone(),
+        last_transition: PrivateOramConsensusTransitionV2::Genesis,
+    };
+    match dispatcher.private_oram_consensus_mutation_state(&key)? {
+        Some(current) if current == state => return Ok(response),
+        Some(_) => {
+            return Err(StorageError::bad_request(
+                "collection is already enrolled in private ORAM mutation V2",
+            ));
+        }
+        None => {}
+    }
+
+    // Bind the signed manifest and genesis state to the live V1 indexes through the same
+    // paired read sessions an open uses; they are released before the proposal.
+    {
+        let _reservation =
+            PrivateOramMutationOpenReservation::acquire(&collection_id, current_unix_secs()?)?;
+        let mut opened = PrivateOramOpenedIndexSessions::new(&collection_id, &input.vector_name);
+        let hnsw_session = do_open_private_hnsw_session_for_paired_mutation(
+            toc,
+            auth,
+            settings,
+            collection_name,
+            &input.vector_name,
+            input.client_id.clone(),
+            signed_index(genesis, PrivateOramIndexKindV2::Hnsw)?.index_epoch,
+            true,
+            input.immutable_manifest.manifest.result_privacy,
+        )
+        .await?;
+        opened.hnsw_session_id = Some(hnsw_session.session_id.clone());
+        let result_session =
+            if manifest_index_optional(&input.immutable_manifest, PrivateOramIndexKindV2::Result)
+                .is_some()
+            {
+                let session = do_open_private_result_oram_session_for_paired_mutation(
+                    toc,
+                    auth,
+                    settings,
+                    collection_name,
+                    input.client_id.clone(),
+                    signed_index(genesis, PrivateOramIndexKindV2::Result)?.index_epoch,
+                    true,
+                )
+                .await?;
+                opened.result_session_id = Some(session.session_id.clone());
+                Some(session)
+            } else {
+                None
+            };
+        validate_live_index_bindings(
+            &input.immutable_manifest,
+            genesis,
+            &hnsw_session,
+            result_session.as_ref(),
+        )
+        .map_err(|_| invalid_enrollment())?;
+    }
+
+    if !current_active_mutation_leader_token(dispatcher).is_ok_and(|current| current == leader) {
+        return Err(invalid_enrollment());
+    }
+    dispatcher
+        .submit_private_oram_mutation_enroll_v2(
+            InitializePrivateOramMutationState { key, state },
+            None,
+        )
+        .await?;
+    Ok(response)
+}
+
+fn validate_enroll_crypto_material(
+    collection_id: &str,
+    input: &PrivateOramMutationEnrollInputV2,
+    verification: PrivateOramSignatureVerification<'_>,
+) -> StorageResult<()> {
+    let manifest = &input.immutable_manifest.manifest;
+    let genesis = &input.genesis_state.state;
+    validate_private_oram_immutable_manifest_v2_shape(manifest)
+        .map_err(|_| invalid_enrollment())?;
+    validate_private_oram_immutable_manifest_v2_signature(
+        manifest,
+        Some(&input.immutable_manifest.signature),
+        verification,
+    )
+    .map_err(|_| invalid_enrollment())?;
+    validate_private_oram_signed_state_v2_shape(genesis).map_err(|_| invalid_enrollment())?;
+    validate_private_oram_signed_state_v2_signature(
+        genesis,
+        Some(&input.genesis_state.signature),
+        verification,
+    )
+    .map_err(|_| invalid_enrollment())?;
+    if manifest.collection_id != collection_id
+        || genesis.collection_id != collection_id
+        || genesis.owner_signing_key_id != manifest.owner_signing_key_id
+        || genesis.state_sequence != 0
+        || genesis.last_mutation_id.is_some()
+        || genesis.indexes.len() != manifest.indexes.len()
+        || genesis.indexes.iter().any(|signed| {
+            !manifest
+                .indexes
+                .iter()
+                .any(|index| index.kind() == signed.kind && index.index_name == signed.index_name)
+        })
+    {
+        return Err(invalid_enrollment());
+    }
+    Ok(())
+}
+
+fn invalid_enrollment() -> StorageError {
+    StorageError::bad_request("private ORAM mutation V2 enrollment is invalid")
+}
+
 pub(crate) async fn do_read_private_oram_mutation_hnsw_paths_v2(
     dispatcher: &Dispatcher,
     auth: &Auth,
@@ -2418,19 +2680,13 @@ fn build_session(
     hnsw_session: PrivateHnswSessionResponse,
     result_session: Option<PrivateResultOramSessionResponse>,
 ) -> StorageResult<PrivateOramMutationSessionV2> {
+    validate_live_index_bindings(
+        &input.immutable_manifest,
+        &input.old_state.state,
+        &hnsw_session,
+        result_session.as_ref(),
+    )?;
     let hnsw_manifest = manifest_index(&input.immutable_manifest, PrivateOramIndexKindV2::Hnsw)?;
-    let hnsw_old = signed_index(&input.old_state.state, PrivateOramIndexKindV2::Hnsw)?;
-    validate_live_hnsw_binding(hnsw_manifest, &hnsw_session)?;
-    validate_live_session_state(hnsw_old, hnsw_session.index_epoch, &hnsw_session.root_hash)?;
-    if input.immutable_manifest.manifest.collection_id != hnsw_session.collection_id
-        || input.immutable_manifest.manifest.result_privacy != hnsw_session.manifest.result_privacy
-        || input.immutable_manifest.manifest.owner_signing_key_id
-            != hnsw_session.manifest.owner_signing_key_id
-        || input.immutable_manifest.manifest.created_at_unix
-            != hnsw_session.manifest.created_at_unix
-    {
-        return Err(invalid_mutation_session());
-    }
     let mut hnsw = index_read_state(hnsw_manifest, hnsw_session.session_id.clone())?;
     hnsw.index_epoch = hnsw_session.index_epoch;
     hnsw.root_hash = hnsw_session.root_hash.clone();
@@ -2439,17 +2695,6 @@ fn build_session(
         manifest_index_optional(&input.immutable_manifest, PrivateOramIndexKindV2::Result);
     let result = match (result_manifest, result_session) {
         (Some(manifest), Some(session)) => {
-            let result_old = signed_index(&input.old_state.state, PrivateOramIndexKindV2::Result)?;
-            validate_live_result_binding(manifest, &session)?;
-            validate_live_session_state(result_old, session.index_epoch, &session.root_hash)?;
-            if input.immutable_manifest.manifest.collection_id != session.collection_id
-                || input.immutable_manifest.manifest.owner_signing_key_id
-                    != session.manifest.owner_signing_key_id
-                || input.immutable_manifest.manifest.created_at_unix
-                    != session.manifest.created_at_unix
-            {
-                return Err(invalid_mutation_session());
-            }
             let mut state = index_read_state(manifest, session.session_id)?;
             state.index_epoch = session.index_epoch;
             state.root_hash = session.root_hash;
@@ -2491,6 +2736,47 @@ fn build_session(
         freeze_owner: None,
         closing: false,
     })
+}
+
+/// Binds the signed manifest and a signed state to the live V1 index sessions: every index's
+/// parameters, the manifest header and the current epoch and root.
+fn validate_live_index_bindings(
+    immutable_manifest: &PrivateOramImmutableManifestBundleV2,
+    state: &PrivateOramSignedStateV2,
+    hnsw_session: &PrivateHnswSessionResponse,
+    result_session: Option<&PrivateResultOramSessionResponse>,
+) -> StorageResult<()> {
+    let manifest = &immutable_manifest.manifest;
+    let hnsw_manifest = manifest_index(immutable_manifest, PrivateOramIndexKindV2::Hnsw)?;
+    let hnsw_old = signed_index(state, PrivateOramIndexKindV2::Hnsw)?;
+    validate_live_hnsw_binding(hnsw_manifest, hnsw_session)?;
+    validate_live_session_state(hnsw_old, hnsw_session.index_epoch, &hnsw_session.root_hash)?;
+    if manifest.collection_id != hnsw_session.collection_id
+        || manifest.result_privacy != hnsw_session.manifest.result_privacy
+        || manifest.owner_signing_key_id != hnsw_session.manifest.owner_signing_key_id
+        || manifest.created_at_unix != hnsw_session.manifest.created_at_unix
+    {
+        return Err(invalid_mutation_session());
+    }
+    match (
+        manifest_index_optional(immutable_manifest, PrivateOramIndexKindV2::Result),
+        result_session,
+    ) {
+        (Some(result_manifest), Some(session)) => {
+            let result_old = signed_index(state, PrivateOramIndexKindV2::Result)?;
+            validate_live_result_binding(result_manifest, session)?;
+            validate_live_session_state(result_old, session.index_epoch, &session.root_hash)?;
+            if manifest.collection_id != session.collection_id
+                || manifest.owner_signing_key_id != session.manifest.owner_signing_key_id
+                || manifest.created_at_unix != session.manifest.created_at_unix
+            {
+                return Err(invalid_mutation_session());
+            }
+        }
+        (None, None) => {}
+        _ => return Err(invalid_mutation_session()),
+    }
+    Ok(())
 }
 
 fn index_read_state(

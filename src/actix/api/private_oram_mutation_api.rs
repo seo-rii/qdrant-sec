@@ -18,7 +18,8 @@ use crate::common::private_hnsw::{
 use crate::common::private_oram_mutation::run_private_oram_mutation_append_v2;
 use crate::common::private_oram_mutation_session::{
     PrivateOramMutationAppendInputV2, PrivateOramMutationAppendJobPhaseV2,
-    PrivateOramMutationOpenInputV2, close_private_oram_mutation_session_v2,
+    PrivateOramMutationEnrollInputV2, PrivateOramMutationOpenInputV2,
+    close_private_oram_mutation_session_v2, do_enroll_private_oram_mutation_collection_v2,
     do_open_private_oram_mutation_session_v2, do_read_private_oram_mutation_hnsw_paths_v2,
     do_read_private_oram_mutation_result_buckets_v2, do_validate_private_oram_mutation_append_v2,
     private_oram_mutation_session_status_v2,
@@ -242,6 +243,28 @@ async fn open_session(
     process_response(result, timing, None)
 }
 
+async fn enroll(
+    dispatcher: web::Data<Dispatcher>,
+    settings: web::Data<Settings>,
+    path: Path<PrivateOramMutationPathV2>,
+    request: Json<PrivateOramMutationWireV2<PrivateOramMutationEnrollInputV2>>,
+    ActixAuth(auth): ActixAuth,
+) -> HttpResponse {
+    let collection_name = path.into_inner().collection.collection_name;
+    let request = request.into_inner().into_inner();
+    let timing = Instant::now();
+    let result = do_enroll_private_oram_mutation_collection_v2(
+        dispatcher.get_ref(),
+        &auth,
+        settings.get_ref(),
+        &collection_name,
+        request,
+    )
+    .await
+    .map(PrivateOramMutationWireV2);
+    process_response(result, timing, None)
+}
+
 async fn read(
     dispatcher: web::Data<Dispatcher>,
     settings: web::Data<Settings>,
@@ -368,6 +391,7 @@ pub fn config_private_oram_mutation_api(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/collections/{collection_name}/private-oram/v2/mutation")
             .app_data(private_oram_mutation_json_config())
+            .route("/enroll", web::post().to(enroll))
             .route("/open", web::post().to(open_session))
             .route("/read", web::post().to(read))
             .route("/append", web::post().to(append))

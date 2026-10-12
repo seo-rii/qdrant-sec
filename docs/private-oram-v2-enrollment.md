@@ -1,7 +1,7 @@
 # Private ORAM V2 Collection Enrollment (design draft)
 
-Status: draft for review; step 1 (enrollment after activation in consensus)
-is implemented, the route and owner ceremony are not. Today no production path creates a
+Status: draft for review; steps 1 (enrollment after activation in consensus)
+and 2 (the genesis route) are implemented, the owner ceremony is not. Today no production path creates a
 collection's V2 consensus state, so `POST .../private-oram/v2/mutation/open`
 always fails on a real deployment (see docs/ckks.md, "multi-process V2
 activation"). This document proposes the missing enrollment path.
@@ -40,7 +40,7 @@ activation"). This document proposes the missing enrollment path.
    `compatibility_epoch` is the floor's format epoch. Between Prepare and
    Enable, Initialize is refused with `bad_request`. Mixed-version replicas
    must reject the new variant deterministically (protocol version gate).
-2. **Genesis route** `POST /collections/{c}/private-oram/v2/enroll` (write
+2. **Genesis route** `POST /collections/{c}/private-oram/v2/mutation/enroll` (write
    access, local Raft leader, V2 active). Body: `{vector_name,
    immutable_manifest, genesis_state}`, both signed by the client owner key
    pinned in the collection's runtime instance. The server verifies both
@@ -74,8 +74,22 @@ activation"). This document proposes the missing enrollment path.
   genesis state is a no-op; a different one is refused. A binary without the
   variant fails to decode the entry and stops instead of diverging. Test:
   `enrollment_after_activation_initializes_and_activates_the_collection_authority`.
-- Not implemented yet: the dispatcher submit method, the `enroll` route, the
-  owner enrollment ceremony and the client procedure.
+- Step 2 is implemented as `POST /collections/{c}/private-oram/v2/mutation/enroll`
+  (`do_enroll_private_oram_mutation_collection_v2`), proposed through
+  `Dispatcher::submit_private_oram_mutation_enroll_v2`. Body: `{client_id,
+  vector_name, immutable_manifest, genesis_state}`. The route requires an active V2
+  cluster and the local Raft leader, verifies both owner signatures, requires a
+  genesis state (sequence 0, no last mutation id) whose indexes are exactly the
+  manifest's, builds the consensus genesis state from the consensus epochs (each
+  with a `Some` write-back digest equal to the signed one, no V1 session lease)
+  and layout, binds the manifest and state to the live V1 indexes with the same
+  paired read sessions an open uses, then proposes. Re-enrolling the same genesis
+  state succeeds; a different state is refused.
+- Open after enrollment: `open` registers its V1 index sessions only in the local
+  session registry (`PrivateHnswSessionOwner::PairedMutation`) and never takes the
+  consensus V1 session lease that enrolled collections refuse, so enrollment does
+  not block it.
+- Not implemented yet: the owner enrollment ceremony and the client procedure.
 
 ## Risks and open questions
 
@@ -84,7 +98,5 @@ activation"). This document proposes the missing enrollment path.
   and a restart/replay test.
 - How the owner's peer-identity key signs genesis commitments locally (key
   custody in the owner store) is not wired yet.
-- Enrollment freezes V1 operations: confirm open/append do not depend on the
-  refused V1 session-lease CAS.
 - Non-empty legacy owner stores: import is undefined; enrollment requires an
   empty owner namespace.
