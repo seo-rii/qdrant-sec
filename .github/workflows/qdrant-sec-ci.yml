@@ -41,6 +41,9 @@ jobs:
       - name: Run qdrant-sec crypto crate security tests
         run: cargo test --locked -p qdrant-sec
 
+      - name: Smoke-run qdrant-sec benchmarks once
+        run: cargo test --locked -p qdrant-sec --benches
+
       - name: Run collection qdrant-sec config tests
         run: |
           cargo test --locked -p collection ckks --lib

@@ -36,3 +36,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "private_hnsw_oram_bench"
 harness = false
+
+[[bench]]
+name = "private_oram_append_bench"
+harness = false

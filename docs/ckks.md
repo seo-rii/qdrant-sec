@@ -5819,6 +5819,22 @@ is covered only by the in-process `leave_*_for_test` stop points so far.
 Still open for the V2-E gate: kills of a whole Qdrant process across Raft
 apply, and the leader/supervisor concurrency E2E.
 
+### Release gate work: V2 append client benchmark
+
+`cargo bench -p qdrant-sec --bench private_oram_append_bench` times one
+client-side V2 append transaction for the HNSW index and for the result
+index (begin, every fixed read window with AEAD open and Merkle proof check,
+re-seal and finalize) on the tree-height-2 fixture of
+`tests/private_oram_append_client.rs`. Before timing it prints, per index,
+the paths and buckets read, the bucket bytes read (base64url wire text), the
+writeback frames and distinct buckets written, and the bytes written. Write
+amplification is fixed by the manifest capacity, not by the data: every
+append writes `fixed_append_write_bucket_count` frames per index (12 in the
+fixture) and reads `fixed_append_read_path_count` paths (4). CI runs the
+benchmark once in test mode (`cargo test -p qdrant-sec --benches`) so it keeps
+compiling. Server-side latency (owner prepare, consensus apply, fsync) and
+larger trees are not measured yet.
+
 ### Release gate work: whole-process kill matrix for replicated write-backs
 
 `tests/consensus_tests/test_private_oram_crash_matrix.py` starts a three-peer
