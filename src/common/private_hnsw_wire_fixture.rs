@@ -796,9 +796,13 @@ fn test_dispatcher_with_consensus_sender(distributed: bool) -> (TempDir, Dispatc
     (temp, Dispatcher::new(toc))
 }
 
+/// Serializes the route tests that share the process-wide private ORAM session registries. A
+/// test that panics while holding it must not fail every later holder, so poisoning is ignored.
 pub(crate) fn route_e2e_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub(crate) async fn create_private_hnsw_collection(dispatcher: &Dispatcher) {

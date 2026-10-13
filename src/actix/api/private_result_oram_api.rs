@@ -1735,6 +1735,22 @@ mod private_result_oram_rest_tests {
             )
             .await
             .unwrap();
+            // The write-back budget is the paths read in this session, so read the two paths
+            // through bucket 0 before rewriting it.
+            let read_bucket_ids = vec![0, 1, 3, 0, 1, 4];
+            do_read_private_result_oram_buckets(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                &session.session_id,
+                BASE_EPOCH,
+                manifest.root_hash.clone(),
+                read_bucket_ids.clone(),
+                fixture.read_signature_for_epoch(BASE_EPOCH, &manifest.root_hash, &read_bucket_ids),
+            )
+            .await
+            .unwrap();
             let committed = do_commit_private_result_oram_buckets(
                 toc,
                 &auth,
