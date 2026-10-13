@@ -95,7 +95,10 @@ def _private_oram_fixture(
 def _write_private_oram_runtime_config(
     peer_dir: pathlib.Path,
     fixture: dict,
+    result_signing_key_id: str = "tenant-a/private-result-signing-v1",
 ) -> None:
+    # A paired V2 collection signs its result index with the HNSW owner key, so its tests pass
+    # that key's id here.
     hnsw_public_key = fixture["hnsw_public_key"]
     result_public_key = fixture["result_public_key"]
     hnsw_oram = fixture["hnsw"]["manifest"]["oram"]
@@ -160,7 +163,7 @@ crypto:
           commit_signature_required: true
           merkle_root_required: true
         signature_public_keys:
-          tenant-a/private-result-signing-v1: {result_public_key}
+          {result_signing_key_id}: {result_public_key}
 """
     (peer_dir / "config" / "local.yaml").write_text(local_config)
 
