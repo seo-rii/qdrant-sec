@@ -3331,14 +3331,21 @@ impl Persistent {
         let previous = self
             .private_oram_epochs
             .insert(key.clone(), operation.new.clone());
-        self.save_or_rollback_on_definitive(move |persistent| match previous {
+        // Raft apply kill points: the restarted peer replays the entry from its log, either
+        // onto the old record or onto the saved new one (an idempotent no-op above).
+        crate::dispatcher::private_oram_crash_point("raft_apply_epoch_cas_before_save");
+        let saved = self.save_or_rollback_on_definitive(move |persistent| match previous {
             Some(previous) => {
                 persistent.private_oram_epochs.insert(key, previous);
             }
             None => {
                 persistent.private_oram_epochs.remove(&key);
             }
-        })
+        });
+        if saved.is_ok() {
+            crate::dispatcher::private_oram_crash_point("raft_apply_epoch_cas_after_save");
+        }
+        saved
     }
 
     pub fn private_oram_session_lease(

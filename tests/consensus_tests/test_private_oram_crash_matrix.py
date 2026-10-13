@@ -3,7 +3,9 @@
 The coordinating peer aborts at a named point of the replicated write-back (no unwinding, no
 destructors, like `kill -9`) and is restarted without the crash point. The cluster must then
 converge: before the consensus CAS the old epoch stays authoritative and the same commit
-succeeds after the restart; after the CAS every peer serves the new epoch.
+succeeds after the restart; after the CAS every peer serves the new epoch. A second matrix
+kills a replica while it applies the committed epoch CAS from the Raft log, before and after
+it saves the consensus state; restarted, it must replay the entry and serve the new epoch.
 
 Requires a `target/debug/qdrant` built with `--features private-oram-crash-points`; the tests
 run only when QDRANT_PRIVATE_ORAM_CRASH_TESTS=1.
@@ -52,6 +54,10 @@ BEFORE_CAS = [
 AFTER_CAS = [
     "replicated_writeback_after_cas",
     "replicated_writeback_after_replica_finalize",
+]
+RAFT_APPLY = [
+    "raft_apply_epoch_cas_before_save",
+    "raft_apply_epoch_cas_after_save",
 ]
 
 @pytest.fixture(autouse=True)
@@ -217,3 +223,88 @@ def _commit_succeeds(peer_url: str, fixture: dict) -> bool:
         LAST_ERROR["error"] = f"commit on {peer_url}: {error}"
         return False
     return True
+
+
+def _restart_peer(
+    peer_urls: list[str],
+    peer_dirs: list[pathlib.Path],
+    index: int,
+    log_file: str,
+    extra_env: dict[str, str],
+) -> str:
+    """Stops peer `index` if it still runs and starts it again on the same p2p port."""
+    process = next(
+        process for process in processes if get_uri(process.http_port) == peer_urls[index]
+    )
+    if process.proc.poll() is None:
+        process.interrupt()
+    port = process.p2p_port
+    bootstrap = next(other for other in processes if other is not process)
+    processes.remove(process)
+    process.kill()  # releases its reserved ports for the restart
+    peer_urls[index] = start_peer(
+        peer_dirs[index], log_file, get_uri(bootstrap.p2p_port), port=port, extra_env=extra_env
+    )
+    wait_for_peer_online(peer_urls[index], path="/cluster")
+    return peer_urls[index]
+
+
+@pytest.mark.parametrize("crash_point", RAFT_APPLY)
+def test_replica_abort_while_applying_the_epoch_cas_replays_it(
+    tmp_path: pathlib.Path, crash_point: str
+):
+    peer_urls, peer_dirs, fixture, leader, _ = _start_private_oram_cluster(
+        tmp_path, 3, 3, include_result_oram=False, extra_env=SHORT_LEASE_ENV
+    )
+    hnsw = fixture["hnsw"]
+    base_root = hnsw["manifest"]["root_hash"]
+    next_root = hnsw["commit"]["new_root_hash"]
+    _upload_hnsw(peer_urls[0], fixture)
+    for peer_url in peer_urls:
+        wait_for(
+            lambda url=peer_url: _serves_epoch(url, BASE_EPOCH, base_root),
+            wait_for_timeout=60,
+        )
+
+    # Only the victim, a follower, runs with the crash point armed, so it alone dies while
+    # applying the write-back's epoch CAS; the leader coordinates the write-back.
+    peer_ids = [get_cluster_info(peer_url)["peer_id"] for peer_url in peer_urls]
+    leader_url = peer_urls[peer_ids.index(leader)]
+    victim = next(index for index, peer_id in enumerate(peer_ids) if peer_id != leader)
+    victim_url = _restart_peer(
+        peer_urls,
+        peer_dirs,
+        victim,
+        f"private_oram_raft_apply_armed_{crash_point}.log",
+        {**SHORT_LEASE_ENV, CRASH_POINT_ENV: crash_point},
+    )
+    wait_for_uniform_cluster_status(peer_urls, leader)
+    wait_for(
+        lambda: _serves_epoch(victim_url, BASE_EPOCH, base_root),
+        wait_for_timeout=60,
+    )
+
+    try:
+        _exercise_hnsw_owner_session(leader_url, fixture)
+    except Exception as error:  # noqa: BLE001 - the replica finalize may fail with the victim
+        LAST_ERROR["error"] = f"commit on {leader_url}: {error}"
+    victim_process = next(
+        process for process in processes if get_uri(process.http_port) == victim_url
+    )
+    assert victim_process.proc.wait(timeout=60) != 0, f"replica did not abort at {crash_point}"
+
+    _restart_peer(
+        peer_urls,
+        peer_dirs,
+        victim,
+        f"private_oram_raft_apply_restart_{crash_point}.log",
+        SHORT_LEASE_ENV,
+    )
+    wait_for_uniform_cluster_status(peer_urls, leader)
+    wait_collection_exists_and_active_on_all_peers(COLLECTION, peer_urls)
+    for peer_url in peer_urls:
+        _wait_until(
+            lambda url=peer_url: _serves_epoch(url, NEXT_EPOCH, next_root),
+            f"{peer_url} to serve the new epoch after {crash_point}",
+            120,
+        )
