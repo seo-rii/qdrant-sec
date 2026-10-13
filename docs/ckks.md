@@ -5754,9 +5754,18 @@ control); no payload, token (raw or base64url), resource key or derived
 bucket key bytes may appear in any file. The test runs in the CI private ORAM
 step.
 
-Not yet covered: result ORAM payload plaintext on a multi-peer cluster (the
-cluster fixture still uses synthetic result ciphertext) and V2 append
-mutations.
+`test_private_oram_cluster_result_payloads_hold_no_plaintext` (in
+`test_private_oram_leak_scan.py`) does the same on the three-peer cluster: with
+`QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN=1` the cluster fixture seals real
+result payload blocks (one per leak-scan point, with that point's fetch and
+point tokens) and reports the payloads (raw and base64url), the shared payload
+marker and the derived bucket AEAD key as sentinels. The test uploads both
+indexes, snapshots the collection, commits a result write-back through a
+follower and scans every peer's storage, Raft state, snapshots, logs, metrics
+and telemetry; the uploaded and committed ciphertext must be visible. It
+passes locally and runs in the CI cluster job.
+
+Not yet covered: V2 append mutations.
 
 ### Release gate work: read-only store fault injection
 
@@ -5816,8 +5825,8 @@ child left behind must not block an exact retry, and the other terminal phase
 stays refused. The V2 prestage lifecycle store (install, adoption, cleanup)
 is covered only by the in-process `leave_*_for_test` stop points so far.
 
-Still open for the V2-E gate: kills of a whole Qdrant process across Raft
-apply, and the leader/supervisor concurrency E2E.
+Still open for the V2-E gate: the leader/supervisor concurrency E2E (whole
+process kills across Raft apply are covered below for the epoch CAS).
 
 ### Release gate work: V2 append client benchmark
 
@@ -5855,6 +5864,22 @@ Run it with `cargo build -p qdrant --features private-oram-crash-points` and
 consensus_tests/test_private_oram_crash_matrix.py` from `tests/`. The
 feature is never enabled in release builds; it also lets the test shorten
 session leases (`QDRANT_PRIVATE_ORAM_TEST_SESSION_LEASE_SECS`).
+
+`test_replica_abort_while_applying_the_epoch_cas_replays_it` (same file) kills
+a peer inside Raft apply instead: the epoch CAS apply
+(`compare_and_swap_private_oram_epoch` in `persistent.rs`) has crash points
+before and after it saves the consensus state
+(`raft_apply_epoch_cas_before_save`, `raft_apply_epoch_cas_after_save`). Only
+one follower is restarted with a point armed, the leader coordinates a
+replicated write-back, and the follower dies while applying the committed CAS
+entry. Restarted clean, it replays the entry from its Raft log, onto the old
+record or as a no-op onto the saved one, and every peer must serve the new
+epoch. Both cases pass locally.
+
+The CI workflow has a second job, `qdrant-sec private ORAM cluster E2E`, that
+builds `qdrant` with `private-oram-crash-points` and the `qdrant-sec` examples
+and runs every `tests/consensus_tests/test_private_oram_*.py` with
+`QDRANT_PRIVATE_ORAM_CRASH_TESTS=1`.
 
 Known limitation found by this test: a killed coordinator's session lease
 stays active in consensus, so every peer refuses new private HNSW sessions

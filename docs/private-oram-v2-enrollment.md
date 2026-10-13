@@ -129,8 +129,19 @@ activation"). This document proposes the missing enrollment path.
   index epochs (`Dispatcher::private_oram_enrollment_layout`), and `enroll`
   records exactly that layout before proposing the genesis state.
 - `tests/consensus_tests/test_private_oram_v2_enrollment.py` covers a pinned
-  single peer that is both leader and owner (owner RPCs need TLS). A
-  multi-owner run needs a TLS test cluster.
+  single peer that is both leader and owner, and
+  `test_private_oram_collection_enrolls_every_owner_over_tls`: three pinned
+  peers with internal TLS (a throwaway CA, `https` consensus URIs) and a
+  replica each, so the leader enrolls two remote owners over the TLS-only
+  owner RPCs. The activation authority pins each peer's consensus URI digest
+  including its scheme, so a TLS cluster's bundle must pin `https` (the
+  activation fixture takes a per-peer `tls` flag).
+- Every V2 index must declare the same `logical_capacity`, and a paired
+  collection's V1 HNSW and result manifests must both name the V2 owner signing
+  key (the live-binding check compares them), so a paired deployment signs its
+  result index with the HNSW owner key. `test_private_oram_v2_append.py`
+  enrolls such a paired collection with a genesis state that commits to a real
+  sealed client checkpoint.
 
 ## Risks and open questions
 

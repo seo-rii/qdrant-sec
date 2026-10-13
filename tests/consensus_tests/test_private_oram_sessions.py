@@ -826,11 +826,20 @@ def test_private_oram_dead_replica_automatically_recovers_from_source(
 
     _upload_hnsw(source_url, fixture)
     _exercise_hnsw_owner_session(source_url, fixture)
-    replicated_session = _open_hnsw_owner_session(
-        target_url,
-        NEXT_EPOCH,
-        IDS_VISIBLE_RESULT_PRIVACY,
-    )
+    # The source's lease release reaches the target through consensus, so the target can
+    # refuse a session for a moment after the source's close returned.
+    replicated_session = {}
+
+    def replicated_session_opens() -> bool:
+        try:
+            replicated_session.update(
+                _open_hnsw_owner_session(target_url, NEXT_EPOCH, IDS_VISIBLE_RESULT_PRIVACY)
+            )
+        except Exception:  # noqa: BLE001 - HTTP helpers raise plain Exception
+            return False
+        return True
+
+    wait_for(replicated_session_opens, wait_for_timeout=30)
     assert replicated_session["root_hash"] == fixture["hnsw"]["commit"][
         "new_root_hash"
     ]

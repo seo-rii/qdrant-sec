@@ -1533,6 +1533,21 @@ Signed fields:
   V1 build가 빈 slot을 모두 dummy로 선언해 V2 capacity(reserved slot ≥ 1)를 만족할 수 없던
   문제는 `reserve_private_hnsw_oram_physical_slots`로 해결했다. TLS cluster의 multi-owner
   enrollment와 V2 append E2E는 남아 있다.
+- 2026-10-12: owner journal의 4개 durable 경계(prepare candidate sync/설치, terminal candidate
+  sync/설치) child-process abort matrix(`journal_survives_process_abort_at_every_durable_boundary`),
+  단일 노드 result ORAM payload storage/snapshot sentinel scan
+  (`private_result_oram_payloads_store_no_plaintext_sentinels`), client 측 V2 append 벤치마크
+  (`private_oram_append_bench`, 읽은 경로/버킷/바이트와 write-back frame 보고)가 추가됐다.
+- 2026-10-13: CI에 private ORAM cluster E2E job을 추가했다(`private-oram-crash-points` build로
+  `tests/consensus_tests/test_private_oram_*.py` 전체 실행). 3-peer result payload leak scan,
+  internal TLS 3-peer multi-owner enrollment, follower가 epoch CAS를 Raft apply하는 중(state 저장
+  전/후) kill되고 재시작해 replay하는 matrix가 추가되어 로컬 build에서 통과한다. TLS cluster의
+  activation bundle은 peer consensus URI digest를 scheme까지 pin하므로 https로 pin해야 한다.
+  Paired V2 enrollment는 모든 index가 같은 `logical_capacity`를 선언하고, result V1 manifest도
+  V2 owner key로 서명해야 한다. 실제 client(`private_oram_v2_append_client` example)가 V1 HNSW와
+  result index를 만들고 각각 V1 write-back한 뒤, 실제 sealed checkpoint를 commit하는 genesis
+  state로 paired enrollment하고 mutation session을 여는 E2E(`test_private_oram_v2_append.py`)가
+  통과한다.
 
 완료 조건:
 
