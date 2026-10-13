@@ -945,26 +945,22 @@ struct PrivateOramMutationAppendJobV2 {
     worker_quiesced: Notify,
 }
 
+/// The runtime authority of a job is the mutation lease its admission installs: owned by the
+/// coordinator that validated the append (the local leader of its freeze token) at the next
+/// generation of the slot it validated against. That slot is the pre-admission one, so it holds
+/// no lease yet; reading the lease from it refused every append.
 fn private_oram_mutation_job_authority_v2(
     job: &PrivateOramMutationAppendJobV2,
 ) -> StorageResult<PrivateOramMutationRuntimeAuthorityV2> {
-    let lease = job
-        .material
-        .consensus_slot
-        .active
-        .as_ref()
-        .ok_or_else(invalid_mutation_session)?;
+    let slot = &job.material.consensus_slot;
     let generation = job.material.session.response.mutation_lease_generation;
-    if lease.collection_id != job.binding.collection_id
-        || lease.mutation_id != job.binding.mutation_id
-        || job.material.consensus_slot.generation != generation
-    {
+    if slot.active.is_some() || slot.generation.checked_add(1) != Some(generation) {
         return Err(invalid_mutation_session());
     }
     Ok(PrivateOramMutationRuntimeAuthorityV2 {
         collection_id: job.binding.collection_id.clone(),
         mutation_id: job.binding.mutation_id.clone(),
-        owner_peer_id: lease.owner_peer_id,
+        owner_peer_id: job.binding.token.leader.peer_id,
         generation,
     })
 }
@@ -1106,6 +1102,12 @@ impl PrivateOramValidatedMutationAppendV2 {
             cleanup_claimed: AtomicBool::new(false),
             worker_quiesced: Notify::new(),
         });
+        // The fixed reads are complete and the session is frozen for this job, so its paired V1
+        // read sessions have served their purpose. They must go before the job runs: the owner
+        // pre-stage and the parent materialization take the collection lifecycle guard, which
+        // refuses while any index session is open, and the coordinator is always an owner, so
+        // its own read sessions would refuse every append. Later releases find nothing to do.
+        release_underlying_sessions(&job.material.session)?;
         reservation.transfer_to_job(Arc::clone(&job))?;
         Ok(PrivateOramDetachedMutationAppendV2 {
             job,

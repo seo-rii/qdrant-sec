@@ -1548,6 +1548,17 @@ Signed fields:
   result index를 만들고 각각 V1 write-back한 뒤, 실제 sealed checkpoint를 commit하는 genesis
   state로 paired enrollment하고 mutation session을 여는 E2E(`test_private_oram_v2_append.py`)가
   통과한다.
+- 2026-10-13: 같은 client로 실제 paired append(모든 fixed read window를 읽고 검증, finalize, owner
+  prepare 제출)를 live peer에서 실행해 두 server bug를 고쳤다: runtime job authority를 admission 전
+  lease slot(항상 lease 없음)에서 읽어 모든 append가 job 등록에서 거부되던 문제, mutation
+  session의 paired V1 read session이 남아 owner pre-stage/parent materialization의 lifecycle
+  guard가 coordinator 자신의 session 때문에 모든 append를 거부하던 문제. 이제 append가 검증,
+  reservation, owner pre-stage, admission까지 진행한다. 남은 gap: admission 뒤 첫 parent
+  progress(lifecycle `Admitted` → `ParentProgress`)를 제안하는 경로가 없어 recovery readiness의
+  owner capsule install이 consensus parent watermark 없음으로 거부된다(restart resume 경로도
+  기존 watermark만 전진시킴). 테스트는 이 지점을 expected failure로 표시한다. Result ORAM
+  snapshot contract가 모든 bucket이 manifest epoch이기를 요구해 commit 뒤 snapshot이 실패하던
+  bug도 고쳤다(older bucket 허용, commitment는 bucket 자신의 epoch로 검증).
 
 완료 조건:
 

@@ -143,6 +143,39 @@ activation"). This document proposes the missing enrollment path.
   enrolls such a paired collection with a genesis state that commits to a real
   sealed client checkpoint.
 
+## Findings from the append test
+
+`test_private_oram_v2_append.py` drives a real paired append: the
+`private_oram_v2_append_client` example reads every fixed window of both
+indexes through the mutation `read` route, verifies the buckets against the
+session roots, finalizes the mutation and posts the owner prepare. Reading
+every level-0 node as a candidate is required: linking the new node to a
+neighbor whose list is full prunes that list, which needs every current
+neighbor's vector, so the read schedule is the rewrites, the insert and one
+candidate path per point.
+
+Two server bugs refused every append, and are fixed:
+
+- The runtime job authority was read from the lease slot the append was
+  validated against. That slot is the pre-admission one, so it never holds a
+  lease and every append was refused when its job was registered. The
+  authority is now the lease the admission installs: the coordinator (the
+  local leader of the job's freeze token) at the slot's next generation.
+- The session's paired V1 read sessions stayed open after the reads. The owner
+  pre-stage and the parent materialization take the collection lifecycle
+  guard, which refuses while any index session is open, and the coordinator is
+  always an owner, so its own read sessions refused every append. They are now
+  released when the job is created; later releases find nothing.
+
+With both fixes an append is validated, reserved, pre-staged on the owner and
+admitted. It then stops: after admission the coordinator materializes the
+parent, adopts the owners and stages the point, but nothing proposes the
+first parent progress (the cleanup lifecycle stays `Admitted`), so recovery
+readiness finds no consensus parent watermark and every owner capsule install
+is refused. The journal resume used after a restart only advances an existing
+watermark, so it cannot record the first one either. The test expects this
+failure until the coordinator records parent progress after admission.
+
 ## Risks and open questions
 
 - The floor-aware Initialize is new consensus behavior: needs the version gate,

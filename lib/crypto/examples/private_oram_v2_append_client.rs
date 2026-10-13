@@ -13,6 +13,12 @@
 //!   manifest of both indexes and a genesis state whose client state digest is that of the
 //!   sealed append checkpoint built from the real position maps.
 //! - `{"cmd": "open"}` returns a mutation `open` body for the enrolled state.
+//! - `{"cmd": "begin", "session": <open response>}` starts the paired append of one new point
+//!   (HNSW node and result payload) and returns the first `read` body; every
+//!   `{"cmd": "read_response", "response": <read result>}` verifies a read window and returns the
+//!   next `read` body, until it returns the `append` body (owner prepare of the finalized
+//!   mutation).
+//! - `{"cmd": "open_next"}` adopts the appended state and returns an `open` body for it.
 
 use std::io::{BufRead as _, Write as _};
 
@@ -24,29 +30,36 @@ use qdrant_sec::{
     PRIVATE_ORAM_SIGNED_STATE_V2_VERSION, PRIVATE_RESULT_ORAM_BINDING,
     PRIVATE_RESULT_ORAM_PAYLOAD_BLOCK_VERSION, PRIVATE_RESULT_ORAM_V2_BINDING,
     PrivateHnswBucketAeadBaseContext, PrivateHnswBuildPoint, PrivateHnswClientKeys,
-    PrivateHnswCommitSignatureContext, PrivateHnswManifestBuildContext, PrivateHnswOramBucket,
-    PrivateHnswOramClientConfig, PrivateHnswOramManifest, PrivateHnswParams,
-    PrivateHnswPlaintextIndexBuild, PrivateHnswVectorEncoding, PrivateOramAppendClientCheckpointV2,
-    PrivateOramAppendClientIndexCheckpointV2, PrivateOramAppendHnswRecordV2,
-    PrivateOramAppendPointRecordV2, PrivateOramAppendResultRecordV2,
+    PrivateHnswCommitSignatureContext, PrivateHnswEncryptedPathBatch,
+    PrivateHnswManifestBuildContext, PrivateHnswOramClientConfig, PrivateHnswOramManifest,
+    PrivateHnswParams, PrivateHnswPlaintextIndexBuild, PrivateHnswVectorEncoding,
+    PrivateOramAppendClientCheckpointV2, PrivateOramAppendClientIndexCheckpointV2,
+    PrivateOramAppendHnswRecordV2, PrivateOramAppendHnswTransactionOutputV2,
+    PrivateOramAppendHnswTransactionPlanV2, PrivateOramAppendHnswTransactionV2,
+    PrivateOramAppendLevel0PointV2, PrivateOramAppendPairedFinalizationContextV1,
+    PrivateOramAppendPairedFinalizationInputV1, PrivateOramAppendPairedFinalizationV1,
+    PrivateOramAppendPointRecordV2, PrivateOramAppendResultPointV2,
+    PrivateOramAppendResultRecordV2, PrivateOramAppendResultTransactionOutputV2,
+    PrivateOramAppendResultTransactionPlanV2, PrivateOramAppendResultTransactionV2,
     PrivateOramEncryptedAppendClientCheckpointV2, PrivateOramImmutableIndexParamsV2,
     PrivateOramImmutableIndexV2, PrivateOramImmutableManifestBundleV2,
     PrivateOramImmutableManifestV2, PrivateOramIndexCapacityV2, PrivateOramIndexKindV2,
     PrivateOramIndexStateV2, PrivateOramSignedStateBundleV2, PrivateOramSignedStateV2,
-    PrivateResultOramBucket, PrivateResultOramBucketAeadBaseContext,
-    PrivateResultOramClientCommitBucketRef, PrivateResultOramClientConfig,
+    PrivateResultOramBucketAeadBaseContext, PrivateResultOramClientCommitBucketRef,
     PrivateResultOramClientKeys, PrivateResultOramClientState, PrivateResultOramCommitPlan,
-    PrivateResultOramCommitSignatureContext, PrivateResultOramManifest,
-    PrivateResultOramPayloadBlockPlaintext, PrivateResultOramPlaintextBucket,
+    PrivateResultOramCommitSignatureContext, PrivateResultOramEncryptedBucketBatch,
+    PrivateResultOramManifest, PrivateResultOramPayloadBlockPlaintext,
     PrivateResultOramReadBucketsSignatureContext, ResultPrivacyMode, SecretKey,
     VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER, bind_private_oram_append_client_checkpoint_v2,
     build_private_hnsw_oram_manifest_from_encrypted_index,
     build_private_hnsw_oram_plaintext_index_from_auto_layered_f32_points,
-    empty_private_result_oram_plaintext_bucket, encode_private_hnsw_oram_leaf_label,
+    decode_private_result_oram_leaf_label, empty_private_result_oram_plaintext_bucket,
+    encode_private_hnsw_oram_leaf_label, finalize_private_oram_append_paired_mutation_v1,
     plan_private_hnsw_oram_commit_for_manifest, private_oram_append_client_checkpoint_v2_digest,
     private_oram_immutable_manifest_v2_digest, private_result_oram_bucket_ids_for_leaf,
     private_result_oram_client_config_from_manifest,
-    private_result_oram_merkle_root_for_commitments, reserve_private_hnsw_oram_physical_slots,
+    private_result_oram_merkle_root_for_commitments,
+    project_private_oram_append_paired_owner_prepare_v1, reserve_private_hnsw_oram_physical_slots,
     seal_private_hnsw_oram_plaintext_bucket, seal_private_hnsw_oram_plaintext_index,
     seal_private_oram_append_client_checkpoint_v2, seal_private_result_oram_plaintext_bucket,
     sign_private_hnsw_oram_commit, sign_private_hnsw_oram_manifest,
@@ -83,23 +96,18 @@ const MAX_NEIGHBOR_REWRITES: u32 = 1;
 const MAX_CLIENT_STASH_BLOCKS: u64 = 8;
 
 struct HnswIndex {
-    config: PrivateHnswOramClientConfig,
     keys: PrivateHnswClientKeys,
     build: PrivateHnswPlaintextIndexBuild,
     manifest: PrivateHnswOramManifest,
-    buckets: Vec<PrivateHnswOramBucket>,
     epoch: u64,
     root_hash: String,
 }
 
 struct ResultIndex {
-    config: PrivateResultOramClientConfig,
     keys: PrivateResultOramClientKeys,
-    plaintext: Vec<PrivateResultOramPlaintextBucket>,
     positions: PrivateResultOramClientState,
     blocks: Vec<PrivateResultOramPayloadBlockPlaintext>,
     manifest: PrivateResultOramManifest,
-    buckets: Vec<PrivateResultOramBucket>,
     epoch: u64,
     root_hash: String,
 }
@@ -111,6 +119,33 @@ struct Enrolled {
     encrypted_checkpoint: PrivateOramEncryptedAppendClientCheckpointV2,
 }
 
+/// The mutation session an append runs in, from the `open` response.
+struct Session {
+    session_id: String,
+    mutation_id: String,
+    manifest_digest: String,
+    old_state_digest: String,
+    writer_lease_digest: String,
+    writer_fence: u64,
+    issued_at_unix: u64,
+    lease_expires_unix: u64,
+    hnsw_epoch: u64,
+    hnsw_root_hash: String,
+    result_epoch: u64,
+    result_root_hash: String,
+}
+
+struct Append {
+    session: Session,
+    hnsw: Option<PrivateOramAppendHnswTransactionV2>,
+    result: Option<PrivateOramAppendResultTransactionV2>,
+    hnsw_output: Option<PrivateOramAppendHnswTransactionOutputV2>,
+    result_output: Option<PrivateOramAppendResultTransactionOutputV2>,
+    /// The index kind and sequence of the read window the server is answering.
+    pending: Option<(PrivateOramIndexKindV2, u32)>,
+    finalized: Option<PrivateOramAppendPairedFinalizationV1>,
+}
+
 struct Client {
     collection_id: String,
     owner_key: Ed25519KeyPair,
@@ -119,6 +154,7 @@ struct Client {
     hnsw: Option<HnswIndex>,
     result: Option<ResultIndex>,
     enrolled: Option<Enrolled>,
+    append: Option<Append>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +184,7 @@ fn main() -> Result<(), BoxError> {
         hnsw: None,
         result: None,
         enrolled: None,
+        append: None,
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -161,7 +198,7 @@ fn main() -> Result<(), BoxError> {
             .and_then(|command| client.handle(&command))
         {
             Ok(result) => json!({"ok": true, "result": result}),
-            Err(error) => json!({"ok": false, "error": error.to_string()}),
+            Err(error) => json!({"ok": false, "error": error_chain(error.as_ref())}),
         };
         writeln!(stdout, "{}", serde_json::to_string(&answer)?)?;
         stdout.flush()?;
@@ -183,6 +220,12 @@ impl Client {
                 self.enroll(template)
             }
             Some("open") => self.open(),
+            Some("begin") => self.begin(&command["session"]),
+            Some("read_response") => {
+                self.accept_read(&command["response"])?;
+                self.next_action()
+            }
+            Some("open_next") => self.open_next(),
             _ => Err("unknown command".into()),
         }
     }
@@ -349,19 +392,11 @@ impl Client {
             },
         });
 
-        let mut buckets = encrypted.buckets;
-        let root = buckets
-            .iter_mut()
-            .find(|bucket| bucket.bucket_id == 0)
-            .ok_or("the sealed HNSW index has no root bucket")?;
-        *root = updated_bucket;
         Ok((
             HnswIndex {
-                config,
                 keys,
                 build,
                 manifest,
-                buckets,
                 epoch: NEXT_EPOCH,
                 root_hash: commit_plan.new_root_hash,
             },
@@ -510,17 +545,12 @@ impl Client {
             },
         });
 
-        let mut buckets = buckets;
-        buckets[0] = updated_bucket;
         Ok((
             ResultIndex {
-                config,
                 keys,
-                plaintext,
                 positions,
                 blocks,
                 manifest,
-                buckets,
                 epoch: NEXT_EPOCH,
                 root_hash: new_root_hash,
             },
@@ -565,9 +595,10 @@ impl Client {
             );
         }
 
-        let window = 1_u32;
-        let fixed_append_read_path_count =
-            (MAX_NEIGHBOR_REWRITES + 1 + window).div_ceil(window) * window;
+        // One path per window. Linking the new node to a neighbor whose level-0 list is full
+        // prunes that list, which needs every current neighbor's vector, so the candidate
+        // phase reads every node: the rewrites, the insert and one candidate path per point.
+        let fixed_append_read_path_count = MAX_NEIGHBOR_REWRITES + 1 + self.points.len() as u32;
         let fixed_append_write_bucket_count = fixed_append_read_path_count * (TREE_HEIGHT + 1);
         let capacity = |bucket_count: u64, bucket_size: u32, logical: u64, dummy: u64| {
             let physical_slots = bucket_count * u64::from(bucket_size);
@@ -729,6 +760,277 @@ impl Client {
         }))
     }
 
+    fn begin(&mut self, session: &Value) -> Result<Value, BoxError> {
+        let enrolled = self.enrolled.as_ref().ok_or("enroll before begin")?;
+        let hnsw = self.hnsw.as_ref().ok_or("build before begin")?;
+        let session = Session::parse(session)?;
+        let manifest = &enrolled.manifest_bundle.manifest;
+        let fixed_read_path_count = manifest
+            .indexes
+            .first()
+            .ok_or("the manifest has no index")?
+            .capacity
+            .fixed_append_read_path_count;
+
+        // One new point: an HNSW node at level 0 and its payload in the result index.
+        let node_id = random_bytes_32()?;
+        let point_token = random_bytes_32()?;
+        let payload_fetch_token = random_bytes_32()?;
+        let hnsw_point = PrivateOramAppendLevel0PointV2 {
+            node_id,
+            point_token,
+            visible_point_id: None,
+            payload_fetch_token: Some(payload_fetch_token),
+            vector: vec![1.5, 0.5],
+            initial_leaf: random_leaf()?,
+        };
+        // Every node is a candidate (see the read schedule chosen at enrollment).
+        let hnsw_plan = PrivateOramAppendHnswTransactionPlanV2 {
+            index_name: VECTOR_NAME.to_string(),
+            mutation_id: session.mutation_id.clone(),
+            writer_lease_digest: session.writer_lease_digest.clone(),
+            writer_fence: session.writer_fence,
+            paths_per_window: 1,
+            candidate_node_ids: self.points.iter().map(|point| point.node_id).collect(),
+            candidate_remap_leaves: random_leaves(self.points.len() as u32)?,
+            rewrite_remap_leaves: random_leaves(MAX_NEIGHBOR_REWRITES)?,
+            padding_leaves: random_leaves(fixed_read_path_count)?,
+        };
+        let result_initial_leaf = random_leaf()?;
+        let result_point = PrivateOramAppendResultPointV2 {
+            payload_fetch_token,
+            point_token,
+            payload: b"{\"body\":\"append-e2e-appended\"}".to_vec(),
+            initial_leaf: result_initial_leaf,
+        };
+        let result_plan = PrivateOramAppendResultTransactionPlanV2 {
+            index_name: RESULT_INDEX_NAME.to_string(),
+            mutation_id: session.mutation_id.clone(),
+            writer_lease_digest: session.writer_lease_digest.clone(),
+            writer_fence: session.writer_fence,
+            paths_per_window: 1,
+            insert_eviction_leaf: (result_initial_leaf + 1) % (1 << TREE_HEIGHT),
+            padding_leaves: random_leaves(fixed_read_path_count - 1)?,
+        };
+        let hnsw_transaction = PrivateOramAppendHnswTransactionV2::begin(
+            manifest,
+            &enrolled.state_bundle.state,
+            &enrolled.checkpoint,
+            hnsw_point,
+            hnsw_plan,
+        )?;
+        let result_transaction = PrivateOramAppendResultTransactionV2::begin(
+            manifest,
+            &enrolled.state_bundle.state,
+            &enrolled.checkpoint,
+            result_point,
+            result_plan,
+        )?;
+        self.append = Some(Append {
+            session,
+            hnsw: Some(hnsw_transaction),
+            result: Some(result_transaction),
+            hnsw_output: None,
+            result_output: None,
+            pending: None,
+            finalized: None,
+        });
+        self.next_action()
+    }
+
+    /// The next read window (HNSW windows first, then result windows) as a `read` body, or,
+    /// once every window is verified, the finalized mutation as an `append` body.
+    fn next_action(&mut self) -> Result<Value, BoxError> {
+        let append = self.append.as_mut().ok_or("begin before reading")?;
+        if let Some(transaction) = append.hnsw.as_mut() {
+            if let Some(marker) = transaction.prepare_next_read_window()? {
+                let window = transaction.next_read_window(&marker)?.window;
+                append.pending = Some((PrivateOramIndexKindV2::Hnsw, window.sequence));
+                return self.hnsw_read_body(window.paths);
+            }
+            let transaction = append.hnsw.take().ok_or("the HNSW transaction is gone")?;
+            append.hnsw_output = Some(transaction.finalize()?);
+        }
+        if let Some(transaction) = append.result.as_mut() {
+            if let Some(marker) = transaction.prepare_next_read_window()? {
+                let window = transaction.next_read_window(&marker)?.window;
+                append.pending = Some((PrivateOramIndexKindV2::Result, window.sequence));
+                return self.result_read_body(&window.paths);
+            }
+            let transaction = append
+                .result
+                .take()
+                .ok_or("the result transaction is gone")?;
+            append.result_output = Some(transaction.finalize()?);
+        }
+        self.finalize_append()
+    }
+
+    fn hnsw_read_body(&self, paths: Vec<String>) -> Result<Value, BoxError> {
+        let hnsw = self.hnsw.as_ref().ok_or("build before reading")?;
+        let session = &self.append.as_ref().ok_or("begin before reading")?.session;
+        let signature = sign_private_hnsw_oram_read_paths_for_manifest_context(
+            &self.owner_key,
+            &hnsw.manifest,
+            session.hnsw_epoch,
+            &session.hnsw_root_hash,
+            &paths,
+        )?;
+        Ok(json!({"read": {
+            "kind": "hnsw",
+            "session_id": session.session_id,
+            "padding": {"requested_paths": paths.len(), "dummy_paths_included": true},
+            "paths": paths,
+            "client_signature": signature,
+        }}))
+    }
+
+    fn result_read_body(&self, paths: &[String]) -> Result<Value, BoxError> {
+        let result = self.result.as_ref().ok_or("build before reading")?;
+        let session = &self.append.as_ref().ok_or("begin before reading")?.session;
+        let mut bucket_ids = Vec::new();
+        for path in paths {
+            let leaf = decode_private_result_oram_leaf_label(path, TREE_HEIGHT)?;
+            bucket_ids.extend(private_result_oram_bucket_ids_for_leaf(leaf, TREE_HEIGHT)?);
+        }
+        let signature = sign_private_result_oram_read_buckets(
+            &self.owner_key,
+            PrivateResultOramReadBucketsSignatureContext {
+                collection_id: &self.collection_id,
+                key_id: KEY_ID,
+                rk_id: KEY_ID,
+                rk_epoch: RK_EPOCH,
+                signing_key_id: OWNER_SIGNING_KEY_ID,
+            },
+            session.result_epoch,
+            &session.result_root_hash,
+            result.manifest.bucket_count,
+            &bucket_ids,
+        )?;
+        Ok(json!({"read": {
+            "kind": "result",
+            "session_id": session.session_id,
+            "bucket_ids": bucket_ids,
+            "read_signature": signature,
+        }}))
+    }
+
+    /// Verifies the server's answer to the pending read window (Merkle proof against the
+    /// session root, AEAD open of every bucket) and feeds it to that index's transaction.
+    fn accept_read(&mut self, response: &Value) -> Result<(), BoxError> {
+        let append = self.append.as_mut().ok_or("begin before reading")?;
+        let (kind, sequence) = append.pending.take().ok_or("no read window is pending")?;
+        // The mutation route wraps the index's read answer as `{"kind", "response"}`.
+        let response = &response["response"];
+        let index_epoch = u64_field(response, "index_epoch")?;
+        let root_hash = str_field(response, "root_hash")?;
+        let proof_value = str_field(&response["proof"], "value")?;
+        match kind {
+            PrivateOramIndexKindV2::Hnsw => {
+                let hnsw = self.hnsw.as_ref().ok_or("build before reading")?;
+                let batch = PrivateHnswEncryptedPathBatch {
+                    index_epoch,
+                    root_hash,
+                    bucket_count: hnsw.manifest.bucket_count,
+                    proof_value,
+                    buckets: serde_json::from_value(response["buckets"].clone())?,
+                };
+                append
+                    .hnsw
+                    .as_mut()
+                    .ok_or("the HNSW transaction is gone")?
+                    .accept_verified_window(sequence, &hnsw.keys, &batch)?;
+            }
+            PrivateOramIndexKindV2::Result => {
+                let result = self.result.as_ref().ok_or("build before reading")?;
+                let batch = PrivateResultOramEncryptedBucketBatch {
+                    index_epoch,
+                    root_hash,
+                    bucket_count: result.manifest.bucket_count,
+                    proof_value,
+                    buckets: serde_json::from_value(response["buckets"].clone())?,
+                };
+                append
+                    .result
+                    .as_mut()
+                    .ok_or("the result transaction is gone")?
+                    .accept_verified_window(sequence, &result.keys, &batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_append(&mut self) -> Result<Value, BoxError> {
+        let enrolled = self.enrolled.as_ref().ok_or("enroll before appending")?;
+        let append = self.append.as_mut().ok_or("begin before appending")?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let hnsw_output = append
+            .hnsw_output
+            .take()
+            .ok_or("the HNSW reads are unfinished")?;
+        let result_output = append
+            .result_output
+            .take()
+            .ok_or("the result reads are unfinished")?;
+        let session = &append.session;
+        let finalized = finalize_private_oram_append_paired_mutation_v1(
+            &self.checkpoint_key,
+            &self.owner_key,
+            PrivateOramAppendPairedFinalizationInputV1 {
+                manifest_bundle: &enrolled.manifest_bundle,
+                old_state_bundle: &enrolled.state_bundle,
+                old_encrypted_checkpoint: &enrolled.encrypted_checkpoint,
+                hnsw_output,
+                result_output,
+                // The mutation's validity window is exactly the session lease.
+                issued_at_unix: session.issued_at_unix,
+                expires_at_unix: session.lease_expires_unix,
+                new_state_signed_at_unix: now_unix,
+                validation: PrivateOramAppendPairedFinalizationContextV1 {
+                    expected_collection_id: &self.collection_id,
+                    expected_manifest_digest: &session.manifest_digest,
+                    expected_owner_signing_key_id: OWNER_SIGNING_KEY_ID,
+                    expected_layout_generation: enrolled.state_bundle.state.layout_generation,
+                    expected_layout_digest: &enrolled.state_bundle.state.layout_digest,
+                    expected_writer_lease_digest: &session.writer_lease_digest,
+                    expected_writer_fence: session.writer_fence,
+                    expected_state_sequence: enrolled.state_bundle.state.state_sequence,
+                    expected_old_state_digest: &session.old_state_digest,
+                    now_unix,
+                    max_mutation_ttl_secs: session
+                        .lease_expires_unix
+                        .checked_sub(session.issued_at_unix)
+                        .ok_or("the session lease ends before it starts")?,
+                    public_key: self.owner_key.public_key().as_ref(),
+                },
+            },
+        )?;
+        let owner_prepare = project_private_oram_append_paired_owner_prepare_v1(&finalized)?;
+        let body = json!({"append": {
+            "session_id": session.session_id,
+            "owner_prepare": owner_prepare,
+            "staged_insert_frame_b64": null,
+        }});
+        append.finalized = Some(finalized);
+        Ok(body)
+    }
+
+    /// Adopts the appended state and checkpoint as the client's current ones.
+    fn open_next(&mut self) -> Result<Value, BoxError> {
+        let finalized = self
+            .append
+            .take()
+            .and_then(|append| append.finalized)
+            .ok_or("append before open_next")?;
+        let enrolled = self.enrolled.as_mut().ok_or("enroll before open_next")?;
+        enrolled.state_bundle = finalized.mutation_bundle.mutation.new_state;
+        enrolled.checkpoint = finalized.checkpoint;
+        enrolled.encrypted_checkpoint = finalized.encrypted_checkpoint;
+        self.open()
+    }
+
     /// One point record per fixture point, ordered by point token bytes.
     fn point_records(&self) -> Result<Vec<PrivateOramAppendPointRecordV2>, BoxError> {
         let mut points = self.points.iter().collect::<Vec<_>>();
@@ -821,10 +1123,82 @@ fn fixture_points() -> Vec<PrivateHnswBuildPoint> {
     ]
 }
 
-fn random_base64url_32() -> Result<String, BoxError> {
+impl Session {
+    fn parse(value: &Value) -> Result<Self, BoxError> {
+        let index = |kind: &str| {
+            value["indexes"]
+                .as_array()
+                .and_then(|indexes| indexes.iter().find(|index| index["kind"] == kind))
+                .ok_or("the session has no index of that kind")
+        };
+        let hnsw = index("hnsw")?;
+        let result = index("result")?;
+        Ok(Self {
+            session_id: str_field(value, "session_id")?,
+            mutation_id: str_field(value, "mutation_id")?,
+            manifest_digest: str_field(value, "manifest_digest")?,
+            old_state_digest: str_field(value, "old_state_digest")?,
+            writer_lease_digest: str_field(value, "writer_lease_digest")?,
+            writer_fence: u64_field(value, "writer_fence")?,
+            issued_at_unix: u64_field(value, "issued_at_unix")?,
+            lease_expires_unix: u64_field(value, "lease_expires_unix")?,
+            hnsw_epoch: u64_field(hnsw, "index_epoch")?,
+            hnsw_root_hash: str_field(hnsw, "root_hash")?,
+            result_epoch: u64_field(result, "index_epoch")?,
+            result_root_hash: str_field(result, "root_hash")?,
+        })
+    }
+}
+
+/// The error and every source under it, since the library errors redact their details.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
+fn str_field(value: &Value, name: &str) -> Result<String, BoxError> {
+    Ok(value[name]
+        .as_str()
+        .ok_or_else(|| format!("missing string field {name}"))?
+        .to_string())
+}
+
+/// The V2 wire carries u64 values as decimal strings; plain numbers are accepted too.
+fn u64_field(value: &Value, name: &str) -> Result<u64, BoxError> {
+    match &value[name] {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| format!("missing u64 field {name}").into())
+}
+
+fn random_bytes_32() -> Result<[u8; 32], BoxError> {
     let mut bytes = [0_u8; 32];
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "random generation failed")?;
-    Ok(BASE64URL_NOPAD.encode(&bytes))
+    Ok(bytes)
+}
+
+fn random_base64url_32() -> Result<String, BoxError> {
+    Ok(BASE64URL_NOPAD.encode(&random_bytes_32()?))
+}
+
+fn random_leaf() -> Result<u64, BoxError> {
+    let mut bytes = [0_u8; 8];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "random generation failed")?;
+    Ok(u64::from_le_bytes(bytes) % (1 << TREE_HEIGHT))
+}
+
+fn random_leaves(count: u32) -> Result<Vec<u64>, BoxError> {
+    (0..count).map(|_| random_leaf()).collect()
 }

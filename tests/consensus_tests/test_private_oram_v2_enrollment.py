@@ -92,6 +92,9 @@ U64_FIELDS = {
     "writer_fence",
 }
 
+# Mirrors the u64 list fields of the wire (lists of decimal strings).
+U64_ARRAY_FIELDS = {"bucket_ids"}
+
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="private ORAM peer identities are Linux-only",
@@ -104,11 +107,17 @@ def cleanup_v2_enrollment_peers():
     kill_all_processes()
 
 
+def _is_u64(item) -> bool:
+    return isinstance(item, int) and not isinstance(item, bool)
+
+
 def _to_wire(value):
     if isinstance(value, dict):
         return {
             key: str(item)
-            if key in U64_FIELDS and isinstance(item, int) and not isinstance(item, bool)
+            if key in U64_FIELDS and _is_u64(item)
+            else [str(entry) if _is_u64(entry) else entry for entry in item]
+            if key in U64_ARRAY_FIELDS and isinstance(item, list)
             else _to_wire(item)
             for key, item in value.items()
         }
@@ -120,7 +129,11 @@ def _to_wire(value):
 def _from_wire(value):
     if isinstance(value, dict):
         return {
-            key: int(item) if key in U64_FIELDS and isinstance(item, str) else _from_wire(item)
+            key: int(item)
+            if key in U64_FIELDS and isinstance(item, str)
+            else [int(entry) if isinstance(entry, str) else entry for entry in item]
+            if key in U64_ARRAY_FIELDS and isinstance(item, list)
+            else _from_wire(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
