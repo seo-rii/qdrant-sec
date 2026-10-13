@@ -1,8 +1,9 @@
 //! Test fixture: signs a private ORAM mutation V2 activation authority bundle for a local
 //! cluster. Reads `{"first_voter_peer_id", "binary_capability_digest", "peers": [{"peer_id",
-//! "host", "p2p_port", "public_key"}]}` on stdin, where `public_key` is the output of
-//! `qdrant --bootstrap-private-oram-peer-identity`, and prints the canonical bundle JSON (to
-//! be written to `authority_bundle_path` byte for byte) and the trust anchor settings.
+//! "host", "p2p_port", "public_key", "tls"?}]}` on stdin, where `public_key` is the output of
+//! `qdrant --bootstrap-private-oram-peer-identity` and `tls: true` pins the peer's https
+//! consensus URI (internal TLS), and prints the canonical bundle JSON (to be written to
+//! `authority_bundle_path` byte for byte) and the trust anchor settings.
 //! The authority key is a fixed test seed: never use this for a real cluster.
 
 use std::io::Read;
@@ -36,6 +37,8 @@ struct InputPeer {
     host: String,
     p2p_port: u16,
     public_key: PrivateOramPeerRecoveryPublicKeyV1,
+    #[serde(default)]
+    tls: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,7 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(PrivateOramActivationPeerPinV1 {
                 peer_id: peer.peer_id,
                 peer_uri_digest: try_private_oram_activation_peer_uri_digest_v1(
-                    PrivateOramActivationPeerUriSchemeV1::Http,
+                    if peer.tls {
+                        PrivateOramActivationPeerUriSchemeV1::Https
+                    } else {
+                        PrivateOramActivationPeerUriSchemeV1::Http
+                    },
                     &peer.host,
                     peer.p2p_port,
                 )?,

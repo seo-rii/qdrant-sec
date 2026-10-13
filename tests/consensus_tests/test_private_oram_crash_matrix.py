@@ -236,12 +236,14 @@ def _restart_peer(
     process = next(
         process for process in processes if get_uri(process.http_port) == peer_urls[index]
     )
+    # Either call releases the peer's reserved ports for the restart.
     if process.proc.poll() is None:
         process.interrupt()
+    else:
+        process.kill()
     port = process.p2p_port
     bootstrap = next(other for other in processes if other is not process)
     processes.remove(process)
-    process.kill()  # releases its reserved ports for the restart
     peer_urls[index] = start_peer(
         peer_dirs[index], log_file, get_uri(bootstrap.p2p_port), port=port, extra_env=extra_env
     )

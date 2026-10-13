@@ -154,8 +154,10 @@ def _enrollment_bundles(fixture: dict, template: dict) -> dict:
     return json.loads(completed.stdout)
 
 
-def _write_config(peer_dir: pathlib.Path, runtime_fixture: dict, activation: dict) -> None:
-    _write_private_oram_runtime_config(peer_dir, runtime_fixture)
+def _write_config(
+    peer_dir: pathlib.Path, runtime_fixture: dict, activation: dict, **runtime_options
+) -> None:
+    _write_private_oram_runtime_config(peer_dir, runtime_fixture, **runtime_options)
     bundle_path = peer_dir / "private_oram_v2_authority_bundle.json"
     bundle_path.write_bytes(activation["bundle_canonical_json"].encode())
     settings = {
@@ -370,6 +372,8 @@ def test_private_oram_collection_enrolls_every_owner_over_tls(
                 "host": "127.0.0.1",
                 "p2p_port": base_port,
                 "public_key": identity["public_key"],
+                # The pins cover each peer's https consensus URI.
+                "tls": True,
             }
             for peer_id, base_port, identity in zip(TLS_PEER_IDS, base_ports, identities)
         ],
