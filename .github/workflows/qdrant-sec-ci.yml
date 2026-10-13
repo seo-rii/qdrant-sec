@@ -173,6 +173,10 @@ jobs:
       - name: Run private ORAM store, journal, consensus and server tests
         shell: bash
         run: |
+          # GitHub keeps only ten error annotations per step: per-line test and panic matches
+          # would use them up before the summary below, so only the summary is annotated here.
+          echo "::remove-matcher owner=qdrant-sec-test::"
+          echo "::remove-matcher owner=qdrant-sec-panic::"
           status=0
           run_tests() {
             cargo test --locked "$@" 2>&1 | tee -a private-oram-tests.log
@@ -182,10 +186,11 @@ jobs:
           run_tests -p storage --lib -- private_oram consensus_manager consensus::persistent dispatcher || status=1
           run_tests -p qdrant --bin qdrant -- private_hnsw private_result_oram private_oram qdrant_internal_api || status=1
           if [ "$status" -ne 0 ]; then
-            # Surface failing tests and panic sites as one annotation (job logs need admin rights).
-            summary=$({ grep -E '^test .* FAILED$|^error(\[|:)' private-oram-tests.log; grep -A3 'panicked at' private-oram-tests.log; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            # Surface panic sites and failing tests as one annotation (job logs need admin rights).
+            summary=$({ grep -A3 'panicked at' private-oram-tests.log; grep -E '^test .* FAILED$|^error(\[|:)' private-oram-tests.log; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=private ORAM tests failed::${summary}"
           fi
+          echo "::add-matcher::.github/rust-problem-matchers.json"
           exit "$status"
 
       - name: Run CLI snapshot crypto preflight tests
@@ -196,3 +201,61 @@ jobs:
 
       - name: Validate default settings parsing
         run: cargo test --locked -p qdrant settings::tests::test_default_config
+
+  qdrant-sec-cluster-e2e:
+    name: qdrant-sec private ORAM cluster E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      UV_VERSION: 0.9.17
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: qdrant-sec-cluster-e2e
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libunwind-dev protobuf-compiler
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Install uv and Python dependencies
+        run: |
+          curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          "$HOME/.local/bin/uv" --project tests sync
+
+      - name: Register Rust problem matchers
+        run: echo "::add-matcher::.github/rust-problem-matchers.json"
+
+      # One binary serves every test: crash points are inert unless their env var names one.
+      - name: Build qdrant with private ORAM crash points and the fixture examples
+        run: |
+          cargo build --locked --bin qdrant --features private-oram-crash-points
+          cargo build --locked -p qdrant-sec --examples
+
+      - name: Run private ORAM multi-process cluster tests
+        shell: bash
+        env:
+          QDRANT_PRIVATE_ORAM_CRASH_TESTS: "1"
+        run: |
+          status=0
+          uv --project tests run pytest tests/consensus_tests/test_private_oram_*.py -v --tb=short -rfE --durations=10 2>&1 | tee private-oram-e2e.log || status=1
+          if [ "$status" -ne 0 ]; then
+            # Failing tests, their assertion lines and any peer panic as one annotation (job logs
+            # and artifacts need sign-in).
+            summary=$({ grep -E '^(FAILED|ERROR) ' private-oram-e2e.log; grep -E '^E   ' private-oram-e2e.log | head -n 40; grep -rh -A2 'panicked at' consensus_test_logs 2>/dev/null | head -n 20; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=private ORAM cluster tests failed::${summary}"
+          fi
+          exit "$status"
