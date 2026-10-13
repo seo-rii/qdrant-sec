@@ -109,6 +109,11 @@ def get_uri(port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def get_p2p_uri(port: int, tls: bool = False) -> str:
+    # Peers with `cluster.p2p.enable_tls` must advertise https consensus URIs.
+    return f"https://127.0.0.1:{port}" if tls else get_uri(port)
+
+
 def assert_project_root():
     """Deprecated: No longer needed as paths are resolved relative to __file__."""
     pass
@@ -143,7 +148,7 @@ def init_pytest_log_folder() -> str:
 
 
 # Starts a peer and returns its api_uri
-def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False, uris_in_env=False) -> str:
+def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False, uris_in_env=False, p2p_tls=False) -> str:
     if extra_env is None:
         extra_env = {}
     p2p_port = get_port() if port is None else port + 0
@@ -155,7 +160,7 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
 
     test_log_folder = init_pytest_log_folder()
     log_file = open(f"{test_log_folder}/{log_file}", "w")
-    this_peer_consensus_uri = get_uri(p2p_port)
+    this_peer_consensus_uri = get_p2p_uri(p2p_port, p2p_tls)
     print(f"Starting follower peer with bootstrap uri {bootstrap_uri},"
           f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
@@ -183,7 +188,7 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
 
 
 # Starts a peer and returns its api_uri and p2p_uri
-def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False, uris_in_env=False) -> Tuple[str, str]:
+def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False, uris_in_env=False, p2p_tls=False) -> Tuple[str, str]:
     if extra_env is None:
         extra_env = {}
 
@@ -196,7 +201,7 @@ def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, r
 
     test_log_folder = init_pytest_log_folder()
     log_file = open(f"{test_log_folder}/{log_file}", "w")
-    bootstrap_uri = get_uri(p2p_port)
+    bootstrap_uri = get_p2p_uri(p2p_port, p2p_tls)
     print(f"\nStarting first peer with uri {bootstrap_uri},"
           f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
