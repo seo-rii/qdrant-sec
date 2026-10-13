@@ -1778,6 +1778,22 @@ mod private_result_oram_rest_tests {
                 .await
                 .unwrap()
             );
+            // A snapshot needs the manifest to name the current epoch, so the client refreshes
+            // it after the commit.
+            let mut refreshed = manifest.clone();
+            refreshed.index_epoch = NEXT_EPOCH;
+            refreshed.root_hash = new_root_hash.clone();
+            let refreshed_signature = fixture.sign_manifest(&refreshed);
+            do_upload_private_result_oram_manifest(
+                toc,
+                &auth,
+                &settings,
+                COLLECTION_NAME,
+                refreshed,
+                refreshed_signature,
+            )
+            .await
+            .unwrap();
             crate::common::collections::do_create_snapshot(toc.clone(), &auth, COLLECTION_NAME)
                 .await
                 .unwrap();
