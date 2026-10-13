@@ -2,19 +2,23 @@ use std::env;
 
 use data_encoding::BASE64URL_NOPAD;
 use qdrant_sec::{
-    DistanceKind, FixedBudgetParams, OramKind, OramParams, PrivateHnswBucketAeadBaseContext,
+    DistanceKind, FixedBudgetParams, OramKind, OramParams,
+    PRIVATE_RESULT_ORAM_PAYLOAD_BLOCK_VERSION, PrivateHnswBucketAeadBaseContext,
     PrivateHnswBuildPoint, PrivateHnswClientKeys, PrivateHnswCommitSignatureContext,
     PrivateHnswManifestBuildContext, PrivateHnswOramClientConfig, PrivateHnswParams,
-    PrivateResultOramBucket, PrivateResultOramBucketCommitmentContext,
-    PrivateResultOramClientCommitBucketRef, PrivateResultOramCommitPlan,
+    PrivateResultOramBucket, PrivateResultOramBucketAeadBaseContext,
+    PrivateResultOramBucketCommitmentContext, PrivateResultOramClientCommitBucketRef,
+    PrivateResultOramClientConfig, PrivateResultOramClientKeys, PrivateResultOramCommitPlan,
     PrivateResultOramCommitSignatureContext, PrivateResultOramManifest,
+    PrivateResultOramPayloadBlockPlaintext, PrivateResultOramPlaintextBucket,
     PrivateResultOramReadBucketsSignatureContext, ResultPrivacyMode, SecretKey,
     build_private_hnsw_oram_manifest_from_encrypted_index,
     build_private_hnsw_oram_plaintext_index_from_auto_layered_f32_points,
     encode_private_hnsw_oram_leaf_label, plan_private_hnsw_oram_commit_for_manifest,
     private_hnsw_bucket_commitment, private_result_oram_bucket_ciphertext_bytes,
-    private_result_oram_bucket_commitment, private_result_oram_merkle_root_for_commitments,
-    reserve_private_hnsw_oram_physical_slots, seal_private_hnsw_oram_plaintext_index,
+    private_result_oram_bucket_commitment, private_result_oram_client_config_from_manifest,
+    private_result_oram_merkle_root_for_commitments, reserve_private_hnsw_oram_physical_slots,
+    seal_private_hnsw_oram_plaintext_index, seal_private_result_oram_plaintext_bucket,
     sign_private_hnsw_oram_commit, sign_private_hnsw_oram_manifest,
     sign_private_hnsw_oram_read_paths_for_manifest_context, sign_private_result_oram_commit,
     sign_private_result_oram_manifest, sign_private_result_oram_read_buckets,
@@ -366,13 +370,15 @@ fn result_fixture(
         owner_signing_key_id: RESULT_SIGNING_KEY_ID.to_string(),
         created_at_unix: 1_770_000_000,
     };
-    let initial_buckets = result_buckets(&manifest)?;
-    let commitments = initial_buckets
+    let sealer = ResultLeakScanSealer::from_env(&manifest)?;
+    // Bucket commitments do not cover the root hash, so the buckets are built once: sealed
+    // buckets use random nonces and could not be rebuilt to match the signed root.
+    let buckets = result_buckets(&manifest, sealer.as_ref())?;
+    let commitments = buckets
         .iter()
         .map(|bucket| bucket.bucket_commitment.clone())
         .collect::<Vec<_>>();
     manifest.root_hash = private_result_oram_merkle_root_for_commitments(&commitments)?;
-    let buckets = result_buckets(&manifest)?;
     let manifest_signature = sign_private_result_oram_manifest(signing_key, &manifest)?;
     let read_bucket_ids = (0..=manifest.oram.tree_height)
         .map(|level| (1_u64 << level) - 1)
@@ -394,7 +400,7 @@ fn result_fixture(
 
     let mut next_manifest = manifest.clone();
     next_manifest.index_epoch = NEXT_EPOCH;
-    let updated_bucket = result_bucket(0, &next_manifest)?;
+    let updated_bucket = result_bucket(0, &next_manifest, sealer.as_ref())?;
     let mut next_commitments = buckets
         .iter()
         .map(|bucket| bucket.bucket_commitment.clone())
@@ -440,21 +446,113 @@ fn result_fixture(
             "updated_buckets": [updated_bucket],
             "signature": commit_signature,
         },
+        "plaintext_sentinels": sealer
+            .as_ref()
+            .map(ResultLeakScanSealer::plaintext_sentinels)
+            .unwrap_or_default(),
     }))
+}
+
+/// Under `QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN=1` the result buckets really seal one payload
+/// block per leak-scan point (bucket `i` holds point `i + 1`), so a cluster scan can search for
+/// payload plaintext. Otherwise the buckets are fixed placeholder bytes.
+struct ResultLeakScanSealer {
+    keys: PrivateResultOramClientKeys,
+    config: PrivateResultOramClientConfig,
+    blocks: Vec<PrivateResultOramPayloadBlockPlaintext>,
+}
+
+impl ResultLeakScanSealer {
+    fn from_env(
+        manifest: &PrivateResultOramManifest,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        if env::var("QDRANT_PRIVATE_ORAM_FIXTURE_LEAK_SCAN").as_deref() != Ok("1") {
+            return Ok(None);
+        }
+        let keys = PrivateResultOramClientKeys::derive_from_resource_key_with_context(
+            &SecretKey::from_bytes([13; 32]),
+            &manifest.collection_id,
+            &manifest.rk_id,
+            manifest.rk_epoch,
+        )?;
+        let blocks = (1_u8..=3)
+            .map(|index| PrivateResultOramPayloadBlockPlaintext {
+                version: PRIVATE_RESULT_ORAM_PAYLOAD_BLOCK_VERSION,
+                payload_fetch_token: leak_scan_bytes(b"leak-scan-fetch-token", index),
+                point_token: leak_scan_bytes(b"leak-scan-point-token", index),
+                payload: format!("{{\"body\":\"leak-scan-result-payload-{index}\"}}").into_bytes(),
+                deleted: false,
+                generation: 1,
+            })
+            .collect();
+        Ok(Some(Self {
+            keys,
+            config: private_result_oram_client_config_from_manifest(manifest)?,
+            blocks,
+        }))
+    }
+
+    fn seal(
+        &self,
+        bucket_id: u64,
+        manifest: &PrivateResultOramManifest,
+    ) -> Result<PrivateResultOramBucket, Box<dyn std::error::Error>> {
+        let mut blocks = vec![None; self.config.bucket_size];
+        if let Some(block) = usize::try_from(bucket_id)
+            .ok()
+            .and_then(|index| self.blocks.get(index))
+        {
+            blocks[0] = Some(block.clone());
+        }
+        Ok(seal_private_result_oram_plaintext_bucket(
+            &self.keys,
+            PrivateResultOramBucketAeadBaseContext {
+                collection_id: &manifest.collection_id,
+                key_id: &manifest.key_id,
+                rk_id: &manifest.rk_id,
+                rk_epoch: manifest.rk_epoch,
+            },
+            manifest.index_epoch,
+            &PrivateResultOramPlaintextBucket { bucket_id, blocks },
+            self.config,
+        )?)
+    }
+
+    /// Hex-encoded payload plaintext (raw and base64url), the shared payload marker and the
+    /// bucket AEAD key. The tokens are already among the HNSW sentinels.
+    fn plaintext_sentinels(&self) -> Vec<String> {
+        let mut sentinels = vec![
+            b"leak-scan-result-payload".to_vec(),
+            self.keys.bucket_aead_key().as_bytes().to_vec(),
+        ];
+        for block in &self.blocks {
+            sentinels.push(block.payload.clone());
+            sentinels.push(BASE64URL_NOPAD.encode(&block.payload).into_bytes());
+        }
+        sentinels
+            .into_iter()
+            .map(|bytes| data_encoding::HEXLOWER.encode(&bytes))
+            .collect()
+    }
 }
 
 fn result_buckets(
     manifest: &PrivateResultOramManifest,
+    sealer: Option<&ResultLeakScanSealer>,
 ) -> Result<Vec<PrivateResultOramBucket>, Box<dyn std::error::Error>> {
     (0..manifest.bucket_count)
-        .map(|bucket_id| result_bucket(bucket_id, manifest))
+        .map(|bucket_id| result_bucket(bucket_id, manifest, sealer))
         .collect()
 }
 
 fn result_bucket(
     bucket_id: u64,
     manifest: &PrivateResultOramManifest,
+    sealer: Option<&ResultLeakScanSealer>,
 ) -> Result<PrivateResultOramBucket, Box<dyn std::error::Error>> {
+    if let Some(sealer) = sealer {
+        return sealer.seal(bucket_id, manifest);
+    }
     let expected_len = private_result_oram_bucket_ciphertext_bytes(&manifest.oram)?;
     let mut raw_ciphertext = vec![0; expected_len];
     for (offset, byte) in raw_ciphertext.iter_mut().enumerate() {
