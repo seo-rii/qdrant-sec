@@ -2401,9 +2401,11 @@ fn validate_private_result_restore_bucket_contract(
     bucket: &PrivateResultOramBucket,
     expected_ciphertext_bytes: usize,
 ) -> CollectionResult<()> {
-    if bucket.index_epoch != manifest.index_epoch {
+    // A write-back rewrites only the buckets on the paths it read; every other bucket keeps the
+    // epoch it was sealed (and committed) at, as the store's reads allow.
+    if bucket.index_epoch > manifest.index_epoch {
         return Err(CollectionError::bad_request(
-            "private result ORAM snapshot bucket epoch does not match manifest",
+            "private result ORAM snapshot bucket is newer than its manifest",
         ));
     }
     let expected_ciphertext_b64_len =
@@ -2432,7 +2434,7 @@ fn validate_private_result_restore_bucket_contract(
             rk_id: &manifest.rk_id,
             rk_epoch: manifest.rk_epoch,
             bucket_id: bucket.bucket_id,
-            index_epoch: manifest.index_epoch,
+            index_epoch: bucket.index_epoch,
         },
         &bucket.ciphertext_sha256,
     )
@@ -5996,6 +5998,44 @@ mod tests {
         assert!(!rendered.contains(&bucket.ciphertext_sha256), "{rendered}");
         assert!(!rendered.contains(&manifest.root_hash), "{rendered}");
         assert_private_result_restore_error_redacts_common(&rendered);
+    }
+
+    #[test]
+    fn private_result_restore_bucket_contract_accepts_older_buckets_and_rejects_newer_ones() {
+        let uuid = Uuid::from_u128(7);
+        let manifest = private_result_manifest(uuid.to_string());
+        let expected_bytes =
+            private_result_restore_expected_bucket_ciphertext_bytes(&manifest).unwrap();
+        let mut next_manifest = manifest.clone();
+        next_manifest.index_epoch += 1;
+
+        // After a write-back that did not touch it, a bucket keeps its older epoch and the
+        // commitment it was sealed with.
+        let untouched = private_result_snapshot_bucket(&manifest, 0);
+        validate_private_result_restore_bucket_contract(&next_manifest, &untouched, expected_bytes)
+            .unwrap();
+
+        let newer = private_result_snapshot_bucket(&next_manifest, 0);
+        let rendered =
+            validate_private_result_restore_bucket_contract(&manifest, &newer, expected_bytes)
+                .unwrap_err()
+                .to_string();
+        assert!(rendered.contains("newer than its manifest"), "{rendered}");
+
+        // The commitment is bound to the bucket's own epoch.
+        let mut relabeled = untouched;
+        relabeled.index_epoch = next_manifest.index_epoch;
+        let rendered = validate_private_result_restore_bucket_contract(
+            &next_manifest,
+            &relabeled,
+            expected_bytes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            rendered.contains("commitment context mismatch"),
+            "{rendered}"
+        );
     }
 
     #[test]
