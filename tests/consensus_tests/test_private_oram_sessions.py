@@ -1094,13 +1094,32 @@ def _assert_private_oram_sessions_blocked_during_resharding(
         assert fixture["result"]["commit"]["new_root_hash"] not in result.text
 
 
+def _open_when_lease_free(open_session) -> dict:
+    """Opens a session once the collection's session lease is free. A lease released by another
+    peer reaches this one through consensus, so an open right after that close can still be
+    refused for a moment."""
+    opened = {}
+
+    def opens() -> bool:
+        try:
+            opened.update(open_session())
+        except Exception:  # noqa: BLE001 - HTTP helpers raise plain Exception
+            return False
+        return True
+
+    wait_for(opens, wait_for_timeout=30)
+    return opened
+
+
 def _assert_private_oram_owner_sessions(
     peer_url: str, fixture: dict, include_result_oram: bool
 ) -> None:
-    hnsw = _open_hnsw_owner_session(
-        peer_url,
-        NEXT_EPOCH,
-        fixture["hnsw"]["manifest"]["result_privacy"],
+    hnsw = _open_when_lease_free(
+        lambda: _open_hnsw_owner_session(
+            peer_url,
+            NEXT_EPOCH,
+            fixture["hnsw"]["manifest"]["result_privacy"],
+        )
     )
     assert hnsw["root_hash"] == fixture["hnsw"]["commit"]["new_root_hash"]
     assert (
@@ -1112,7 +1131,7 @@ def _assert_private_oram_owner_sessions(
     )
 
     if include_result_oram:
-        result = _open_result_owner_session(peer_url, NEXT_EPOCH)
+        result = _open_when_lease_free(lambda: _open_result_owner_session(peer_url, NEXT_EPOCH))
         assert result["root_hash"] == fixture["result"]["commit"]["new_root_hash"]
         assert (
             _post_result(
