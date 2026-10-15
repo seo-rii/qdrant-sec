@@ -932,7 +932,12 @@ def test_private_oram_dead_replica_automatically_recovers_from_source(
         for index, peer_url in enumerate(peer_urls)
         if get_collection_cluster_info(peer_url, COLLECTION)["local_shards"]
     ]
-    _wait_for_private_oram_layout(peer_dirs, 2, active_owner_peer_ids)
+    # The first recovery transfer records layout generation 1 and every finished one advances
+    # it; placement decides whether the target held one shard or both.
+    recovered_shard_count = len(cluster_infos[target_index]["local_shards"])
+    _wait_for_private_oram_layout(
+        peer_dirs, 1 + recovered_shard_count, active_owner_peer_ids
+    )
 
 
 def _private_oram_transfer_peers(
@@ -1018,15 +1023,25 @@ def _wait_for_private_oram_layout(
     peer_dirs: list[pathlib.Path], generation: int, owner_peer_ids: list[int]
 ) -> None:
     expected_owners = sorted(owner_peer_ids)
-    wait_for(
-        lambda: all(
-            (state := _private_oram_layout_state(peer_dir)) is not None
+    observed = {}
+
+    def layouts_match() -> bool:
+        for peer_dir in peer_dirs:
+            observed[peer_dir.name] = _private_oram_layout_state(peer_dir)
+        return all(
+            state is not None
             and state["generation"] == generation
             and state["owner_peer_ids"] == expected_owners
-            for peer_dir in peer_dirs
-        ),
-        wait_for_timeout=30,
-    )
+            for state in observed.values()
+        )
+
+    try:
+        wait_for(layouts_match, wait_for_timeout=30)
+    except Exception as error:  # noqa: BLE001 - wait_for raises plain Exception
+        raise AssertionError(
+            f"private ORAM layout is not generation {generation} with owners "
+            f"{expected_owners} on every peer; last seen: {observed}"
+        ) from error
 
 
 def _wait_for_private_oram_epochs(
