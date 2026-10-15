@@ -1570,6 +1570,15 @@ Signed fields:
   state로 새 session이 열리며 genesis state는 거부된다. Raft snapshot apply가 persistent write
   lock을 잡은 채 collection lock을 기다려 생기던 deadlock(active scale-down snapshot test가 CI를
   90분 timeout시킴)도 고쳤다. Remote owner terminal과 abort 경로, append leakage scan은 남아 있다.
+- 2026-10-15: Append leakage scan이 추가됐다. Commit 뒤 peer storage, Raft state, log에 append된
+  point의 plaintext sentinel(vector, token, client key)이 없고 append가 쓴 bucket ciphertext는
+  보이는지 확인한다. 같은 테스트가 server-side 비용을 `append_latency.json`으로 남긴다(peer 1개,
+  height 2 tree: fixed read window 10개 228 KB/0.11 s, owner prepare 227 KB, admission 7.8 s,
+  commit과 clear 77 s, `docs/ckks.md`). CI에서는 두 문제를 고쳤다: `bash -e -o pipefail`에서
+  일치 없는 grep이 failure annotation을 지우던 문제, 그리고 peer가 crypto runtime capability
+  metadata를 제안하기 전에(Raft idle 뒤, 60 s throttle) encrypted shard transfer, resharding,
+  custom shard key를 실행해 sessions test 8개가 CI에서만 실패하던 문제다. 이제 cluster setup이 그
+  metadata를 기다린다.
 
 완료 조건:
 
