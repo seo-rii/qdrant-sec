@@ -7,9 +7,7 @@ once through V1 sessions. It then enrolls both indexes with a genesis state that
 sealed append checkpoint. In a mutation session on that state it appends one point: it reads
 every fixed window of both indexes, verifies the buckets against the session roots, and sends
 the owner prepare of the finalized paired mutation. The append must commit, after which only the
-new signed state opens a session. Until the coordinator records parent progress after
-admission (see the note in the test), the append stops after admission and the commit part is an
-expected failure. Linux only (peer identities are Linux-only).
+new signed state opens a session. Linux only (peer identities are Linux-only).
 """
 
 import json
@@ -54,8 +52,10 @@ from .utils import (
 )
 
 OWNER_SIGNING_KEY_ID = "tenant-a/private-hnsw-signing-v1"
-TERMINAL_APPEND_PHASES = {"terminal_committed", "terminal_aborted", "quarantined"}
-POST_ADMISSION_APPEND_PHASES = TERMINAL_APPEND_PHASES | {
+POST_ADMISSION_APPEND_PHASES = {
+    "terminal_committed",
+    "terminal_aborted",
+    "quarantined",
     "admitted_ack_pending",
     "admitted_ack_complete",
     "parent_sequence1",
@@ -249,25 +249,28 @@ def test_private_oram_paired_append_commits_through_a_real_client(
         phases.append(status.json()["result"]["append_phase"])
         return phases[-1] in expected
 
-    # The owners pre-stage the mutation and consensus admits its lease.
+    # The owners pre-stage the mutation, consensus admits its lease, the coordinator records the
+    # parent progress, certifies recovery readiness and commits; the supervisor then records the
+    # decision, collects the owner terminals and cleans up.
     wait_for(lambda: append_phase_in(POST_ADMISSION_APPEND_PHASES), wait_for_timeout=60)
-    try:
-        wait_for(lambda: append_phase_in(TERMINAL_APPEND_PHASES), wait_for_timeout=60)
-    except Exception:  # noqa: BLE001 - wait_for raises plain Exception on timeout
-        pass
-    if phases[-1] != "terminal_committed":
-        # Known gap: after admission the coordinator materializes the parent, adopts the owners
-        # and stages the point, but no path proposes the first parent progress from the
-        # Admitted lifecycle, so recovery readiness finds no consensus parent watermark and
-        # refuses every owner capsule install (docs/private-oram-v2-enrollment.md).
-        pytest.xfail(f"V2 append stops after admission in phase {phases[-1]}")
+    assert "quarantined" not in phases and "terminal_aborted" not in phases, phases
 
-    # The committed state is the only one a new session can open on.
-    stale = _mutation_post(peer_url, "open", append_client.call("open"))
+    # The append is committed once a session opens on the appended state; until the supervisor
+    # has cleaned up, the collection's mutation slot is still busy.
+    genesis_open = append_client.call("open")
+    appended_open = append_client.call("open_next")
+    reopened = {}
+
+    def appended_state_opens() -> bool:
+        response = _mutation_post(peer_url, "open", appended_open)
+        if response.status_code != 200:
+            return False
+        reopened.update(response.json()["result"])
+        return True
+
+    wait_for(appended_state_opens, wait_for_timeout=300)
+    assert reopened["old_state_digest"] != genesis_state_digest
+    assert_http_ok(_mutation_post(peer_url, "close", {"session_id": reopened["session_id"]}))
+    # The genesis state is no longer current.
+    stale = _mutation_post(peer_url, "open", genesis_open)
     assert stale.status_code == 400, stale.text
-    reopened = _mutation_post(peer_url, "open", append_client.call("open_next"))
-    assert_http_ok(reopened)
-    assert reopened.json()["result"]["old_state_digest"] != genesis_state_digest
-    assert_http_ok(
-        _mutation_post(peer_url, "close", {"session_id": reopened.json()["result"]["session_id"]})
-    )

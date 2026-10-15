@@ -168,13 +168,42 @@ Two server bugs refused every append, and are fixed:
   released when the job is created; later releases find nothing.
 
 With both fixes an append is validated, reserved, pre-staged on the owner and
-admitted. It then stops: after admission the coordinator materializes the
-parent, adopts the owners and stages the point, but nothing proposes the
-first parent progress (the cleanup lifecycle stays `Admitted`), so recovery
-readiness finds no consensus parent watermark and every owner capsule install
-is refused. The journal resume used after a restart only advances an existing
-watermark, so it cannot record the first one either. The test expects this
-failure until the coordinator records parent progress after admission.
+admitted. Four more gaps stopped it after admission, and are fixed:
+
+- Nothing recorded parent progress. Parent materialization, owner adoption and
+  point staging move the coordinator's journal through sequences 1 to 3, but
+  admission leaves the consensus cleanup lifecycle `Admitted` with no
+  watermark, and every owner's recovery capsule install requires the
+  consensus watermark of the staged point. The journal resume only works after
+  the decision (it requires an aborted or committed lease) and only advances
+  an existing watermark. The journal now has
+  `next_private_oram_mutation_parent_progress_before_decision_v2` (valid while
+  the admitted lease is preparing over the exact old state, starting at
+  sequence 1), and the coordinator, and its restart reconciliation, propose
+  one step at a time until consensus holds the journal's watermark.
+- Owner adoption deleted the finalized reservation's resolution record as
+  residue (`require_no_active_reservation_fence_locked`), but the reservation
+  outcome is acknowledged only after point staging and recovery readiness,
+  and that acknowledgement re-proves the installed reservation from this
+  record. Adoption now only checks that no fence is active; cleanup and the
+  next reservation fence still clear the residue.
+- Nothing committed. `ApplyPrivateOramMutation` is refused once the collection
+  holds V2 authority state, and the V2 `ConsensusCommit` material operation
+  had a builder but no caller. After readiness and the outcome
+  acknowledgement, the coordinator now proposes the admitted plan's exact new
+  state over its exact old state; the lease becomes `ConsensusCommitted` in the
+  same apply.
+- The supervisor's restart reconciliation re-ran parent materialization and
+  owner capsule installs after the commit, which can never succeed (the
+  installs require a preparing lease over the old state), so it never reached
+  the terminal resume. It now returns early once the recovery-readiness
+  certificate is recorded.
+
+With these the append commits: the supervisor's terminal resume records the
+decision, the owner terminals and the point resolution, then the cleanup
+witness and clear, and a mutation session opens on the appended signed state
+while the genesis state is refused. A remote owner's terminal and the abort
+path are not exercised by this single-peer test.
 
 ## Risks and open questions
 

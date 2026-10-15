@@ -10314,6 +10314,58 @@ mod tests {
             PrivateOramMutationJournalPhaseV2::OwnersPrepared
         );
 
+        // Before the decision the admitted lease is still preparing over the old state, and
+        // consensus holds no parent progress yet: the coordinator records sequences 1 to 3 (point
+        // staged), then nothing more until the decision.
+        let preparing_at = |sequence: Option<u64>| {
+            let mut reconcile =
+                reconcile_snapshot(&fixture.old_consensus, fixture.preparing_lease.clone());
+            if let Some(sequence) = sequence {
+                let snapshot = journal.load_v2().unwrap().unwrap();
+                reconcile = reconcile.with_parent_watermark_for_test(
+                    derive_private_oram_mutation_parent_watermark_at_sequence_v2(
+                        &snapshot, sequence,
+                    )
+                    .unwrap()
+                    .watermark()
+                    .clone(),
+                );
+            }
+            LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                reconcile, 100,
+            )
+        };
+        for (consensus_sequence, expected_next) in [(None, 1), (Some(1), 2), (Some(2), 3)] {
+            let next = journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
+                    consensus_sequence,
+                ))
+                .unwrap()
+                .expect("consensus lags the journal");
+            assert_eq!(
+                next.into_proposal().expectation().watermark().sequence(),
+                expected_next
+            );
+        }
+        assert!(
+            journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(Some(
+                    3
+                )))
+                .unwrap()
+                .is_none()
+        );
+        // A decided lease or a new consensus state belongs to the post-decision resume.
+        assert!(matches!(
+            journal.next_private_oram_mutation_parent_progress_before_decision_v2(
+                LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                    reconcile_snapshot(&fixture.new_consensus, fixture.committed_lease.clone()),
+                    100,
+                )
+            ),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+
         let authority_at = |sequence| {
             let snapshot = journal.load_v2().unwrap().unwrap();
             let parent_watermark =

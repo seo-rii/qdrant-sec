@@ -48,6 +48,7 @@ use storage::content_manager::consensus_manager::{
 };
 use storage::content_manager::consensus_ops::{
     PrivateOramConsensusLayout, PrivateOramLayoutKey, PrivateOramMutationKey,
+    PrivateOramMutationLeasePhase,
 };
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::private_oram_mutation_journal::{
@@ -87,6 +88,8 @@ use super::private_result_oram::{
 use crate::settings::Settings;
 
 const PRIVATE_ORAM_RECOVERY_READINESS_WAIT: Duration = Duration::from_secs(60);
+/// Parent progress advances one journal sequence per proposal; the journal has fewer phases.
+const PRIVATE_ORAM_PARENT_PROGRESS_MAX_STEPS: usize = 8;
 /// Two proposals (prepared, activated) per owner, bounded by the owner table capacity.
 const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS: usize = 2 * 1_024 + 1;
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1411,6 +1414,15 @@ async fn complete_private_oram_admitted_handoff_v2(
         &owners_prepared,
     )
     .await?;
+    record_private_oram_parent_progress_v2(
+        dispatcher,
+        settings,
+        identity,
+        detached.collection_name(),
+        detached.vector_name(),
+        &detached.immutable_manifest().manifest.owner_signing_key_id,
+    )
+    .await?;
     coordinate_private_oram_recovery_readiness_v2(
         dispatcher,
         settings,
@@ -1422,7 +1434,124 @@ async fn complete_private_oram_admitted_handoff_v2(
     .await?;
     acknowledge_detached_reservation_outcome_v3(dispatcher, settings, identity, detached).await?;
     detached.mark_admitted_ack_complete()?;
-    detached.mark_deciding()
+    detached.mark_deciding()?;
+    commit_private_oram_admitted_mutation_v2(dispatcher, coordinated.admission()).await
+}
+
+/// The commit decision. With every owner pre-staged and adopted, the point staged and the
+/// replicated recovery-readiness certificate durable, the coordinator commits the admitted plan's
+/// exact new state over its exact old state; the lease moves to `ConsensusCommitted` in the same
+/// apply. From there the supervisor's terminal resume records the decision, collects the owner
+/// terminals and cleans up. A proposal that is not applied leaves the lease `Preparing`, which
+/// the supervisor reports instead of guessing an outcome.
+async fn commit_private_oram_admitted_mutation_v2(
+    dispatcher: &Dispatcher,
+    admission: &PrivateOramMutationAdmissionPlanV2,
+) -> StorageResult<()> {
+    let consensus = dispatcher
+        .consensus_state()
+        .ok_or_else(invalid_owner_prestage)?;
+    let key = PrivateOramMutationKey {
+        collection_id: admission.lease().collection_id.clone(),
+    };
+    if consensus.private_oram_mutation_state(&key).as_ref() != Some(admission.expected_old_state())
+    {
+        return Err(invalid_owner_prestage());
+    }
+    let operation = consensus.private_oram_mutation_v2_consensus_commit_operation(
+        admission.lease().generation,
+        admission.expected_new_state().clone(),
+    )?;
+    let _applied = consensus
+        .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
+        .await;
+    let committed = consensus
+        .private_oram_mutation_lease_slot(&key)
+        .and_then(|slot| slot.active)
+        .is_some_and(|lease| {
+            lease.generation == admission.lease().generation
+                && matches!(
+                    lease.phase,
+                    PrivateOramMutationLeasePhase::ConsensusCommitted { .. }
+                )
+        });
+    if !committed
+        || consensus.private_oram_mutation_state(&key).as_ref()
+            != Some(admission.expected_new_state())
+    {
+        return Err(StorageError::service_error(
+            "private ORAM mutation commit was not applied",
+        ));
+    }
+    Ok(())
+}
+
+/// Parent materialization, owner adoption and point staging advance the coordinator's journal
+/// past the parent progress consensus holds (none, right after admission), and each owner's
+/// recovery capsule install checks the consensus parent watermark. The coordinator records that
+/// progress one sequence at a time until consensus has caught up with the journal.
+async fn record_private_oram_parent_progress_v2(
+    dispatcher: &Dispatcher,
+    settings: &Settings,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+) -> StorageResult<()> {
+    let consensus = dispatcher
+        .consensus_state()
+        .ok_or_else(invalid_owner_prestage)?;
+    let auth = Auth::new_internal(Access::full("private ORAM mutation parent progress"));
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_parent_progress_v2",
+    )?;
+    let verification = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(&auth, &verification);
+    let collection = toc.get_collection(&pass).await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+        settings,
+        collection.name(),
+        collection.path(),
+        &config,
+        vector_name,
+        owner_signing_key_id,
+    )?;
+    if hnsw_context.collection_crypto_id() != collection_id {
+        return Err(invalid_owner_prestage());
+    }
+    let journal = PrivateOramMutationJournal::new(
+        collection.path(),
+        owner_signing_key_id,
+        hnsw_context.public_key().to_vec(),
+    )
+    .map_err(|_| invalid_owner_prestage())?;
+    let key = PrivateOramMutationKey { collection_id };
+    for _ in 0..PRIVATE_ORAM_PARENT_PROGRESS_MAX_STEPS {
+        let authority = consensus
+            .linearizable_private_oram_mutation_reconcile_snapshot_v2(
+                &key,
+                identity.peer_id(),
+                Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+            )
+            .await?;
+        let Some(progress) = journal
+            .next_private_oram_mutation_parent_progress_before_decision_v2(authority)
+            .map_err(|_| invalid_owner_prestage())?
+        else {
+            return Ok(());
+        };
+        dispatcher
+            .submit_private_oram_mutation_parent_progress_v2(
+                progress,
+                Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+            )
+            .await?;
+    }
+    Err(invalid_owner_prestage())
 }
 
 pub(crate) async fn reconcile_private_oram_admitted_to_ready_v2(
@@ -1435,6 +1564,12 @@ pub(crate) async fn reconcile_private_oram_admitted_to_ready_v2(
     let consensus = dispatcher
         .consensus_state()
         .ok_or_else(invalid_owner_prestage)?;
+    // Readiness is recorded before the commit, and the owner capsule installs it re-runs only
+    // accept the preparing lease over the old state. Once readiness is certified there is
+    // nothing left to reconcile here; the terminal resume takes over.
+    if consensus.private_oram_mutation_v2_recovery_ready(key) {
+        return Ok(());
+    }
     let state = consensus
         .private_oram_mutation_state(key)
         .ok_or_else(invalid_owner_prestage)?;
@@ -1633,6 +1768,15 @@ pub(crate) async fn reconcile_private_oram_admitted_to_ready_v2(
     .await?;
     stage_private_oram_mutation_point_v2(dispatcher, settings, &execution, &plan, &owners_prepared)
         .await?;
+    record_private_oram_parent_progress_v2(
+        dispatcher,
+        settings,
+        identity,
+        execution.collection_name(),
+        execution.vector_name(),
+        &execution.immutable_manifest().manifest.owner_signing_key_id,
+    )
+    .await?;
     coordinate_private_oram_recovery_readiness_v2(
         dispatcher,
         settings,

@@ -1547,6 +1547,79 @@ impl PrivateOramMutationJournal {
         )
     }
 
+    /// Before the decision, the next parent progress consensus lacks for this journal: admission
+    /// leaves the cleanup lifecycle `Admitted` with no watermark, while the coordinator's journal
+    /// moves through lease acquired, owners prepared and point staged (sequences 1 to 3), and
+    /// every owner's recovery capsule install requires the consensus watermark of the staged
+    /// point. Valid only while the admitted lease is still preparing over the exact old state;
+    /// `None` once consensus holds the journal's watermark. After the decision, the resume below
+    /// drives parent progress instead.
+    #[doc(hidden)]
+    pub fn next_private_oram_mutation_parent_progress_before_decision_v2(
+        &self,
+        authority: LinearizablePrivateOramMutationReconcileSnapshotV2,
+    ) -> Result<Option<PrivateOramMutationNeedParentProgressV2>, PrivateOramMutationJournalError>
+    {
+        let authority = PrivateOramMutationResumeAuthorityV2::from_linearizable(authority);
+        if authority.applied_index == 0 {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let snapshot = self
+            .load_v2()?
+            .ok_or(PrivateOramMutationJournalError::Corrupt)?;
+        let journal_sequence = snapshot.state.phase.sequence();
+        if journal_sequence > PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence()
+            || snapshot.immutable_manifest.manifest.result_privacy
+                != ResultPrivacyMode::PrivatePayloadOramRequired
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let active_lease =
+            validate_reconcile_lease_slot(&snapshot.descriptor, authority.reconcile.lease_slot())?;
+        if active_lease.phase != PrivateOramMutationLeasePhase::Preparing
+            || authority.reconcile.consensus_state()
+                != &snapshot.descriptor.expected_consensus_old_state
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let parent_watermark = authority.reconcile.parent_watermark();
+        let next_sequence = match parent_watermark {
+            // The first progress, which the parent-progress apply checks against the admitted
+            // record itself.
+            None => 1,
+            Some(watermark) if watermark.sequence() > journal_sequence => {
+                return Err(PrivateOramMutationJournalError::InvalidTransition);
+            }
+            Some(watermark) if watermark.sequence() == journal_sequence => return Ok(None),
+            Some(watermark) => watermark
+                .sequence()
+                .checked_add(1)
+                .ok_or(PrivateOramMutationJournalError::InvalidTransition)?,
+        };
+        let expectation =
+            derive_private_oram_mutation_parent_watermark_at_sequence_v2(&snapshot, next_sequence)?;
+        if let Some(watermark) = parent_watermark {
+            validate_private_oram_mutation_parent_watermark_v2_cas_transition(
+                watermark,
+                expectation.watermark(),
+                &expectation,
+            )?;
+        }
+        Ok(Some(PrivateOramMutationNeedParentProgressV2 {
+            proposal: PrivateOramMutationParentProgressProposalV2 {
+                key: PrivateOramMutationKey {
+                    collection_id: snapshot
+                        .descriptor
+                        .mutation_bundle
+                        .mutation
+                        .collection_id
+                        .clone(),
+                },
+                expectation,
+            },
+        }))
+    }
+
     /// Reconstructs exactly one next recovery action from durable state and Raft-confirmed
     /// authority. V2 production activation is intentionally limited to the no-server-point path.
     #[doc(hidden)]

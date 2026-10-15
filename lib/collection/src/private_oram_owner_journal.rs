@@ -2606,7 +2606,11 @@ impl PrivateOramOwnerPrestageStoreV2 {
             &root,
             &self.root,
         )?;
-        self.require_no_active_reservation_fence_locked(&root)?;
+        // The finalized reservation's resolution record outlives adoption: the coordinator
+        // acknowledges the reservation outcome only after point staging and recovery readiness,
+        // and that acknowledgement re-proves the installed reservation from this record. Cleanup
+        // and the next reservation fence clear it.
+        self.require_no_reservation_fence_locked(&root)?;
         let superblock = self.load_superblock_locked(&root)?;
         if let Some(terminal) = self.load_terminal_marker_locked(&root, intent_key)? {
             if terminal.signed_cleanup_receipt.is_some() {
@@ -4443,6 +4447,23 @@ impl PrivateOramOwnerPrestageStoreV2 {
             return Err(PrivateOramOwnerJournalError::ConcurrentMutation);
         }
         self.remove_reservation_resolution_residual_locked(root, &fence_dir)?;
+        Ok(())
+    }
+
+    /// Like `require_no_active_reservation_fence_locked`, but keeps a finalized reservation's
+    /// resolution record (and any abort release) in place.
+    fn require_no_reservation_fence_locked(
+        &self,
+        root: &File,
+    ) -> Result<(), PrivateOramOwnerJournalError> {
+        let (_, fence_dir) =
+            self.open_prestage_child_locked(root, PRESTAGE_RESERVATION_FENCE_DIR)?;
+        if self
+            .load_reservation_fence_locked(root, &fence_dir)?
+            .is_some()
+        {
+            return Err(PrivateOramOwnerJournalError::ConcurrentMutation);
+        }
         Ok(())
     }
 

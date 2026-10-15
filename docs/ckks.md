@@ -5765,8 +5765,9 @@ follower and scans every peer's storage, Raft state, snapshots, logs, metrics
 and telemetry; the uploaded and committed ciphertext must be visible. It
 passes locally and runs in the CI cluster job.
 
-Not yet covered: V2 append mutations (a real append reaches admission on a
-live peer but does not commit yet; see `docs/private-oram-v2-enrollment.md`).
+Not yet covered: a leakage scan of V2 append mutations. A real paired append
+now commits on a live peer (`test_private_oram_v2_append.py`, see
+`docs/private-oram-v2-enrollment.md`), so its storage can be scanned next.
 
 ### Release gate work: read-only store fault injection
 

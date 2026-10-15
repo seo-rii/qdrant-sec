@@ -4149,6 +4149,15 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.persistent.read().private_oram_mutation_lease_slot(key)
     }
 
+    /// Whether the active mutation's replicated recovery-readiness certificate is recorded, i.e.
+    /// every owner holds its recovery capsule for the staged point.
+    pub fn private_oram_mutation_v2_recovery_ready(&self, key: &PrivateOramMutationKey) -> bool {
+        self.persistent
+            .read()
+            .private_oram_mutation_recovery_capsules_certificate(key)
+            .is_some()
+    }
+
     pub(crate) fn private_oram_mutation_v2_active_recovery_manifest(
         &self,
         key: &PrivateOramMutationKey,

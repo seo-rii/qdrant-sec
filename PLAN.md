@@ -1559,6 +1559,17 @@ Signed fields:
   기존 watermark만 전진시킴). 테스트는 이 지점을 expected failure로 표시한다. Result ORAM
   snapshot contract가 모든 bucket이 manifest epoch이기를 요구해 commit 뒤 snapshot이 실패하던
   bug도 고쳤다(older bucket 허용, commitment는 bucket 자신의 epoch로 검증).
+- 2026-10-15: 실제 paired append가 live peer에서 commit까지 통과한다. Admission 뒤 네 gap을 고쳤다:
+  coordinator와 restart reconciliation이 decision 전 parent progress(sequence 1-3)를
+  `next_private_oram_mutation_parent_progress_before_decision_v2`로 한 단계씩 기록하고, owner
+  adoption이 reservation resolution record를 지우지 않아 outcome acknowledgement가 installed
+  reservation을 다시 증명할 수 있으며, readiness와 acknowledgement 뒤 coordinator가 V2
+  `ConsensusCommit`(builder만 있고 호출자가 없었음)을 제안하고, supervisor의 restart
+  reconciliation이 readiness certificate가 있으면 바로 terminal resume으로 넘어간다. Supervisor가
+  decision, terminal, point resolution, cleanup witness와 clear까지 진행하고 appended signed
+  state로 새 session이 열리며 genesis state는 거부된다. Raft snapshot apply가 persistent write
+  lock을 잡은 채 collection lock을 기다려 생기던 deadlock(active scale-down snapshot test가 CI를
+  90분 timeout시킴)도 고쳤다. Remote owner terminal과 abort 경로, append leakage scan은 남아 있다.
 
 완료 조건:
 
