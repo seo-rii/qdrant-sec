@@ -772,7 +772,7 @@ impl Client {
 
     fn begin(&mut self, session: &Value) -> Result<Value, BoxError> {
         let enrolled = self.enrolled.as_ref().ok_or("enroll before begin")?;
-        let hnsw = self.hnsw.as_ref().ok_or("build before begin")?;
+        self.hnsw.as_ref().ok_or("build before begin")?;
         let session = Session::parse(session)?;
         let manifest = &enrolled.manifest_bundle.manifest;
         let fixed_read_path_count = manifest

@@ -227,6 +227,12 @@ def _start_private_oram_cluster(
             )
         )
     wait_for_uniform_cluster_status(peer_urls, leader)
+    # Shard transfers and resharding of an encrypted collection need every peer's crypto runtime
+    # capability metadata, which a peer proposes only once its Raft node has been idle for a few
+    # ticks; on a slow host that can lag cluster formation.
+    _wait_for_crypto_runtime_capability_metadata(
+        peer_dirs[:started_peer_count], started_peer_count, wait_for_timeout=90
+    )
 
     vectors = {VECTOR: {"size": 2, "distance": "Euclid"}}
     if include_public_vector:
@@ -1043,7 +1049,7 @@ def _wait_for_private_oram_epochs(
 
 
 def _wait_for_crypto_runtime_capability_metadata(
-    peer_dirs: list[pathlib.Path], expected_count: int
+    peer_dirs: list[pathlib.Path], expected_count: int, wait_for_timeout: int = 30
 ) -> None:
     def metadata_match(peer_dir: pathlib.Path) -> bool:
         try:
@@ -1058,7 +1064,7 @@ def _wait_for_crypto_runtime_capability_metadata(
 
     wait_for(
         lambda: all(metadata_match(peer_dir) for peer_dir in peer_dirs),
-        wait_for_timeout=30,
+        wait_for_timeout=wait_for_timeout,
     )
 
 
