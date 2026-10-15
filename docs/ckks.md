@@ -5878,7 +5878,9 @@ confirmation was rejected deterministically and re-proposed in the new term),
 but mutation sessions are coordinated by the current leader, so the old
 leader answers `open` with a precondition failure (HTTP 500, as for every
 `PreconditionFailed`) and a client has to route mutation calls to the leader
-`GET /cluster` reports. Larger trees are not measured yet.
+`GET /cluster` reports. How an admitted append survives a leader change or a
+coordinator restart, and when it aborts instead of committing, is described in
+`docs/private-oram-v2-enrollment.md`. Larger trees are not measured yet.
 
 ### Release gate work: whole-process kill matrix for replicated write-backs
 

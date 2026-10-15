@@ -69,6 +69,21 @@ use super::private_result_oram::{
 use crate::settings::Settings;
 
 pub(crate) const PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS: u64 = 300;
+
+/// The lease a new mutation session is issued. Test builds with the `private-oram-crash-points`
+/// feature may shorten it through `QDRANT_PRIVATE_ORAM_TEST_MUTATION_LEASE_SECS`, so a test can
+/// let an admitted mutation's signed lease expire before its decision.
+fn private_oram_mutation_session_lease_secs() -> u64 {
+    #[cfg(feature = "private-oram-crash-points")]
+    if let Some(secs) = std::env::var("QDRANT_PRIVATE_ORAM_TEST_MUTATION_LEASE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| (1..=PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS).contains(secs))
+    {
+        return secs;
+    }
+    PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS
+}
 const PRIVATE_ORAM_MUTATION_MAX_SESSION_COUNT: usize = 512;
 const PRIVATE_ORAM_MUTATION_MAX_APPEND_JOB_COUNT: usize = 128;
 const PRIVATE_ORAM_MUTATION_WRITER_LEASE_DOMAIN: &[u8] =
@@ -918,6 +933,9 @@ pub(crate) enum PrivateOramMutationAppendJobPhaseV2 {
     OwnersAdopting,
     ParentSequence2,
     PointsStaging,
+    /// The live handoff of an admitted mutation failed before its commit; the lease owner's
+    /// supervisor finishes it from the durable recovery material.
+    AdmittedRecovery,
     Deciding,
     Finalizing,
     Cleaning,
@@ -1215,6 +1233,7 @@ impl PrivateOramDetachedMutationAppendV2 {
                 | PrivateOramMutationAppendJobPhaseV2::AdmissionUnknown
                 | PrivateOramMutationAppendJobPhaseV2::AdmittedAckPending
                 | PrivateOramMutationAppendJobPhaseV2::AdmittedAckComplete
+                | PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
                 | PrivateOramMutationAppendJobPhaseV2::RejectedAckPending
                 | PrivateOramMutationAppendJobPhaseV2::RejectedAckComplete
                 | PrivateOramMutationAppendJobPhaseV2::NotSubmitted
@@ -1286,6 +1305,31 @@ impl PrivateOramDetachedMutationAppendV2 {
             PrivateOramMutationAppendJobPhaseV2::AdmittedAckComplete,
             PrivateOramMutationAppendJobPhaseV2::Deciding,
         )
+    }
+
+    /// Hands an admitted mutation whose live handoff failed to the supervisor, which reloads it
+    /// from the durable recovery material. Only phases after admission and before the terminal
+    /// resume qualify.
+    pub(crate) fn hand_admitted_job_to_recovery(&self) -> StorageResult<()> {
+        self.ensure_cleanup_not_claimed()?;
+        let mut phase = self.job.phase.lock().map_err(|_| {
+            StorageError::service_error("private ORAM mutation append job poisoned")
+        })?;
+        if !matches!(
+            *phase,
+            PrivateOramMutationAppendJobPhaseV2::AdmittedAckPending
+                | PrivateOramMutationAppendJobPhaseV2::ParentSequence1
+                | PrivateOramMutationAppendJobPhaseV2::OwnersAdopting
+                | PrivateOramMutationAppendJobPhaseV2::ParentSequence2
+                | PrivateOramMutationAppendJobPhaseV2::PointsStaging
+                | PrivateOramMutationAppendJobPhaseV2::AdmittedAckComplete
+                | PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
+                | PrivateOramMutationAppendJobPhaseV2::Deciding
+        ) {
+            return Err(invalid_mutation_session());
+        }
+        *phase = PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery;
+        Ok(())
     }
 
     pub(crate) fn mark_rejected_ack_pending(&self) -> StorageResult<()> {
@@ -1429,12 +1473,37 @@ pub(crate) fn private_oram_detached_job_exists_for_collection_v2(
         })?;
         if !matches!(
             phase,
-            PrivateOramMutationAppendJobPhaseV2::Deciding
+            PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
+                | PrivateOramMutationAppendJobPhaseV2::Deciding
                 | PrivateOramMutationAppendJobPhaseV2::Finalizing
                 | PrivateOramMutationAppendJobPhaseV2::Cleaning
                 | PrivateOramMutationAppendJobPhaseV2::TerminalCommitted
                 | PrivateOramMutationAppendJobPhaseV2::TerminalAborted
         ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether this process's live append job for the collection is deciding: it has proposed, or is
+/// about to propose, the commit of its admitted mutation. A failed commit moves it to
+/// `AdmittedRecovery`.
+pub(crate) fn private_oram_detached_job_deciding_for_collection_v2(
+    collection_id: &str,
+) -> StorageResult<bool> {
+    let registry = session_registry().lock().map_err(|_| {
+        StorageError::service_error("private ORAM mutation session registry is poisoned")
+    })?;
+    for job in registry
+        .append_jobs
+        .values()
+        .filter(|job| job.binding.collection_id == collection_id)
+    {
+        let phase = *job.phase.lock().map_err(|_| {
+            StorageError::service_error("private ORAM mutation append job poisoned")
+        })?;
+        if phase == PrivateOramMutationAppendJobPhaseV2::Deciding {
             return Ok(true);
         }
     }
@@ -1621,7 +1690,8 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
                 })?;
                 if !matches!(
                     *phase,
-                    PrivateOramMutationAppendJobPhaseV2::Deciding
+                    PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
+                        | PrivateOramMutationAppendJobPhaseV2::Deciding
                         | PrivateOramMutationAppendJobPhaseV2::Finalizing
                         | PrivateOramMutationAppendJobPhaseV2::Cleaning
                 ) {
@@ -1838,7 +1908,7 @@ pub(crate) async fn do_open_private_oram_mutation_session_v2(
         .ok_or_else(invalid_mutation_session)?;
     let issued_at_unix = current_unix_secs()?;
     let requested_expires_unix = issued_at_unix
-        .checked_add(PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS)
+        .checked_add(private_oram_mutation_session_lease_secs())
         .ok_or_else(invalid_mutation_session)?;
     let writer_lease_digest = new_writer_lease_digest(
         &collection_id,

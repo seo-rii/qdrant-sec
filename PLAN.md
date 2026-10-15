@@ -1579,6 +1579,23 @@ Signed fields:
   metadata를 제안하기 전에(Raft idle 뒤, 60 s throttle) encrypted shard transfer, resharding,
   custom shard key를 실행해 sessions test 8개가 CI에서만 실패하던 문제다. 이제 cluster setup이 그
   metadata를 기다린다.
+- 2026-10-15: 내부 TLS peer 3개(각각 replica)에서 실제 paired append가 remote owner 2개를 거쳐
+  commit된다. 모든 peer storage에 append bucket ciphertext가 있고 plaintext sentinel은 없다.
+  Admission 뒤 leader나 coordinator process가 바뀌면 append가 영원히 멈추던 세 gap을 고쳤다:
+  coordinator가 자신의 reservation outcome을 Raft leader일 때만 ACK해 admission 뒤 election이
+  나면 commit 전에 live job이 실패했고(debug build는 300 KB material entry apply에 4 s까지 걸려
+  election이 실제로 난다), 실패한 job이 pending phase에 남아 supervisor가 그 collection을 건너뛰었고,
+  coordinator restart 뒤에는 recovery plan derivation이 committed lease만 받아 아무도 commit하지
+  않았다. 이제 admitted mutation의 ACK는 lease owner가 하고(owner의 서명된 receipt를 consensus가
+  검증), 실패한 live job은 `AdmittedRecovery`로 넘어가며, lease owner의 supervisor가 retained
+  recovery material에서 plan을 다시 만들어 readiness 전 단계, ACK, 결정을 끝낸다. 결정은 client가
+  서명한 lease 안이면 commit, 만료됐으면 `Preparing -> AbortDecided`로 abort한다(Raft apply는 시계를
+  읽을 수 없으므로). Leader를 SIGSTOP으로 바꾸는 test, admission 직후와 commit 직전 crash point에서
+  coordinator를 죽였다 재시작하는 test, 만료된 lease를 abort하고 genesis state가 다시 열리는 test가
+  통과한다. Mutation session은 현재 leader가 coordinate하므로 client는 `open`을 `GET /cluster`의
+  leader로 보내야 한다. CI에서만 나던 실패도 고쳤다: dead replica 복구 test가 placement에 따라 layout
+  generation 3이 되는 경우, V2 activation이 learner promotion 전에 실행되던 경우, scale-down snapshot
+  test가 upload의 session lease release가 적용되기 전에 resharding을 시작하던 경우.
 
 완료 조건:
 

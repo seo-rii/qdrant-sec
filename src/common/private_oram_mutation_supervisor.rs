@@ -6,14 +6,17 @@ use std::time::Duration;
 use collection::operations::verification::new_unchecked_verification_pass;
 use schemars::JsonSchema;
 use serde::Serialize;
-use storage::content_manager::consensus_ops::PrivateOramMutationKey;
+use storage::content_manager::consensus_ops::{
+    PrivateOramMutationKey, PrivateOramMutationLeasePhase,
+};
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::dispatcher::Dispatcher;
 
 use super::auth::Auth;
-use super::private_oram_mutation::reconcile_private_oram_admitted_to_ready_v2;
+use super::private_oram_mutation::reconcile_private_oram_admitted_to_commit_v2;
 use super::private_oram_mutation_session::{
-    current_unix_secs, private_oram_detached_job_exists_for_collection_v2,
+    current_unix_secs, private_oram_detached_job_deciding_for_collection_v2,
+    private_oram_detached_job_exists_for_collection_v2,
 };
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::{
@@ -397,7 +400,24 @@ async fn reconcile_private_oram_mutations_once_v2(
             });
             continue;
         }
-        match reconcile_private_oram_admitted_to_ready_v2(
+        // The live job is proposing the commit of this admitted mutation; let it finish.
+        if lease.phase == PrivateOramMutationLeasePhase::Preparing {
+            match private_oram_detached_job_deciding_for_collection_v2(&key.collection_id) {
+                Ok(true) => {
+                    status.process_local_pending = status.process_local_pending.saturating_add(1);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!(
+                        "private ORAM mutation supervisor could not inspect detached jobs: {error}"
+                    );
+                    status.failed = status.failed.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        match reconcile_private_oram_admitted_to_commit_v2(
             dispatcher,
             settings,
             identity,
@@ -432,7 +452,7 @@ async fn reconcile_private_oram_mutations_once_v2(
             },
             Err(error) => {
                 log::warn!(
-                    "private ORAM mutation supervisor could not reconcile an admitted mutation: {error}"
+                    "private ORAM mutation supervisor could not commit an admitted mutation: {error}"
                 );
                 status.failed = status.failed.saturating_add(1);
             }

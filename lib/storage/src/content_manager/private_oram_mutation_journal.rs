@@ -3802,12 +3802,14 @@ pub fn derive_private_oram_mutation_admitted_recovery_plan_v2(
     recovery_manifest: &PrivateOramMutationAllOwnersPrestagedV2,
     validated: &PrivateOramValidatedOwnerPrepareV1,
 ) -> Result<PrivateOramMutationAdmissionPlanV2, PrivateOramMutationJournalError> {
-    if !matches!(
-        active_lease.phase,
-        PrivateOramMutationLeasePhase::ConsensusCommitted { .. }
-    ) || active_lease.generation == 0
-        || active_lease.writer_fence == 0
-    {
+    // An admitted lease is recovered either before its commit (still `Preparing` over the exact
+    // old state) or after it (`ConsensusCommitted` over the exact new state).
+    let committed = match active_lease.phase {
+        PrivateOramMutationLeasePhase::Preparing => false,
+        PrivateOramMutationLeasePhase::ConsensusCommitted { .. } => true,
+        _ => return Err(PrivateOramMutationJournalError::InvalidTransition),
+    };
+    if active_lease.generation == 0 || active_lease.writer_fence == 0 {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     let (package, expected_old_state) = recovery_manifest.coordinator_recovery_envelope()?;
@@ -3839,7 +3841,12 @@ pub fn derive_private_oram_mutation_admitted_recovery_plan_v2(
     )?;
     let mut expected_active_lease = active_lease.clone();
     expected_active_lease.phase = PrivateOramMutationLeasePhase::Preparing;
-    if plan.lease != expected_active_lease || plan.expected_new_state != *current_state {
+    let expected_current_state = if committed {
+        &plan.expected_new_state
+    } else {
+        &plan.expected_old_state
+    };
+    if plan.lease != expected_active_lease || expected_current_state != current_state {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     recovery_manifest.validate_admission_plan(&plan)?;

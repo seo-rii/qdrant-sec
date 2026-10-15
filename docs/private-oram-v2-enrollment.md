@@ -202,8 +202,64 @@ admitted. Four more gaps stopped it after admission, and are fixed:
 With these the append commits: the supervisor's terminal resume records the
 decision, the owner terminals and the point resolution, then the cleanup
 witness and clear, and a mutation session opens on the appended signed state
-while the genesis state is refused. A remote owner's terminal and the abort
-path are not exercised by this single-peer test.
+while the genesis state is refused.
+
+On three TLS peers with a replica each the same append commits through two
+remote owners (`test_private_oram_paired_append_commits_on_every_owner_over_tls`).
+Three more gaps showed up once Raft leadership or the coordinator process
+changed while an admitted append was in flight, and are fixed:
+
+- The coordinator acknowledged its own reservation outcome only while it led
+  Raft (`require_private_oram_activation_coordinator_is_local_leader`), so any
+  election after admission failed the live job before its commit. Applying
+  the append's material entries (about 300 KB each) can stall a debug build
+  long enough for a follower to start one. The acknowledgement carries the
+  owners' signed resolution receipts, which consensus validates regardless of
+  the proposer, so an admitted mutation's outcome is now acknowledged by its
+  lease owner (`PrivateOramReservationAckProposerV3::AdmittedLeaseOwner`);
+  pre-admission acknowledgements stay with the leader.
+- A live handoff that failed after admission left its job in a pending phase,
+  and the supervisor skips collections with a pending job, so nothing ever
+  committed. The job now moves to `AdmittedRecovery`, which the supervisor
+  takes over and local cleanup accepts.
+- Nothing committed after a coordinator restart either: the restart
+  reconciliation derived its plan with
+  `derive_private_oram_mutation_admitted_recovery_plan_v2`, which accepted
+  only a committed lease, and it stopped at the acknowledgement. The
+  derivation now also accepts the preparing lease over the exact old state,
+  and the lease owner's supervisor
+  (`reconcile_private_oram_admitted_to_commit_v2`) re-runs the steps before
+  readiness while readiness is not certified, acknowledges the outcome and
+  proposes the commit. The commit is idempotent (a second proposal is refused
+  in apply and finds the commit applied), and the supervisor leaves a
+  preparing lease alone while this process's live job is deciding.
+
+`test_private_oram_paired_append_commits_across_a_leader_change` freezes the
+coordinator (SIGSTOP) right after admission until a follower leads, and
+`test_private_oram_paired_append_commits_after_the_coordinator_restarts` kills
+it at the crash points `mutation_v2_after_admission` and
+`mutation_v2_before_consensus_commit` and restarts it; every case commits.
+Mutation sessions are coordinated by the current leader, so clients must route
+`open` to the leader `GET /cluster` reports; the old leader answers with a
+precondition failure.
+
+The decision itself (`decide_private_oram_admitted_mutation_v2`, taken by the
+live handoff and by the supervisor alike) commits only inside the validity
+window the client signed: once the lease consensus holds has expired, the
+lease owner proposes the `Preparing -> AbortDecided` transition
+(`private_oram_mutation_v2_abort_decision_operation`, which had no caller)
+instead, since Raft apply cannot read a clock. Both transitions require the
+preparing lease and the generation's readiness certificate, so a racing
+commit and abort are ordered by Raft and the terminal resume finishes
+whichever applied; for an abort it rolls every owner back to the exact old
+state and cleans up. `test_private_oram_paired_append_aborts_once_its_signed_lease_expired`
+shortens the mutation lease with the test-only
+`QDRANT_PRIVATE_ORAM_TEST_MUTATION_LEASE_SECS` (crash-point builds only),
+kills the coordinator before its decision and restarts it after the lease
+expired: the genesis state opens again and the appended state is refused. An
+admitted mutation whose readiness can never be certified (an owner that never
+installs its capsule) still stays blocked, because both decisions require the
+readiness certificate.
 
 ## Risks and open questions
 
