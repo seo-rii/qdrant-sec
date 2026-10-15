@@ -7,7 +7,8 @@ once through V1 sessions. It then enrolls both indexes with a genesis state that
 sealed append checkpoint. In a mutation session on that state it appends one point: it reads
 every fixed window of both indexes, verifies the buckets against the session roots, and sends
 the owner prepare of the finalized paired mutation. The append must commit, after which only the
-new signed state opens a session. Linux only (peer identities are Linux-only).
+new signed state opens a session, and no plaintext of the appended point or the client keys may
+appear in the peer's files or log. Linux only (peer identities are Linux-only).
 """
 
 import json
@@ -41,8 +42,10 @@ from .test_private_oram_v2_enrollment import (
     _mutation_post,
     _write_config,
 )
+from .test_private_oram_leak_scan import _files_under
 from .utils import (
     PROJECT_ROOT,
+    init_pytest_log_folder,
     kill_all_processes,
     make_peer_folders,
     start_first_peer,
@@ -230,6 +233,7 @@ def test_private_oram_paired_append_commits_through_a_real_client(
     # The client asks for each fixed read window, verifies the answer and, after the last one,
     # hands over the owner prepare of the finalized mutation.
     action = append_client.call("begin", session=_from_wire(session))
+    sentinels = [bytes.fromhex(sentinel) for sentinel in action["plaintext_sentinels"]]
     reads = 0
     while "read" in action:
         read = _mutation_post(peer_url, "read", action["read"])
@@ -237,6 +241,7 @@ def test_private_oram_paired_append_commits_through_a_real_client(
         action = append_client.call("read_response", response=_from_wire(read.json()["result"]))
         reads += 1
     assert reads == 10, "five fixed read paths per index, one path per window"
+    written_ciphertext = action["written_ciphertext"]
     appended = _mutation_post(peer_url, "append", action["append"])
     assert_http_ok(appended)
 
@@ -274,3 +279,22 @@ def test_private_oram_paired_append_commits_through_a_real_client(
     # The genesis state is no longer current.
     stale = _mutation_post(peer_url, "open", genesis_open)
     assert stale.status_code == 400, stale.text
+
+    # Leakage scan (PLAN V2-D5): nothing of the appended point or the client keys may reach the
+    # peer's storage, Raft state or log, while the bucket ciphertext the append wrote is there.
+    kill_all_processes()
+    files = [
+        file
+        for root in [peer_dir, pathlib.Path(init_pytest_log_folder())]
+        for file in _files_under(root)
+    ]
+    assert any(
+        written_ciphertext.encode() in data for _, data in files
+    ), "scan does not see the appended buckets"
+    leaks = [
+        (str(path), sentinel.hex())
+        for path, data in files
+        for sentinel in sentinels
+        if sentinel in data
+    ]
+    assert not leaks, f"plaintext sentinels leaked: {leaks[:5]}"

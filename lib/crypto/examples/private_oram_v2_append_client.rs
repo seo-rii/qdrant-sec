@@ -19,6 +19,12 @@
 //!   next `read` body, until it returns the `append` body (owner prepare of the finalized
 //!   mutation).
 //! - `{"cmd": "open_next"}` adopts the appended state and returns an `open` body for it.
+//!
+//! The `begin` answer also carries `plaintext_sentinels`: hex byte strings of the appended
+//! point (node id, point and fetch tokens raw and base64url, vector bytes, payload raw and
+//! base64url) and of the client keys, which must never reach server storage, snapshots or logs.
+//! The `append` answer carries `written_ciphertext`, one bucket ciphertext the append writes, as
+//! the positive control of such a scan.
 
 use std::io::{BufRead as _, Write as _};
 
@@ -94,6 +100,10 @@ const HNSW_RESERVED_SLOTS: u64 = 10;
 const CREATED_AT_UNIX: u64 = 1_770_000_000;
 const MAX_NEIGHBOR_REWRITES: u32 = 1;
 const MAX_CLIENT_STASH_BLOCKS: u64 = 8;
+const RESOURCE_KEY: [u8; 32] = [13; 32];
+const CHECKPOINT_KEY: [u8; 32] = [44; 32];
+const APPENDED_PAYLOAD: &[u8] = b"{\"body\":\"append-e2e-appended-payload\"}";
+const APPENDED_VECTOR: [f32; 2] = [1.5, 0.5];
 
 struct HnswIndex {
     keys: PrivateHnswClientKeys,
@@ -179,7 +189,7 @@ fn main() -> Result<(), BoxError> {
         collection_id: String::new(),
         owner_key: Ed25519KeyPair::from_seed_unchecked(&[7; 32])
             .map_err(|_| "failed to create the owner key")?,
-        checkpoint_key: SecretKey::from_bytes([44; 32]),
+        checkpoint_key: SecretKey::from_bytes(CHECKPOINT_KEY),
         points: fixture_points(),
         hnsw: None,
         result: None,
@@ -282,7 +292,7 @@ impl Client {
         // An index that enrolls into mutation V2 keeps physical slots free for appends.
         reserve_private_hnsw_oram_physical_slots(&mut build, HNSW_RESERVED_SLOTS)?;
         let keys = PrivateHnswClientKeys::derive_from_resource_key_with_context(
-            &SecretKey::from_bytes([13; 32]),
+            &SecretKey::from_bytes(RESOURCE_KEY),
             &self.collection_id,
             VECTOR_NAME,
             KEY_ID,
@@ -432,7 +442,7 @@ impl Client {
         };
         let config = private_result_oram_client_config_from_manifest(&manifest)?;
         let keys = PrivateResultOramClientKeys::derive_from_resource_key_with_context(
-            &SecretKey::from_bytes([13; 32]),
+            &SecretKey::from_bytes(RESOURCE_KEY),
             &self.collection_id,
             KEY_ID,
             RK_EPOCH,
@@ -781,7 +791,7 @@ impl Client {
             point_token,
             visible_point_id: None,
             payload_fetch_token: Some(payload_fetch_token),
-            vector: vec![1.5, 0.5],
+            vector: APPENDED_VECTOR.to_vec(),
             initial_leaf: random_leaf()?,
         };
         // Every node is a candidate (see the read schedule chosen at enrollment).
@@ -800,7 +810,7 @@ impl Client {
         let result_point = PrivateOramAppendResultPointV2 {
             payload_fetch_token,
             point_token,
-            payload: b"{\"body\":\"append-e2e-appended\"}".to_vec(),
+            payload: APPENDED_PAYLOAD.to_vec(),
             initial_leaf: result_initial_leaf,
         };
         let result_plan = PrivateOramAppendResultTransactionPlanV2 {
@@ -835,7 +845,27 @@ impl Client {
             pending: None,
             finalized: None,
         });
-        self.next_action()
+        let mut action = self.next_action()?;
+        let mut sentinels = vec![RESOURCE_KEY.to_vec(), CHECKPOINT_KEY.to_vec()];
+        for token in [node_id, point_token, payload_fetch_token] {
+            sentinels.push(token.to_vec());
+            sentinels.push(BASE64URL_NOPAD.encode(&token).into_bytes());
+        }
+        sentinels.push(
+            APPENDED_VECTOR
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        );
+        sentinels.push(APPENDED_PAYLOAD.to_vec());
+        sentinels.push(BASE64URL_NOPAD.encode(APPENDED_PAYLOAD).into_bytes());
+        action["plaintext_sentinels"] = json!(
+            sentinels
+                .iter()
+                .map(|bytes| data_encoding::HEXLOWER.encode(bytes))
+                .collect::<Vec<_>>()
+        );
+        Ok(action)
     }
 
     /// The next read window (HNSW windows first, then result windows) as a `read` body, or,
@@ -1008,11 +1038,20 @@ impl Client {
             },
         )?;
         let owner_prepare = project_private_oram_append_paired_owner_prepare_v1(&finalized)?;
-        let body = json!({"append": {
-            "session_id": session.session_id,
-            "owner_prepare": owner_prepare,
-            "staged_insert_frame_b64": null,
-        }});
+        let written_ciphertext = finalized
+            .hnsw_output
+            .final_encrypted_buckets
+            .first()
+            .map(|bucket| bucket.ciphertext.clone())
+            .ok_or("the append writes no HNSW bucket")?;
+        let body = json!({
+            "append": {
+                "session_id": session.session_id,
+                "owner_prepare": owner_prepare,
+                "staged_insert_frame_b64": null,
+            },
+            "written_ciphertext": written_ciphertext,
+        });
         append.finalized = Some(finalized);
         Ok(body)
     }
