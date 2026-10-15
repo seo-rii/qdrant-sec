@@ -5862,8 +5862,23 @@ commit with cleanup done (the next session opens) after 77 s. Most of the
 admission time is the owner pre-stage and consensus round trips; most of the
 rest is the supervisor, which advances the terminal recovery one step per 5 s
 pass (decision, owner terminals, point resolution, cleanup witness, clear),
-plus the coordinator's parent-progress and readiness proposals. Larger trees
-and multi-peer clusters are not measured yet.
+plus the coordinator's parent-progress and readiness proposals.
+
+`test_private_oram_paired_append_commits_on_every_owner_over_tls` runs the
+same append on three peers with internal TLS and a replica each, so the
+coordinator pre-stages, adopts and terminates it on two remote owners through
+the TLS-only owner RPCs; afterwards every peer's storage holds the appended
+bucket ciphertext and no peer file or log holds a plaintext sentinel. Two
+local runs measured admission after 11.5-11.9 s and commit with cleanup done
+after 94 s. Applying one of the append's material entries (about 300 KB)
+takes the debug build up to 4 s on each peer, long enough for a follower's
+election timeout to fire: in one run peer 103 took over Raft leadership
+mid-append. The lease owner still finished the recovery (its stale authority
+confirmation was rejected deterministically and re-proposed in the new term),
+but mutation sessions are coordinated by the current leader, so the old
+leader answers `open` with a precondition failure (HTTP 500, as for every
+`PreconditionFailed`) and a client has to route mutation calls to the leader
+`GET /cluster` reports. Larger trees are not measured yet.
 
 ### Release gate work: whole-process kill matrix for replicated write-backs
 
