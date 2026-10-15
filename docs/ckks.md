@@ -5852,8 +5852,18 @@ amplification is fixed by the manifest capacity, not by the data: every
 append writes `fixed_append_write_bucket_count` frames per index (12 in the
 fixture) and reads `fixed_append_read_path_count` paths (4). CI runs the
 benchmark once in test mode (`cargo test -p qdrant-sec --benches`) so it keeps
-compiling. Server-side latency (owner prepare, consensus apply, fsync) and
-larger trees are not measured yet.
+compiling.
+
+Server side, `test_private_oram_v2_append.py` writes `append_latency.json` to its
+test log folder for the live paired append it drives (one peer, tree height 2,
+debug build). A local run measured: 10 read windows, 228 KB of read responses
+in 0.11 s, a 227 KB owner-prepare request, admission after 7.8 s, and the
+commit with cleanup done (the next session opens) after 77 s. Most of the
+admission time is the owner pre-stage and consensus round trips; most of the
+rest is the supervisor, which advances the terminal recovery one step per 5 s
+pass (decision, owner terminals, point resolution, cleanup witness, clear),
+plus the coordinator's parent-progress and readiness proposals. Larger trees
+and multi-peer clusters are not measured yet.
 
 ### Release gate work: whole-process kill matrix for replicated write-backs
 

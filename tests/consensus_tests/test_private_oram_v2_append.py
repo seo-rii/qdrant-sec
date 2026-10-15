@@ -15,6 +15,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 import requests
@@ -235,13 +236,20 @@ def test_private_oram_paired_append_commits_through_a_real_client(
     action = append_client.call("begin", session=_from_wire(session))
     sentinels = [bytes.fromhex(sentinel) for sentinel in action["plaintext_sentinels"]]
     reads = 0
+    read_bytes = 0
+    read_seconds = 0.0
     while "read" in action:
+        started = time.monotonic()
         read = _mutation_post(peer_url, "read", action["read"])
+        read_seconds += time.monotonic() - started
         assert_http_ok(read)
+        read_bytes += len(read.content)
         action = append_client.call("read_response", response=_from_wire(read.json()["result"]))
         reads += 1
     assert reads == 10, "five fixed read paths per index, one path per window"
     written_ciphertext = action["written_ciphertext"]
+    append_body_bytes = len(json.dumps(action["append"]).encode())
+    appended_at = time.monotonic()
     appended = _mutation_post(peer_url, "append", action["append"])
     assert_http_ok(appended)
 
@@ -257,7 +265,12 @@ def test_private_oram_paired_append_commits_through_a_real_client(
     # The owners pre-stage the mutation, consensus admits its lease, the coordinator records the
     # parent progress, certifies recovery readiness and commits; the supervisor then records the
     # decision, collects the owner terminals and cleans up.
-    wait_for(lambda: append_phase_in(POST_ADMISSION_APPEND_PHASES), wait_for_timeout=60)
+    wait_for(
+        lambda: append_phase_in(POST_ADMISSION_APPEND_PHASES),
+        wait_for_timeout=60,
+        wait_for_interval=0.2,
+    )
+    admitted_seconds = time.monotonic() - appended_at
     assert "quarantined" not in phases and "terminal_aborted" not in phases, phases
 
     # The append is committed once a session opens on the appended state; until the supervisor
@@ -273,7 +286,23 @@ def test_private_oram_paired_append_commits_through_a_real_client(
         reopened.update(response.json()["result"])
         return True
 
-    wait_for(appended_state_opens, wait_for_timeout=300)
+    wait_for(appended_state_opens, wait_for_timeout=300, wait_for_interval=0.5)
+    committed_seconds = time.monotonic() - appended_at
+    # Server-side cost of one paired append on a single peer (tree height 2): the fixed read
+    # windows the client fetched, the owner prepare it sent, and how long the server took to
+    # admit the mutation and to commit and clear it so the next session can open.
+    report = {
+        "read_windows": reads,
+        "read_response_bytes": read_bytes,
+        "read_seconds": round(read_seconds, 3),
+        "append_request_bytes": append_body_bytes,
+        "admitted_seconds": round(admitted_seconds, 1),
+        "committed_and_cleared_seconds": round(committed_seconds, 1),
+    }
+    (pathlib.Path(init_pytest_log_folder()) / "append_latency.json").write_text(
+        json.dumps(report, indent=2)
+    )
+    print(f"V2 paired append cost: {report}")
     assert reopened["old_state_digest"] != genesis_state_digest
     assert_http_ok(_mutation_post(peer_url, "close", {"session_id": reopened["session_id"]}))
     # The genesis state is no longer current.
