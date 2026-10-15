@@ -1063,6 +1063,25 @@ def _wait_for_private_oram_epochs(
     )
 
 
+def _wait_for_private_oram_session_leases_released(peer_dirs: list[pathlib.Path]) -> None:
+    """Shard transfers and resharding of an encrypted collection take its session lease, which
+    each peer checks against its own consensus state; a release proposed by another peer (an
+    upload's or a closed session's) reaches it a moment later."""
+
+    def released(peer_dir: pathlib.Path) -> bool:
+        try:
+            with open(peer_dir / "storage" / "raft_state.json") as state_file:
+                leases = json.load(state_file).get("private_oram_session_leases", {})
+        except (OSError, json.JSONDecodeError):
+            return False
+        return not leases
+
+    wait_for(
+        lambda: all(released(peer_dir) for peer_dir in peer_dirs),
+        wait_for_timeout=30,
+    )
+
+
 def _wait_for_crypto_runtime_capability_metadata(
     peer_dirs: list[pathlib.Path], expected_count: int, wait_for_timeout: int = 30
 ) -> None:
@@ -3565,6 +3584,7 @@ def test_private_oram_active_scale_down_snapshot_rejects_wiped_nonredundant_endp
     _upload_hnsw(coordinator_url, fixture)
     _upload_result_oram(coordinator_url, fixture)
     _wait_for_private_oram_epochs(peer_dirs, BASE_EPOCH, 2)
+    _wait_for_private_oram_session_leases_released(peer_dirs)
     _wait_for_crypto_runtime_capability_metadata(peer_dirs, len(peer_urls))
 
     assert_http_ok(
@@ -3576,6 +3596,9 @@ def test_private_oram_active_scale_down_snapshot_rejects_wiped_nonredundant_endp
         )
     )
     wait_for_collection_resharding_operations_count(coordinator_url, COLLECTION, 1)
+    # The resharding start releases the session leases it took on the coordinator; the endpoint
+    # refuses the migration until it has applied that release too.
+    _wait_for_private_oram_session_leases_released(peer_dirs)
     migrate_points(
         endpoint_url,
         receiver_peer_id,

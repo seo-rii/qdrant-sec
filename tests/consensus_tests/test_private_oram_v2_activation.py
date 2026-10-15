@@ -119,6 +119,16 @@ def _write_activation_config(peer_dir: pathlib.Path, fixture: dict) -> None:
     (peer_dir / "config" / "local.yaml").write_text(config)
 
 
+def _wait_for_stable_voters(peer_urls: list[str]) -> None:
+    """Activation requires a stable voter configuration. Peers join as learners and the leader
+    promotes them one at a time once it has no uncommitted entries, which on a slow host can lag
+    the cluster's formation."""
+    wait_for(
+        lambda: all(get_cluster_info(url)["raft_info"]["is_voter"] for url in peer_urls),
+        wait_for_timeout=60,
+    )
+
+
 def _status(peer_url: str) -> dict:
     response = requests.get(f"{peer_url}/cluster/private-oram/mutation-v2/status", timeout=30)
     assert_http_ok(response)
@@ -171,6 +181,7 @@ def test_private_oram_mutation_v2_activates_across_a_pinned_cluster(tmp_path: pa
     assert [get_cluster_info(url)["peer_id"] for url in peer_urls] == PEER_IDS
 
     leader_url = next(url for url in peer_urls if get_cluster_info(url)["peer_id"] == leader)
+    _wait_for_stable_voters(peer_urls)
     response = requests.post(
         f"{leader_url}/cluster/private-oram/mutation-v2/activate?timeout=60", timeout=120
     )

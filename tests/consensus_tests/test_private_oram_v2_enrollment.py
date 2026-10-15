@@ -41,6 +41,7 @@ from .test_private_oram_v2_activation import (
     _bootstrap_identity,
     _free_port_triple,
     _status,
+    _wait_for_stable_voters,
 )
 from .utils import (
     PROJECT_ROOT,
@@ -421,6 +422,7 @@ def test_private_oram_collection_enrolls_every_owner_over_tls(
         )
     wait_for_uniform_cluster_status(peer_urls, leader)
     leader_url = next(url for url in peer_urls if get_cluster_info(url)["peer_id"] == leader)
+    _wait_for_stable_voters(peer_urls)
     activated = requests.post(
         f"{leader_url}/cluster/private-oram/mutation-v2/activate?timeout=60", timeout=120
     )
