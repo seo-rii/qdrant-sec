@@ -205,7 +205,7 @@ jobs:
   qdrant-sec-cluster-e2e:
     name: qdrant-sec private ORAM cluster E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       UV_VERSION: 0.9.17
 
@@ -251,7 +251,8 @@ jobs:
           QDRANT_PRIVATE_ORAM_CRASH_TESTS: "1"
         run: |
           status=0
-          uv --project tests run pytest tests/consensus_tests/test_private_oram_*.py -v --tb=short -rfE --durations=10 2>&1 | tee private-oram-e2e.log || status=1
+          # A per-test timeout turns a hung peer into one failed test instead of a cancelled job.
+          uv --project tests run pytest tests/consensus_tests/test_private_oram_*.py -v --tb=short -rfE --durations=10 --timeout 900 2>&1 | tee private-oram-e2e.log || status=1
           if [ "$status" -ne 0 ]; then
             # Failing tests, their assertion lines and any peer panic as one annotation (job logs
             # and artifacts need sign-in).

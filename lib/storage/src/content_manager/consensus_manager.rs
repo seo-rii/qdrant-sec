@@ -3737,26 +3737,40 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             &self.toc.collections_snapshot(),
             &collections_data,
         );
-        let mut persistent = self.persistent.write();
-        let current_private_oram_epochs = persistent.private_oram_epochs.clone();
-        let current_private_oram_layouts = persistent.private_oram_layouts.clone();
-        let current_private_oram_external_recoveries =
-            persistent.private_oram_external_recoveries.clone();
-        let this_peer_id = persistent.this_peer_id();
-        crate::content_manager::consensus::persistent::validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
-            &current_private_oram_external_recoveries,
-            &private_oram_external_recoveries,
-            this_peer_id,
-            &retired_external_recovery_keys,
-        )?;
-        persistent.validate_private_oram_activation_authority_for_snapshot(
-            private_oram_activation_authority.as_ref(),
-        )?;
-        persistent.validate_private_oram_mutation_floor_for_snapshot(
-            private_oram_mutation_format_floor.as_ref(),
-            &private_oram_mutation_lease_slots,
-            meta.index,
-        )?;
+        // Validate under a read lock that is released before the collections apply: that apply
+        // takes the table of contents' collection locks, and a task holding one of those while
+        // reading consensus state (a REST handler, a startup reconciliation) would otherwise
+        // deadlock against this thread holding the persistent write lock.
+        let (
+            current_private_oram_epochs,
+            current_private_oram_layouts,
+            current_private_oram_external_recoveries,
+        ) = {
+            let persistent = self.persistent.read();
+            let current_private_oram_epochs = persistent.private_oram_epochs.clone();
+            let current_private_oram_layouts = persistent.private_oram_layouts.clone();
+            let current_private_oram_external_recoveries =
+                persistent.private_oram_external_recoveries.clone();
+            crate::content_manager::consensus::persistent::validate_private_oram_external_recovery_snapshot_transition_for_peer_retiring(
+                &current_private_oram_external_recoveries,
+                &private_oram_external_recoveries,
+                persistent.this_peer_id(),
+                &retired_external_recovery_keys,
+            )?;
+            persistent.validate_private_oram_activation_authority_for_snapshot(
+                private_oram_activation_authority.as_ref(),
+            )?;
+            persistent.validate_private_oram_mutation_floor_for_snapshot(
+                private_oram_mutation_format_floor.as_ref(),
+                &private_oram_mutation_lease_slots,
+                meta.index,
+            )?;
+            (
+                current_private_oram_epochs,
+                current_private_oram_layouts,
+                current_private_oram_external_recoveries,
+            )
+        };
         match self.toc.apply_collections_snapshot_with_private_oram_state(
             collections_data,
             PrivateOramSnapshotState {
@@ -3774,9 +3788,25 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 return Err(error);
             }
             Err(CollectionsSnapshotApplyError::Indeterminate(error)) => {
-                persistent.fence_after_snapshot_side_effect_failure();
+                self.persistent
+                    .read()
+                    .fence_after_snapshot_side_effect_failure();
                 return Err(error);
             }
+        }
+        let mut persistent = self.persistent.write();
+        // Only this thread applies Raft entries and snapshots, so the private ORAM state validated
+        // above cannot have moved; if it did, the collections already changed and the state is
+        // fenced like any other side-effect failure.
+        if persistent.private_oram_epochs != current_private_oram_epochs
+            || persistent.private_oram_layouts != current_private_oram_layouts
+            || persistent.private_oram_external_recoveries
+                != current_private_oram_external_recoveries
+        {
+            persistent.fence_after_snapshot_side_effect_failure();
+            return Err(StorageError::service_error(
+                "private ORAM consensus state changed during a Raft snapshot apply",
+            ));
         }
         if let Err(error) = persistent.update_from_snapshot_retiring(
             meta,

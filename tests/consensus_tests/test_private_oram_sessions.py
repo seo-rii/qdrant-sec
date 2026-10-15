@@ -3717,8 +3717,11 @@ def _private_oram_buckets_dir(peer_dir: pathlib.Path, index_kind: str) -> pathli
 def test_private_oram_partial_finalize_recovers_after_coordinator_restart(
     tmp_path: pathlib.Path, index_kind: str
 ):
+    # The killed coordinator's session lease stays in consensus until it expires; builds with
+    # private ORAM crash points honour this shorter test lease.
+    lease_env = {"QDRANT_PRIVATE_ORAM_TEST_SESSION_LEASE_SECS": "15"}
     peer_urls, peer_dirs, fixture, leader, _ = _start_private_oram_cluster(
-        tmp_path, 3, 2
+        tmp_path, 3, 2, extra_env=lease_env
     )
     peer_ids = [get_cluster_info(peer_url)["peer_id"] for peer_url in peer_urls]
     replica_indices = [
@@ -3794,17 +3797,31 @@ def test_private_oram_partial_finalize_recovers_after_coordinator_restart(
         peer_dirs[coordinator_index],
         f"private_oram_{index_kind}_coordinator_restarted.log",
         restart_bootstrap_uri,
+        extra_env=lease_env,
     )
     peer_urls[coordinator_index] = restarted_url
     wait_for_peer_online(restarted_url, path="/cluster")
     wait_for_uniform_cluster_status(peer_urls, leader)
     wait_collection_exists_and_active_on_all_peers(COLLECTION, peer_urls)
 
+    recovered = {}
+
+    def recovered_session_opens() -> bool:
+        try:
+            recovered.update(
+                _open_hnsw_owner_session(restarted_url, NEXT_EPOCH)
+                if index_kind == "hnsw"
+                else _open_result_owner_session(restarted_url, NEXT_EPOCH)
+            )
+        except Exception:  # noqa: BLE001 - HTTP helpers raise plain Exception
+            return False
+        return True
+
+    # Up to the default 300 s lease when the build ignores the test lease.
+    wait_for(recovered_session_opens, wait_for_timeout=330)
     if index_kind == "hnsw":
-        recovered = _open_hnsw_owner_session(restarted_url, NEXT_EPOCH)
         recovered_close_url = f"{restarted_url}/collections/{COLLECTION}/private-hnsw/{VECTOR}/session/{recovered['session_id']}/close"
     else:
-        recovered = _open_result_owner_session(restarted_url, NEXT_EPOCH)
         recovered_close_url = f"{restarted_url}/collections/{COLLECTION}/private-result-oram/session/{recovered['session_id']}/close"
     assert recovered["index_epoch"] == NEXT_EPOCH
     assert recovered["root_hash"] == commit["new_root_hash"]
