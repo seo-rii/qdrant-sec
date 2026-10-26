@@ -521,7 +521,7 @@ pub(crate) fn private_oram_activation_uri_digest(uri: &http::Uri) -> Result<Stri
     try_private_oram_activation_peer_uri_digest_v1(scheme, &host, port).map_err(|_| ())
 }
 
-fn private_oram_activation_history_and_group_digests(
+pub(super) fn private_oram_activation_history_and_group_digests(
     cluster_identity_digest: &str,
     cluster_first_voter_peer_id: u64,
 ) -> Result<(String, String), ()> {

@@ -40,6 +40,7 @@ const STABLE_FLOOR_FILE: &str = "stable.json";
 const PENDING_FLOOR_FILE: &str = "pending.json";
 const FLOOR_LOCK_FILE: &str = ".lock";
 const FLOOR_TEMP_PREFIX: &str = ".floor-";
+const LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION: u16 = 1;
 const LOCAL_FLOOR_CHECKPOINT_VERSION: u16 = 2;
 const LOCAL_FLOOR_PENDING_VERSION: u16 = 1;
 // A serialized authority floor is roughly 1 KiB (ten base64 digests, its key and field names),
@@ -55,15 +56,56 @@ const LOCAL_FLOOR_CHECKPOINT_DIGEST_DOMAIN_V2: &[u8] =
 const LOCAL_FLOOR_PENDING_DIGEST_DOMAIN_V2: &[u8] =
     b"qdrant-sec/private-oram-mutation-local-floor-pending/v2";
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrivateOramMutationLocalFloorCheckpointV2 {
     version: u16,
     generation: u64,
     format_floor: PrivateOramMutationFormatFloorV2,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     enrollment_floors: BTreeMap<String, PrivateOramMutationEnrollmentFloorV2>,
     authority_floors: BTreeMap<String, PrivateOramMutationAuthorityFloorV2>,
     checkpoint_digest: String,
+}
+
+impl<'de> Deserialize<'de> for PrivateOramMutationLocalFloorCheckpointV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: u16,
+            generation: u64,
+            format_floor: PrivateOramMutationFormatFloorV2,
+            #[serde(default, deserialize_with = "present_enrollment_floors")]
+            enrollment_floors: Option<BTreeMap<String, PrivateOramMutationEnrollmentFloorV2>>,
+            authority_floors: BTreeMap<String, PrivateOramMutationAuthorityFloorV2>,
+            checkpoint_digest: String,
+        }
+        fn present_enrollment_floors<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<BTreeMap<String, PrivateOramMutationEnrollmentFloorV2>>, D::Error>
+        {
+            BTreeMap::deserialize(deserializer).map(Some)
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.version == LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION && wire.enrollment_floors.is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "legacy private ORAM floor checkpoint cannot contain enrollment floors",
+            ));
+        }
+        let checkpoint = Self {
+            version: wire.version,
+            generation: wire.generation,
+            format_floor: wire.format_floor,
+            enrollment_floors: wire.enrollment_floors.unwrap_or_default(),
+            authority_floors: wire.authority_floors,
+            checkpoint_digest: wire.checkpoint_digest,
+        };
+        validate_private_oram_mutation_local_floor_checkpoint_v2(&checkpoint)
+            .map_err(serde::de::Error::custom)?;
+        Ok(checkpoint)
+    }
 }
 
 impl Debug for PrivateOramMutationLocalFloorCheckpointV2 {
@@ -202,7 +244,15 @@ pub(crate) fn plan_private_oram_mutation_local_floor_checkpoint_v2(
 pub(crate) fn validate_private_oram_mutation_local_floor_checkpoint_v2(
     checkpoint: &PrivateOramMutationLocalFloorCheckpointV2,
 ) -> Result<(), PrivateOramMutationJournalError> {
-    if checkpoint.version != LOCAL_FLOOR_CHECKPOINT_VERSION
+    if !matches!(
+        checkpoint.version,
+        LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION | LOCAL_FLOOR_CHECKPOINT_VERSION
+    ) || (checkpoint.version == LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION
+        && (!checkpoint.enrollment_floors.is_empty()
+            || checkpoint
+                .format_floor
+                .required_binary_capability_digest()
+                .is_some()))
         || checkpoint.generation == 0
         || checkpoint.enrollment_floors.len() > MAX_LOCAL_ENROLLMENT_FLOORS
         || checkpoint.authority_floors.len() > MAX_LOCAL_AUTHORITY_FLOORS
@@ -252,11 +302,12 @@ fn validate_private_oram_mutation_local_floor_checkpoint_transition_v2(
     if candidate == current {
         return Ok(());
     }
-    if candidate.generation
-        != current
-            .generation
-            .checked_add(1)
-            .ok_or(PrivateOramMutationJournalError::InvalidTransition)?
+    if candidate.version < current.version
+        || candidate.generation
+            != current
+                .generation
+                .checked_add(1)
+                .ok_or(PrivateOramMutationJournalError::InvalidTransition)?
     {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
@@ -395,12 +446,14 @@ fn local_floor_checkpoint_digest_v2(
     hasher.update(checkpoint.version.to_be_bytes());
     hasher.update(checkpoint.generation.to_be_bytes());
     hash_digest(&mut hasher, checkpoint.format_floor.floor_digest())?;
-    let enrollment_count = u64::try_from(checkpoint.enrollment_floors.len())
-        .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
-    hasher.update(enrollment_count.to_be_bytes());
-    for (key, floor) in &checkpoint.enrollment_floors {
-        hash_digest(&mut hasher, key)?;
-        hash_digest(&mut hasher, floor.floor_digest())?;
+    if checkpoint.version != LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION {
+        let enrollment_count = u64::try_from(checkpoint.enrollment_floors.len())
+            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+        hasher.update(enrollment_count.to_be_bytes());
+        for (key, floor) in &checkpoint.enrollment_floors {
+            hash_digest(&mut hasher, key)?;
+            hash_digest(&mut hasher, floor.floor_digest())?;
+        }
     }
     let authority_count = u64::try_from(checkpoint.authority_floors.len())
         .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
@@ -1373,6 +1426,75 @@ mod tests {
             store.recover(&digest(70)),
             Err(PrivateOramMutationJournalError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn legacy_wire_7_checkpoint_preserves_hash_and_recovers_without_rewriting() {
+        use super::super::format::LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON;
+
+        let checkpoint: PrivateOramMutationLocalFloorCheckpointV2 =
+            serde_json::from_str(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON).unwrap();
+        assert_eq!(
+            checkpoint.checkpoint_digest(),
+            "FyJioXT1VPRtUCf-ucAOqkQW9WTNAyfzi7NYIL2Np4Y"
+        );
+        assert_eq!(
+            serde_json::to_string(&checkpoint).unwrap(),
+            LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON.trim()
+        );
+        assert_eq!(
+            plan_private_oram_mutation_local_floor_checkpoint_v2(
+                Some(&checkpoint),
+                checkpoint.format_floor.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+            checkpoint
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(&temp);
+        {
+            let lock = store.acquire_lock(true).unwrap().unwrap();
+            write_json_atomic(&lock, STABLE_FLOOR_FILE, &checkpoint, None).unwrap();
+        }
+        let before = fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store.recover(&digest(70)).unwrap(),
+                Some(checkpoint.clone())
+            );
+            assert_eq!(
+                fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap(),
+                before
+            );
+        }
+        let mut forged: serde_json::Value =
+            serde_json::from_str(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON).unwrap();
+        forged["enrollment_floors"] = serde_json::json!({});
+        assert!(
+            serde_json::from_value::<PrivateOramMutationLocalFloorCheckpointV2>(forged).is_err()
+        );
+        let mut new = checkpoint.clone();
+        new.version = LOCAL_FLOOR_CHECKPOINT_VERSION;
+        new.generation += 1;
+        new.checkpoint_digest = local_floor_checkpoint_digest_v2(&new).unwrap();
+        validate_private_oram_mutation_local_floor_checkpoint_transition_v2(
+            Some(&checkpoint),
+            &new,
+        )
+        .unwrap();
+        let mut rollback = new.clone();
+        rollback.version = LEGACY_LOCAL_FLOOR_CHECKPOINT_VERSION;
+        rollback.generation += 1;
+        rollback.checkpoint_digest = local_floor_checkpoint_digest_v2(&rollback).unwrap();
+        assert!(
+            validate_private_oram_mutation_local_floor_checkpoint_transition_v2(
+                Some(&new),
+                &rollback
+            )
+            .is_err()
+        );
     }
 
     #[test]

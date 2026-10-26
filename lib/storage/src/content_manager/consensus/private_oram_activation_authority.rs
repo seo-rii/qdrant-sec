@@ -155,6 +155,21 @@ impl PrivateOramActivationAuthorityStateV1 {
         })
     }
 
+    /// Only use after verifying this state and its retained predecessor under the trust anchor.
+    /// Codec-1 floors did not store a binary capability; the exact signed predecessor supplies it.
+    pub(super) fn legacy_floor_manifest(
+        &self,
+        format_floor_digest: &str,
+    ) -> Option<&PrivateOramActivationAuthorityManifestV1> {
+        match &self.capability_upgrade {
+            Some(upgrade) if upgrade.format_floor_digest == format_floor_digest => {
+                Some(&upgrade.predecessor.manifest)
+            }
+            Some(_) => None,
+            None => Some(self.manifest()),
+        }
+    }
+
     fn from_verified(verified: &VerifiedSignedPrivateOramActivationAuthorityManifestV1) -> Self {
         Self {
             version: PRIVATE_ORAM_ACTIVATION_AUTHORITY_STATE_VERSION,

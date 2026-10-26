@@ -43,6 +43,7 @@ use crate::content_manager::consensus::private_oram_activation_authority::{
 };
 use crate::content_manager::consensus::private_oram_mutation_activation_barrier::{
     PrivateOramMutationActivationApplyFactsV2, PrivateOramMutationActivationPendingV2,
+    private_oram_activation_history_and_group_digests,
     validate_private_oram_mutation_activation_barrier_v2,
     validate_private_oram_mutation_activation_pending_v2,
 };
@@ -164,6 +165,49 @@ const PRIVATE_ORAM_EXTERNAL_RECOVERY_LEASE_MAX_SECS: u64 = 3_600;
 const PRIVATE_ORAM_MUTATION_LEASE_MAX_SECS: u64 = 3_600;
 const PERSISTENT_PARENT_SYNC_ATTEMPTS: usize = 3;
 const PERSISTENT_SAVE_INDETERMINATE_MESSAGE: &str = "Raft persistent state durability is indeterminate; restart this peer before applying more consensus operations";
+
+// Immutable binary capability known answers from 76ca9ae178c8789c0eae3c2abcf7e7b4ff8d2189. This is
+// recognition of a signed historical capability, never a default inserted into a codec-1 floor.
+const PRIVATE_ORAM_LEGACY_WIRE_6_CAPABILITY_DIGEST: &str =
+    "476bxEnworZ3LqmqqKrsc1Udw7AjtJdwjNq_gyPsxok";
+const PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST: &str =
+    "dAtfKtcZBHNaXhM-amdoNULrgFbKmnO_EWz8LcJy3l4";
+
+/// Authority signatures, including any predecessor, must already have been verified by the caller.
+fn private_oram_format_floor_required_capability<'a>(
+    floor: &'a PrivateOramMutationFormatFloorV2,
+    authority: &'a PrivateOramActivationAuthorityStateV1,
+) -> Result<&'a str, StorageError> {
+    if let Some(digest) = floor.required_binary_capability_digest() {
+        return Ok(digest);
+    }
+    let invalid = || {
+        StorageError::service_error(
+            "legacy private ORAM mutation format floor has no matching signed capability authority",
+        )
+    };
+    let manifest = authority
+        .legacy_floor_manifest(floor.floor_digest())
+        .ok_or_else(invalid)?;
+    let (history, group) = private_oram_activation_history_and_group_digests(
+        &manifest.cluster_identity_digest,
+        manifest.cluster_first_voter_peer_id,
+    )
+    .map_err(|_| invalid())?;
+    let digest = &manifest.required_binary_capability_digest;
+    let recognized = match floor.minimum_reader_protocol() {
+        6 => digest == PRIVATE_ORAM_LEGACY_WIRE_6_CAPABILITY_DIGEST,
+        7 => digest == PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST,
+        _ => false,
+    };
+    if !recognized
+        || history != floor.consensus_history_id_digest()
+        || group != floor.raft_group_id_digest()
+    {
+        return Err(invalid());
+    }
+    Ok(digest)
+}
 
 fn validate_persisted_private_oram_activation_authority(
     authority: Option<&PrivateOramActivationAuthorityStateV1>,
@@ -3118,8 +3162,18 @@ impl Persistent {
                     "private ORAM mutation format floor has no activation authority",
                 )
             })?;
-            if manifest.required_binary_capability_digest
-                != format_floor.required_binary_capability_digest()
+            let required_capability = private_oram_format_floor_required_capability(
+                format_floor,
+                state
+                    .private_oram_activation_authority
+                    .as_ref()
+                    .ok_or_else(|| {
+                        StorageError::service_error(
+                            "private ORAM mutation format floor has no activation authority",
+                        )
+                    })?,
+            )?;
+            if manifest.required_binary_capability_digest != required_capability
                 && !(state.private_oram_capability_upgrade_can_start(format_floor)
                     && state
                         .private_oram_activation_authority
@@ -3127,7 +3181,7 @@ impl Persistent {
                         .is_some_and(|authority| {
                             authority.capability_upgrade_matches_floor(
                                 format_floor.floor_digest(),
-                                format_floor.required_binary_capability_digest(),
+                                required_capability,
                             )
                         }))
             {
@@ -3476,19 +3530,18 @@ impl Persistent {
         if let Some(current) = &self.private_oram_activation_authority
             && let Some(floor) = &self.private_oram_mutation_format_floor
         {
+            let required_capability =
+                private_oram_format_floor_required_capability(floor, current)?;
             if self.private_oram_mutation_activation_pending.is_some()
                 || self.current_unapplied_entry().is_some()
-                || current.manifest().required_binary_capability_digest
-                    != floor.required_binary_capability_digest()
+                || current.manifest().required_binary_capability_digest != required_capability
             {
                 return Err(StorageError::PreconditionFailed {
                     description: "private ORAM activation authority cannot rotate before its capability upgrade completes"
                         .to_string(),
                 });
             }
-            if new_state.manifest().required_binary_capability_digest
-                != floor.required_binary_capability_digest()
-            {
+            if new_state.manifest().required_binary_capability_digest != required_capability {
                 if !self.private_oram_capability_upgrade_can_start(floor) {
                     return Err(StorageError::PreconditionFailed {
                         description: "private ORAM activation authority capability upgrade requires an older fully enabled format floor"
@@ -8630,6 +8683,189 @@ mod tests {
                 .bundle(),
             &successor,
         );
+    }
+
+    #[test]
+    fn activation_authority_upgrades_an_actual_legacy_wire_7_floor_without_rewriting_it() {
+        use crate::content_manager::consensus::private_oram_mutation_cleanup::format::{
+            LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON, LEGACY_WIRE_7_FORMAT_FLOOR_JSON,
+        };
+        use crate::content_manager::private_oram_mutation_journal::{
+            create_private_directory, secure_open_options,
+        };
+
+        let (key, trust_anchor, mut genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        genesis.manifest.required_binary_capability_digest =
+            PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST.to_string();
+        genesis = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            genesis.manifest.authority_key_epoch,
+            genesis.manifest,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = Persistent::load_or_init(temp.path(), true, false, Some(11)).unwrap();
+        state.set_unapplied_entries(1, 4).unwrap();
+        for _ in 0..4 {
+            state.entry_applied().unwrap();
+        }
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        state
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
+        drop(state);
+
+        // Install the independent historical bytes, including the old snapshot-independent
+        // checkpoint. Going through the current constructor would conceal both codec regressions.
+        let state_path = temp.path().join(STATE_FILE_NAME);
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let legacy_floor: serde_json::Value =
+            serde_json::from_str(LEGACY_WIRE_7_FORMAT_FLOOR_JSON).unwrap();
+        encoded["private_oram_mutation_format_floor"] = legacy_floor.clone();
+        fs::write(&state_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        let floor_directory = temp.path().join("private_oram_mutation_floor_v2");
+        create_private_directory(&floor_directory).unwrap();
+        let checkpoint_path = floor_directory.join("stable.json");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        secure_open_options(&mut options, true);
+        options
+            .open(&checkpoint_path)
+            .unwrap()
+            .write_all(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON.as_bytes())
+            .unwrap();
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+
+        for _ in 0..2 {
+            let mut loaded = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &genesis,
+            )
+            .unwrap();
+            loaded.save().unwrap();
+            assert_eq!(
+                serde_json::to_value(loaded.private_oram_mutation_format_floor.as_ref().unwrap())
+                    .unwrap(),
+                legacy_floor
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        }
+        let mut successor_manifest = genesis.manifest.clone();
+        successor_manifest.registry_generation += 1;
+        successor_manifest.parent_manifest_digest = Some(
+            qdrant_sec::private_oram_activation_authority_manifest_digest_v1(&genesis.manifest)
+                .unwrap(),
+        );
+        successor_manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            successor_manifest.authority_key_epoch,
+            successor_manifest,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut upgraded = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &successor,
+            )
+            .unwrap();
+            upgraded.save().unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    upgraded
+                        .private_oram_mutation_format_floor
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap(),
+                legacy_floor
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            let authority =
+                serde_json::to_value(upgraded.private_oram_activation_authority.as_ref().unwrap())
+                    .unwrap();
+            assert_eq!(
+                authority["capability_upgrade"]["predecessor"],
+                serde_json::to_value(&genesis).unwrap()
+            );
+            assert_eq!(
+                authority["capability_upgrade"]["format_floor_digest"],
+                legacy_floor["floor_digest"]
+            );
+        }
+        let saved = fs::read(&state_path).unwrap();
+        let mut third_manifest = successor.manifest.clone();
+        third_manifest.registry_generation += 1;
+        third_manifest.parent_manifest_digest = Some(
+            qdrant_sec::private_oram_activation_authority_manifest_digest_v1(&successor.manifest)
+                .unwrap(),
+        );
+        third_manifest.required_binary_capability_digest = test_digest(92);
+        let third = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            third_manifest.authority_key_epoch,
+            third_manifest,
+        )
+        .unwrap();
+        assert!(
+            Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &third,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot rotate before its capability upgrade completes")
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+        let valid: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        let mut missing = valid.clone();
+        missing["private_oram_activation_authority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_upgrade");
+        let mut wrong_floor = valid.clone();
+        wrong_floor["private_oram_activation_authority"]["capability_upgrade"]["format_floor_digest"] =
+            serde_json::json!(test_digest(93));
+        let mut forged = valid.clone();
+        forged["private_oram_activation_authority"]["capability_upgrade"]["predecessor"]["signature"]
+            ["sig"] = serde_json::json!(BASE64URL_NOPAD.encode(&[93; 64]));
+        let mut absent_authority = valid;
+        absent_authority
+            .as_object_mut()
+            .unwrap()
+            .remove("private_oram_activation_authority");
+        for invalid in [missing, wrong_floor, forged, absent_authority] {
+            fs::write(&state_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(
+                Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                    temp.path(),
+                    true,
+                    false,
+                    Some(11),
+                    &trust_anchor,
+                    &successor,
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        }
+        fs::write(&state_path, saved).unwrap();
     }
 
     #[test]

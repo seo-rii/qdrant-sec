@@ -22,6 +22,7 @@ use super::{
 };
 use crate::content_manager::private_oram_mutation_journal::PrivateOramMutationJournalError;
 
+const LEGACY_FORMAT_FLOOR_VERSION: u16 = 1;
 const FORMAT_FLOOR_VERSION: u16 = 2;
 const AUTHORITY_FLOOR_VERSION: u16 = 1;
 const ENROLLMENT_FLOOR_VERSION: u16 = 1;
@@ -31,8 +32,18 @@ const AUTHORITY_FLOOR_DIGEST_DOMAIN_V2: &[u8] =
 const ENROLLMENT_FLOOR_DIGEST_DOMAIN_V2: &[u8] =
     b"qdrant-sec/private-oram-mutation-enrollment-floor/v2";
 
+// Encoded using the codec-1 layout from 76ca9ae178c8789c0eae3c2abcf7e7b4ff8d2189,
+// independently of the current floor constructor. Its cluster matches the signed authority fixture.
+#[cfg(test)]
+pub(crate) const LEGACY_WIRE_7_FORMAT_FLOOR_JSON: &str =
+    include_str!("test_data/legacy_wire_7_floor.json");
+
+#[cfg(test)]
+pub(crate) const LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON: &str =
+    include_str!("test_data/legacy_wire_7_floor_checkpoint.json");
+
 /// Cluster-wide irreversible minimum format known to one Raft history and group.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrivateOramMutationFormatFloorV2 {
     version: u16,
@@ -46,11 +57,65 @@ pub(crate) struct PrivateOramMutationFormatFloorV2 {
     eligible_peer_set_digest: String,
     eligible_process_incarnations_digest: String,
     capability_manifest_digest: String,
-    required_binary_capability_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_binary_capability_digest: Option<String>,
     tagged_write_required: bool,
     activation_enabled: bool,
     floor_applied: PrivateOramRaftApplyLocatorV2,
     floor_digest: String,
+}
+
+impl<'de> Deserialize<'de> for PrivateOramMutationFormatFloorV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: u16,
+            consensus_history_id_digest: String,
+            raft_group_id_digest: String,
+            format_epoch: u64,
+            minimum_reader_protocol: u16,
+            minimum_writer_protocol: u16,
+            snapshot_format_epoch: u64,
+            membership_generation: u64,
+            eligible_peer_set_digest: String,
+            eligible_process_incarnations_digest: String,
+            capability_manifest_digest: String,
+            #[serde(default, deserialize_with = "present_digest")]
+            required_binary_capability_digest: Option<String>,
+            tagged_write_required: bool,
+            activation_enabled: bool,
+            floor_applied: PrivateOramRaftApplyLocatorV2,
+            floor_digest: String,
+        }
+        // An absent historical field is distinct from an explicitly supplied null.
+        fn present_digest<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<String>, D::Error> {
+            String::deserialize(deserializer).map(Some)
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let floor = Self {
+            version: wire.version,
+            consensus_history_id_digest: wire.consensus_history_id_digest,
+            raft_group_id_digest: wire.raft_group_id_digest,
+            format_epoch: wire.format_epoch,
+            minimum_reader_protocol: wire.minimum_reader_protocol,
+            minimum_writer_protocol: wire.minimum_writer_protocol,
+            snapshot_format_epoch: wire.snapshot_format_epoch,
+            membership_generation: wire.membership_generation,
+            eligible_peer_set_digest: wire.eligible_peer_set_digest,
+            eligible_process_incarnations_digest: wire.eligible_process_incarnations_digest,
+            capability_manifest_digest: wire.capability_manifest_digest,
+            required_binary_capability_digest: wire.required_binary_capability_digest,
+            tagged_write_required: wire.tagged_write_required,
+            activation_enabled: wire.activation_enabled,
+            floor_applied: wire.floor_applied,
+            floor_digest: wire.floor_digest,
+        };
+        validate_private_oram_mutation_format_floor_v2(&floor).map_err(serde::de::Error::custom)?;
+        Ok(floor)
+    }
 }
 
 impl Debug for PrivateOramMutationFormatFloorV2 {
@@ -177,8 +242,8 @@ impl PrivateOramMutationFormatFloorV2 {
         self.tagged_write_required
     }
 
-    pub(crate) fn required_binary_capability_digest(&self) -> &str {
-        &self.required_binary_capability_digest
+    pub(crate) fn required_binary_capability_digest(&self) -> Option<&str> {
+        self.required_binary_capability_digest.as_deref()
     }
 
     pub(crate) fn floor_applied_index(&self) -> u64 {
@@ -277,7 +342,14 @@ pub(crate) fn plan_private_oram_mutation_enrollment_floor_v2(
 pub(crate) fn validate_private_oram_mutation_format_floor_v2(
     floor: &PrivateOramMutationFormatFloorV2,
 ) -> Result<(), PrivateOramMutationJournalError> {
-    if floor.version != FORMAT_FLOOR_VERSION
+    let valid_codec = match (floor.version, &floor.required_binary_capability_digest) {
+        (LEGACY_FORMAT_FLOOR_VERSION, None) => {
+            floor.minimum_reader_protocol <= 7 && floor.minimum_writer_protocol <= 7
+        }
+        (FORMAT_FLOOR_VERSION, Some(digest)) => validate_digest(digest).is_ok(),
+        _ => false,
+    };
+    if !valid_codec
         || floor.format_epoch == 0
         || floor.minimum_reader_protocol == 0
         || floor.minimum_writer_protocol == 0
@@ -294,7 +366,6 @@ pub(crate) fn validate_private_oram_mutation_format_floor_v2(
         &floor.eligible_peer_set_digest,
         &floor.eligible_process_incarnations_digest,
         &floor.capability_manifest_digest,
-        &floor.required_binary_capability_digest,
         &floor.floor_digest,
     ] {
         validate_digest(digest)?;
@@ -325,7 +396,8 @@ pub(crate) fn plan_private_oram_mutation_format_floor_transition_v2(
     if candidate == current {
         return Ok(current.clone());
     }
-    if candidate.consensus_history_id_digest != current.consensus_history_id_digest
+    if candidate.version < current.version
+        || candidate.consensus_history_id_digest != current.consensus_history_id_digest
         || candidate.raft_group_id_digest != current.raft_group_id_digest
         || candidate.format_epoch
             != current
@@ -518,7 +590,9 @@ fn format_floor_digest_v2(
     hash_digest(&mut hasher, &floor.eligible_peer_set_digest)?;
     hash_digest(&mut hasher, &floor.eligible_process_incarnations_digest)?;
     hash_digest(&mut hasher, &floor.capability_manifest_digest)?;
-    hash_digest(&mut hasher, &floor.required_binary_capability_digest)?;
+    if let Some(digest) = &floor.required_binary_capability_digest {
+        hash_digest(&mut hasher, digest)?;
+    }
     hasher.update([u8::from(floor.tagged_write_required)]);
     hasher.update([u8::from(floor.activation_enabled)]);
     hash_locator(&mut hasher, &floor.floor_applied)?;
@@ -614,7 +688,7 @@ pub(crate) fn private_oram_mutation_format_floor_from_barrier_v2(
         eligible_peer_set_digest: input.eligible_peer_set_digest,
         eligible_process_incarnations_digest: input.eligible_process_incarnations_digest,
         capability_manifest_digest: input.capability_manifest_digest,
-        required_binary_capability_digest: input.required_binary_capability_digest,
+        required_binary_capability_digest: Some(input.required_binary_capability_digest),
         tagged_write_required: true,
         activation_enabled: input.activation_enabled,
         floor_applied: PrivateOramRaftApplyLocatorV2 {
@@ -1014,6 +1088,57 @@ mod tests {
             ),
             Err(PrivateOramMutationJournalError::InvalidTransition)
         ));
+    }
+
+    #[test]
+    fn legacy_wire_7_floor_preserves_its_historical_codec_and_digest() {
+        let floor: PrivateOramMutationFormatFloorV2 =
+            serde_json::from_str(LEGACY_WIRE_7_FORMAT_FLOOR_JSON).unwrap();
+        assert_eq!(
+            floor.floor_digest(),
+            "b2a0Oyy-t0ARMunLdgZ7hX96vi2uFquZQcpdeFfDOuk"
+        );
+        assert_eq!(floor.required_binary_capability_digest(), None);
+        assert_eq!(
+            serde_json::to_string(&floor).unwrap(),
+            LEGACY_WIRE_7_FORMAT_FLOOR_JSON.trim()
+        );
+
+        let mut candidate = floor.clone();
+        candidate.version = FORMAT_FLOOR_VERSION;
+        candidate.required_binary_capability_digest = Some(digest(90));
+        candidate.format_epoch += 1;
+        candidate.snapshot_format_epoch += 1;
+        candidate.membership_generation += 1;
+        candidate.floor_applied.index += 1;
+        candidate.floor_digest = format_floor_digest_v2(&candidate).unwrap();
+        plan_private_oram_mutation_format_floor_transition_v2(Some(&floor), &candidate).unwrap();
+        let mut rollback = candidate.clone();
+        rollback.version = LEGACY_FORMAT_FLOOR_VERSION;
+        rollback.required_binary_capability_digest = None;
+        rollback.format_epoch += 1;
+        rollback.snapshot_format_epoch += 1;
+        rollback.membership_generation += 1;
+        rollback.floor_applied.index += 1;
+        rollback.floor_digest = format_floor_digest_v2(&rollback).unwrap();
+        assert!(
+            plan_private_oram_mutation_format_floor_transition_v2(Some(&candidate), &rollback)
+                .is_err()
+        );
+
+        let historical: serde_json::Value =
+            serde_json::from_str(LEGACY_WIRE_7_FORMAT_FLOOR_JSON).unwrap();
+        let mut unsupported = historical.clone();
+        unsupported["version"] = serde_json::json!(2);
+        let mut invented = historical.clone();
+        invented["required_binary_capability_digest"] = serde_json::json!(digest(91));
+        let mut explicit_null = historical.clone();
+        explicit_null["required_binary_capability_digest"] = serde_json::Value::Null;
+        let mut tampered = historical;
+        tampered["floor_digest"] = serde_json::json!(digest(92));
+        for invalid in [unsupported, invented, explicit_null, tampered] {
+            assert!(serde_json::from_value::<PrivateOramMutationFormatFloorV2>(invalid).is_err());
+        }
     }
 
     #[test]
