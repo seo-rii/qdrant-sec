@@ -19,7 +19,9 @@ const CAPSULE_VERSION: u16 = 2;
 const CAPSULE_PACKAGE_VERSION: u16 = 1;
 const CAPSULE_INSTALL_RECEIPT_VERSION: u16 = 1;
 const CAPSULE_ROOT_DIR: &str = "private_oram_owner_recovery_capsules_v2";
-const CAPSULE_FILE: &str = "capsule.json";
+const LEGACY_CAPSULE_FILE: &str = "capsule.json";
+const CAPSULE_FILE_PREFIX: &str = "capsule-v2-";
+const CAPSULE_FILE_SUFFIX: &str = ".json";
 const CAPSULE_LOCK_FILE: &str = "capsule.lock";
 const CAPSULE_MAX_BYTES: u64 = PRIVATE_ORAM_OWNER_CAPSULE_MAX_CANONICAL_BYTES_V2 as u64;
 const CAPSULE_DIGEST_DOMAIN: &[u8] = b"qdrant-sec/private-oram-owner-recovery-capsule/v2";
@@ -78,6 +80,10 @@ impl Debug for PrivateOramOwnerRecoveryCapsulePackageV2 {
 }
 
 impl PrivateOramOwnerRecoveryCapsulePackageV2 {
+    pub fn generation(&self) -> u64 {
+        self.capsule.descriptor.preparing_lease.generation
+    }
+
     pub fn owner_peer_id(&self) -> PeerId {
         self.capsule.owner_peer_id
     }
@@ -292,31 +298,25 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         let root = lock.root_file();
         let temp = PrivateOramPinnedDirectoryV2::open_at(root, std::ffi::OsStr::new(TEMP_DIR))?;
         temp.validate_binding(root, std::ffi::OsStr::new(TEMP_DIR))?;
+        let capsule_file = capsule_generation_file_v2(package.generation())?;
 
-        let mut superseding_previous_generation = false;
-        if let Some(existing_file) = optional_private_oram_file_at_v2(
-            root,
-            std::ffi::OsStr::new(CAPSULE_FILE),
-            CAPSULE_MAX_BYTES,
+        // Each lease generation has its own insert-only capsule. A later mutation can install
+        // its recovery material without replacing the previous generation's durable capsule.
+        if let Some((existing_file, existing)) = self.load_optional_package_locked(
+            &lock,
+            package.generation(),
+            current_activation_authority,
         )? {
-            let existing: PrivateOramOwnerRecoveryCapsulePackageV2 = existing_file.deserialize()?;
-            if existing == *package {
-                existing_file.validate_binding_and_contents(root)?;
-                root.sync_all()
-                    .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
-                temp.sync()
-                    .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
-                lock.validate_root_identity()?;
-                return capsule_install_receipt_v2(package);
-            }
-            // Only one mutation is ever active per collection, so a capsule minted for a later
-            // lease generation supersedes the previous mutation's capsule; the store is not a
-            // one-shot per collection. Any other difference is a conflicting install for the
-            // same generation (or a replay of an older one) and fails closed.
-            if package.lease_generation() <= existing.lease_generation() {
+            if existing != *package {
                 return Err(PrivateOramMutationJournalError::ConcurrentMutation);
             }
-            superseding_previous_generation = true;
+            existing_file.validate_binding_and_contents(root)?;
+            root.sync_all()
+                .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
+            temp.sync()
+                .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
+            lock.validate_root_identity()?;
+            return capsule_install_receipt_v2(package);
         }
 
         let candidate = PrivateOramJsonCandidateV2::new(&temp, package, CAPSULE_MAX_BYTES)?;
@@ -325,15 +325,14 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
             &temp.file,
             candidate.name(),
             root,
-            std::ffi::OsStr::new(CAPSULE_FILE),
-            !superseding_previous_generation,
+            std::ffi::OsStr::new(&capsule_file),
+            true,
         ) {
-            if let Some(installed) = optional_private_oram_file_at_v2(
-                root,
-                std::ffi::OsStr::new(CAPSULE_FILE),
-                CAPSULE_MAX_BYTES,
+            if let Some((installed, actual)) = self.load_optional_package_locked(
+                &lock,
+                package.generation(),
+                current_activation_authority,
             )? {
-                let actual: PrivateOramOwnerRecoveryCapsulePackageV2 = installed.deserialize()?;
                 if actual != *package {
                     return Err(PrivateOramMutationJournalError::ConcurrentMutation);
                 }
@@ -347,7 +346,7 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         let installed = candidate
             .validate_installed(
                 &lock.root_directory()?,
-                std::ffi::OsStr::new(CAPSULE_FILE),
+                std::ffi::OsStr::new(&capsule_file),
                 CAPSULE_MAX_BYTES,
             )
             .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
@@ -415,12 +414,14 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
 
     pub fn load_recovery_material_v2(
         &self,
+        expected_generation: u64,
         current_activation_authority: &PrivateOramActivationAuthorityLocatorV1,
     ) -> Result<PrivateOramMutationRecoveryMaterialV2, PrivateOramMutationJournalError> {
         validate_private_directory(&self.root)?;
         validate_private_directory(&self.root.join(TEMP_DIR))?;
         let lock = self.acquire_lock()?;
-        let package = self.load_package_locked(&lock, current_activation_authority)?;
+        let package =
+            self.load_package_locked(&lock, expected_generation, current_activation_authority)?;
         Ok(PrivateOramMutationRecoveryMaterialV2 {
             immutable_manifest: package.capsule.immutable_manifest,
             mutation_bundle: package.capsule.descriptor.mutation_bundle,
@@ -434,7 +435,10 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         let activation_authority = reconcile_snapshot
             .activation_authority()
             .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
-        self.load_recovery_material_v2(activation_authority)
+        self.load_recovery_material_v2(
+            active_reconcile_generation_v2(reconcile_snapshot)?,
+            activation_authority,
+        )
     }
 
     pub fn recover_remote_owner_pair_v2(
@@ -454,7 +458,8 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         let activation_authority = reconcile_snapshot
             .activation_authority()
             .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
-        let package = self.load_package_locked(&lock, activation_authority)?;
+        let active_generation = active_reconcile_generation_v2(reconcile_snapshot)?;
+        let package = self.load_package_locked(&lock, active_generation, activation_authority)?;
         let capsule = &package.capsule;
         if resources.immutable_manifest != &capsule.immutable_manifest
             || resources.mutation_bundle != &capsule.descriptor.mutation_bundle
@@ -527,7 +532,7 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         let terminal = live
             .recover_pair_then_v1(resources, |outcome| {
                 let revalidated = self
-                    .load_package_locked(&lock, activation_authority)
+                    .load_package_locked(&lock, active_generation, activation_authority)
                     .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
                 if revalidated != expected_package {
                     return Err(PrivateOramMutationJournalError::Indeterminate);
@@ -546,27 +551,103 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
     fn load_package_locked(
         &self,
         lock: &PrivateOramOwnerRecoveryCapsuleLockV2,
+        expected_generation: u64,
         current_activation_authority: &PrivateOramActivationAuthorityLocatorV1,
     ) -> Result<PrivateOramOwnerRecoveryCapsulePackageV2, PrivateOramMutationJournalError> {
+        let Some((_file, package)) = self.load_optional_package_locked(
+            lock,
+            expected_generation,
+            current_activation_authority,
+        )?
+        else {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        };
         let root = lock.root_file();
         let temp = PrivateOramPinnedDirectoryV2::open_at(root, std::ffi::OsStr::new(TEMP_DIR))?;
-        let file = required_v2_artifact(PrivateOramPinnedFileV2::open_at(
-            root,
-            std::ffi::OsStr::new(CAPSULE_FILE),
-            CAPSULE_MAX_BYTES,
-        ))?;
-        let package: PrivateOramOwnerRecoveryCapsulePackageV2 = file.deserialize()?;
-        validate_capsule_package_v2(
-            &package,
-            &self.validator,
-            &self.expected_collection_id,
-            self.expected_owner_peer_id,
-            current_activation_authority,
-        )?;
-        file.validate_binding_and_contents(root)?;
         temp.validate_binding(root, std::ffi::OsStr::new(TEMP_DIR))?;
         lock.validate_root_identity()?;
         Ok(package)
+    }
+
+    fn load_optional_package_locked(
+        &self,
+        lock: &PrivateOramOwnerRecoveryCapsuleLockV2,
+        expected_generation: u64,
+        current_activation_authority: &PrivateOramActivationAuthorityLocatorV1,
+    ) -> Result<
+        Option<(
+            PrivateOramPinnedFileV2,
+            PrivateOramOwnerRecoveryCapsulePackageV2,
+        )>,
+        PrivateOramMutationJournalError,
+    > {
+        let root = lock.root_file();
+        let capsule_file = capsule_generation_file_v2(expected_generation)?;
+        let generation_package = optional_private_oram_file_at_v2(
+            root,
+            std::ffi::OsStr::new(&capsule_file),
+            CAPSULE_MAX_BYTES,
+        )?
+        .map(|file| {
+            let package: PrivateOramOwnerRecoveryCapsulePackageV2 = file.deserialize()?;
+            if package.generation() != expected_generation {
+                return Err(PrivateOramMutationJournalError::Corrupt);
+            }
+            validate_capsule_package_v2(
+                &package,
+                &self.validator,
+                &self.expected_collection_id,
+                self.expected_owner_peer_id,
+                current_activation_authority,
+            )?;
+            file.validate_binding_and_contents(root)?;
+            Ok((file, package))
+        })
+        .transpose()?;
+
+        let legacy_package = optional_private_oram_file_at_v2(
+            root,
+            std::ffi::OsStr::new(LEGACY_CAPSULE_FILE),
+            CAPSULE_MAX_BYTES,
+        )?
+        .map(|file| -> Result<_, PrivateOramMutationJournalError> {
+            let package: PrivateOramOwnerRecoveryCapsulePackageV2 = file.deserialize()?;
+            file.validate_binding_and_contents(root)?;
+            Ok((file, package))
+        })
+        .transpose()?;
+        let matching_legacy = match legacy_package {
+            Some((file, package)) if package.generation() == expected_generation => {
+                validate_capsule_package_v2(
+                    &package,
+                    &self.validator,
+                    &self.expected_collection_id,
+                    self.expected_owner_peer_id,
+                    current_activation_authority,
+                )?;
+                Some((file, package))
+            }
+            Some((_file, package)) => {
+                let embedded_activation_authority = package.activation_authority().clone();
+                validate_capsule_package_v2(
+                    &package,
+                    &self.validator,
+                    &self.expected_collection_id,
+                    self.expected_owner_peer_id,
+                    &embedded_activation_authority,
+                )?;
+                None
+            }
+            None => None,
+        };
+
+        match (generation_package, matching_legacy) {
+            (Some(generation), Some(legacy)) if generation.1 != legacy.1 => {
+                Err(PrivateOramMutationJournalError::Corrupt)
+            }
+            (Some(generation), _) => Ok(Some(generation)),
+            (None, legacy) => Ok(legacy),
+        }
     }
 
     fn validate_install_resources_locked(
@@ -647,6 +728,29 @@ impl PrivateOramOwnerRecoveryCapsuleStoreV2 {
         lock.validate_root_identity()?;
         Ok(lock)
     }
+}
+
+fn capsule_generation_file_v2(generation: u64) -> Result<String, PrivateOramMutationJournalError> {
+    if generation == 0 {
+        return Err(PrivateOramMutationJournalError::InvalidInput("generation"));
+    }
+    Ok(format!(
+        "{CAPSULE_FILE_PREFIX}{generation:020}{CAPSULE_FILE_SUFFIX}"
+    ))
+}
+
+fn active_reconcile_generation_v2(
+    reconcile_snapshot: &PrivateOramMutationReconcileSnapshotV1,
+) -> Result<u64, PrivateOramMutationJournalError> {
+    let slot = reconcile_snapshot.lease_slot();
+    let active = slot
+        .active
+        .as_ref()
+        .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+    if active.generation == 0 || slot.generation != active.generation {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    Ok(active.generation)
 }
 
 struct PrivateOramOwnerRecoveryCapsuleLockV2 {

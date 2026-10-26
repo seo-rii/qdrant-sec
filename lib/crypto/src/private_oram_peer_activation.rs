@@ -25,7 +25,7 @@ pub const PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION_V2: u16 = 2;
 pub const PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION: u16 =
     PRIVATE_ORAM_PEER_ACTIVATION_PROTOCOL_VERSION_V2;
 pub const PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION: u16 = 6;
-pub const PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION: u16 = 7;
+pub const PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION: u16 = 8;
 pub const PRIVATE_ORAM_PEER_ACTIVATION_CAPABILITY: &str =
     "qdrant-sec/private-oram-consensus-wire/v2";
 pub const PRIVATE_ORAM_PEER_ACTIVATION_CONFIGURATION_DIGEST_DOMAIN: &str =
@@ -34,7 +34,7 @@ pub const PRIVATE_ORAM_PEER_ACTIVATION_ACK_SIGNATURE_DOMAIN: &str =
     "qdrant-sec/private-oram-peer-activation-ack-signature/v1";
 pub const PRIVATE_ORAM_MUTATION_PROTOCOL_CAPABILITY_DESCRIPTOR_V2: &str = "private-oram-mutation-v2;wire=6;material=6;authority=6;envelope=7;reservation=3;outcome=1;owner-prestage=2;owner-checkpoint=1;owner-tombstone=0";
 pub const PRIVATE_ORAM_MUTATION_RESERVATION_CAPABILITY_DESCRIPTOR_V2: &str = "private-oram-mutation-v2;wire=6;material=6;authority=6;envelope=7;reservation=2;outcome=1;owner-prestage=2;owner-checkpoint=1;owner-tombstone=0";
-pub const PRIVATE_ORAM_MUTATION_PROTOCOL_CAPABILITY_DESCRIPTOR_V3: &str = "private-oram-mutation-v3;wire=7;material=7;authority=7;envelope=7;reservation=3;outcome=1;owner-prestage=2;owner-checkpoint=1;owner-tombstone=1";
+pub const PRIVATE_ORAM_MUTATION_PROTOCOL_CAPABILITY_DESCRIPTOR_V3: &str = "private-oram-mutation-v3;wire=8;material=7;authority=7;envelope=7;reservation=3;outcome=1;owner-prestage=2;owner-checkpoint=1;owner-tombstone=1;external-recovery-authority=1;snapshot-barrier=1;enrollment-floor=1";
 
 pub fn private_oram_mutation_protocol_capability_digest_v2() -> String {
     private_oram_mutation_protocol_capability_digest_for_descriptor_v2(
@@ -1148,11 +1148,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             BASE64URL_NOPAD.encode(&Sha256::digest(&message)),
-            "-uKCEY1v3Vo1Q6LQe7jBEjGrgYnKrF9mKB4PSiebe5k",
+            "j96yfi-euBGUJie_HItlgIb-ISmbWIEXB3Vn74wfEj4",
         );
         assert_eq!(
             signed_ack.signature.sig,
-            "WwmFK9dpwFJqJWASNBJ5Jo-XFQaWoZBgmAzlWzJa-x-2Ak6iD2s5EzOGcCbvgfWBUL0jufIG-mHt6xSkR0uIAA",
+            "zcc8ypl7oAMFFhTF9ihQiiedsz2oCq8d9crNRb3QEr0egw4UfHSICr_4ZxLm0se5q_g3m2MWl636XJpewfCcAg",
         );
         validate_private_oram_peer_activation_ack_signature_v1(
             &challenge,

@@ -3802,7 +3802,7 @@ mod private_hnsw_grpc_tests {
             let search_run = fixture.run_single_search_collect_writeback();
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 COLLECTION_NAME,
             )

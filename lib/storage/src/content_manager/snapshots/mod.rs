@@ -6,7 +6,9 @@ pub mod recover;
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
+use std::sync::Arc;
 
+use collection::collection::Collection;
 use collection::operations::snapshot_ops::SnapshotDescription;
 use collection::operations::verification::new_unchecked_verification_pass;
 use fs_err as fs;
@@ -19,7 +21,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::content_manager::toc::FULL_SNAPSHOT_FILE_NAME;
 use crate::dispatcher::Dispatcher;
-use crate::rbac::{AccessRequirements, Auth, CollectionMultipass};
+use crate::rbac::{AccessRequirements, Auth};
 use crate::{StorageError, TableOfContent};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,6 +31,46 @@ pub struct SnapshotConfig {
     /// Aliases for collections `<alias>:<collection_name>`
     #[serde(default)]
     pub collections_aliases: HashMap<String, String>,
+}
+
+pub struct FullSnapshotPlan {
+    collections: Vec<Arc<Collection>>,
+    alias_mapping: HashMap<String, String>,
+}
+
+impl FullSnapshotPlan {
+    pub fn new(
+        mut collections: Vec<Arc<Collection>>,
+        alias_mapping: HashMap<String, String>,
+    ) -> Result<Self, StorageError> {
+        collections.sort_by(|left, right| left.name().cmp(right.name()));
+        if collections
+            .windows(2)
+            .any(|pair| pair[0].name() == pair[1].name())
+        {
+            return Err(StorageError::service_error(
+                "full snapshot plan contains duplicate collection names",
+            ));
+        }
+        if alias_mapping.values().any(|target| {
+            collections
+                .binary_search_by(|collection| collection.name().cmp(target))
+                .is_err()
+        }) {
+            return Err(StorageError::service_error(
+                "full snapshot plan alias target is not in the planned collection set",
+            ));
+        }
+        Ok(Self {
+            collections,
+            alias_mapping,
+        })
+    }
+}
+
+pub struct PreparedFullSnapshot {
+    snapshot_name: String,
+    archive: TempPath,
 }
 
 pub async fn do_delete_full_snapshot(
@@ -101,113 +143,69 @@ pub async fn do_list_full_snapshots(
     Ok(snapshots_manager.list_snapshots(snapshots_path).await?)
 }
 
-pub async fn do_create_full_snapshot(
-    dispatcher: &Dispatcher,
-    auth: Auth,
-) -> Result<SnapshotDescription, StorageError> {
-    let collections_pass =
-        auth.check_global_access(AccessRequirements::new().manage(), "create_full_snapshot")?;
-
-    // All checks should've been done at this point.
-    let pass = new_unchecked_verification_pass();
-    let toc = dispatcher.toc(&auth, &pass).clone();
-
-    let res = tokio::spawn(async move { _do_create_full_snapshot(&toc, collections_pass).await })
-        .await??;
-    Ok(res)
-}
-
-async fn _do_create_full_snapshot(
+pub async fn prepare_full_snapshot(
     toc: &TableOfContent,
-    multipass: CollectionMultipass,
-) -> Result<SnapshotDescription, StorageError> {
-    let snapshot_dir = toc.snapshots_path();
-
-    let all_collections = toc.multipass_into_collections(&multipass).await;
-    let mut created_snapshots: Vec<(&str, SnapshotDescription)> = vec![];
-    for collection_pass in &all_collections {
-        let snapshot_details = toc.create_snapshot(collection_pass).await?;
-        created_snapshots.push((collection_pass.name(), snapshot_details));
+    plan: FullSnapshotPlan,
+) -> Result<PreparedFullSnapshot, StorageError> {
+    let mut prepared_snapshots = Vec::with_capacity(plan.collections.len());
+    for collection in &plan.collections {
+        let prepared = toc.prepare_snapshot(collection).await?;
+        prepared_snapshots.push((Arc::clone(collection), prepared));
     }
     let current_time = chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S").to_string();
 
     let snapshot_name = format!("{FULL_SNAPSHOT_FILE_NAME}-{current_time}.snapshot");
 
-    let collection_name_to_snapshot_path: HashMap<_, _> = created_snapshots
+    let collection_name_to_snapshot_path: HashMap<_, _> = prepared_snapshots
         .iter()
-        .map(|&(collection_name, ref snapshot_details)| {
-            (collection_name.to_string(), snapshot_details.name.clone())
-        })
+        .map(|(collection, prepared)| (collection.name().to_string(), prepared.name().to_string()))
         .collect();
 
-    let mut alias_mapping: HashMap<String, String> = Default::default();
-    for collection_pass in &all_collections {
-        for alias in toc
-            .all_collection_aliases(collection_pass.name(), &multipass)
-            .await
-        {
-            alias_mapping.insert(alias, collection_pass.name().to_string());
-        }
-    }
-
-    let config_path = snapshot_dir.join(format!("config-{current_time}.json"));
+    let temp_storage_path = toc.optional_temp_or_storage_temp_path()?;
+    let config_path = tempfile::Builder::new()
+        .prefix(&format!("config-{current_time}-"))
+        .suffix(".json.staged")
+        .tempfile_in(&temp_storage_path)?
+        .into_temp_path();
 
     {
         let snapshot_config = SnapshotConfig {
             collections_mapping: collection_name_to_snapshot_path,
-            collections_aliases: alias_mapping,
+            collections_aliases: plan.alias_mapping,
         };
         let snapshot_config_json = serde_json::to_vec_pretty(&snapshot_config).map_err(|err| {
             StorageError::service_error(format!("failed to serialize snapshot config: {err}"))
         })?;
         let mut config_file = tokio_fs::File::create(&config_path).await?;
         config_file.write_all(&snapshot_config_json).await?;
+        config_file.sync_all().await?;
     }
 
-    let full_snapshot_path = snapshot_dir.join(&snapshot_name);
+    let temp_full_snapshot_path = tempfile::Builder::new()
+        .prefix(&format!("{snapshot_name}-"))
+        .suffix(".staged")
+        .tempfile_in(&temp_storage_path)?
+        .into_temp_path();
 
-    let temp_full_snapshot_path = toc
-        .optional_temp_or_storage_temp_path()?
-        .join(&snapshot_name);
+    let config_path_clone = config_path.to_path_buf();
+    let collection_archive_paths = prepared_snapshots
+        .iter()
+        .map(|(_, prepared)| {
+            (
+                prepared.archive_path().to_path_buf(),
+                prepared.name().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    // Make sure temporary file is removed in case of error
-    let _temp_full_snapshot_path_file = TempPath::try_from_path(&temp_full_snapshot_path)?;
-
-    let config_path_clone = config_path.clone();
-
-    // (tempfile_with_snapshot, snapshot_name)
-    let mut temp_collection_snapshots = vec![];
-
-    let temp_storage_path = toc.optional_temp_or_storage_temp_path()?;
-    let snapshot_manager = toc.get_snapshots_storage_manager()?;
-
-    for (collection_name, snapshot_details) in &created_snapshots {
-        let snapshot_path = snapshot_dir
-            .join(collection_name)
-            .join(&snapshot_details.name);
-
-        let local_temp_collection_snapshot = temp_storage_path
-            .join(collection_name)
-            .join(&snapshot_details.name);
-
-        snapshot_manager
-            .get_stored_file(&snapshot_path, &local_temp_collection_snapshot)
-            .await?;
-
-        temp_collection_snapshots.push((
-            TempPath::try_from_path(local_temp_collection_snapshot)?,
-            snapshot_details.name.clone(),
-        ));
-    }
-
-    let full_snapshot_path_clone = temp_full_snapshot_path.clone();
+    let full_snapshot_path_clone = temp_full_snapshot_path.to_path_buf();
     let archiving = tokio::task::spawn_blocking(move || {
         // have to use std here, cause TarBuilder is not async
         let mut file = BufWriter::new(fs::File::create(&full_snapshot_path_clone)?);
         let mut builder = TarBuilder::new(&mut file);
         builder.sparse(true);
-        for (temp_file, snapshot_name) in temp_collection_snapshots {
-            builder.append_path_with_name(&temp_file, &snapshot_name)?;
+        for (archive_path, snapshot_name) in collection_archive_paths {
+            builder.append_path_with_name(&archive_path, &snapshot_name)?;
         }
         builder.append_path_with_name(&config_path_clone, "config.json")?;
         builder.finish()?;
@@ -220,9 +218,49 @@ async fn _do_create_full_snapshot(
     });
     AbortOnDropHandle::new(archiving).await??;
 
-    let snapshot_description = snapshot_manager
-        .store_file(&temp_full_snapshot_path, &full_snapshot_path)
-        .await?;
-    tokio_fs::remove_file(&config_path).await?;
-    Ok(snapshot_description)
+    Ok(PreparedFullSnapshot {
+        snapshot_name,
+        archive: temp_full_snapshot_path,
+    })
+}
+
+pub async fn publish_full_snapshot(
+    toc: &TableOfContent,
+    prepared: PreparedFullSnapshot,
+) -> Result<SnapshotDescription, StorageError> {
+    let PreparedFullSnapshot {
+        snapshot_name,
+        archive,
+    } = prepared;
+
+    let full_snapshot_path = toc.snapshots_path().join(snapshot_name);
+    let snapshot_manager = toc.get_snapshots_storage_manager()?;
+    Ok(snapshot_manager
+        .store_file(&archive, &full_snapshot_path)
+        .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_snapshot_plan_rejects_alias_target_outside_exact_collection_set() {
+        let error = FullSnapshotPlan::new(
+            Vec::new(),
+            HashMap::from([("alias".to_string(), "unplanned".to_string())]),
+        )
+        .err()
+        .expect("alias outside the exact collection set must fail closed");
+
+        assert!(error.to_string().contains("alias target"));
+    }
+
+    #[test]
+    fn full_snapshot_plan_accepts_empty_exact_collection_set() {
+        let plan = FullSnapshotPlan::new(Vec::new(), HashMap::new()).unwrap();
+
+        assert!(plan.collections.is_empty());
+        assert!(plan.alias_mapping.is_empty());
+    }
 }

@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+use std::path::Path;
+
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::private_hnsw_oram_store::PrivateHnswOramStore;
 use collection::private_result_oram_store::PrivateResultOramStore;
@@ -73,16 +76,19 @@ use storage::rbac::{Access, AccessRequirements};
 
 use super::auth::Auth;
 use super::private_hnsw::{
-    begin_private_hnsw_collection_lifecycle, resolve_private_hnsw_context_from_snapshot,
+    begin_private_hnsw_collection_lifecycle,
+    begin_private_hnsw_collection_lifecycle_for_paired_mutation,
+    resolve_private_hnsw_context_from_snapshot,
 };
 use super::private_oram_mutation_session::{
     PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS, PrivateOramDetachedMutationAppendV2,
-    current_unix_secs,
+    acquire_private_oram_mutation_execution_v2, current_unix_secs,
 };
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::do_install_local_private_oram_owner_recovery_capsule_v2;
 use super::private_result_oram::{
     begin_private_result_oram_collection_lifecycle,
+    begin_private_result_oram_collection_lifecycle_for_paired_mutation,
     resolve_private_result_oram_context_from_snapshot,
 };
 use crate::settings::Settings;
@@ -94,6 +100,27 @@ const PRIVATE_ORAM_PARENT_PROGRESS_MAX_STEPS: usize = 8;
 const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS: usize = 2 * 1_024 + 1;
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_ATTEMPTS: usize = 240;
+#[cfg(debug_assertions)]
+const PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE";
+
+#[cfg(debug_assertions)]
+async fn private_oram_mutation_pause_after_admission_v2() {
+    let Some(pause_file) = std::env::var_os(PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV)
+    else {
+        return;
+    };
+    if pause_file.is_empty() {
+        return;
+    }
+    log::warn!("Private ORAM staging mutation append post-admission pause reached");
+    while Path::new(&pause_file).exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn private_oram_mutation_pause_after_admission_v2() {}
 
 fn private_oram_owner_reservation_resolution_input_v1(
     challenge: &PrivateOramOwnerReservationPrepareChallengeV1,
@@ -1001,6 +1028,24 @@ async fn acknowledge_oldest_private_oram_reservation_outcome_v3(
     else {
         return Ok(false);
     };
+    let local_peer_id = dispatcher.this_peer_id();
+    if identity.peer_id() != local_peer_id
+        || (consensus
+            .require_private_oram_activation_coordinator_is_local_leader()
+            .is_err()
+            && !consensus
+                .private_oram_mutation_lease(&key)
+                .as_ref()
+                .is_some_and(|lease| {
+                    recovery.matches_active_controller_lease(local_peer_id, lease)
+                }))
+    {
+        return Err(StorageError::PreconditionFailed {
+            description:
+                "private ORAM reservation outcome must be acknowledged by the current leader or immutable active controller"
+                    .to_string(),
+        });
+    }
     let disposition = recovery.disposition().clone();
     let attempt_id = recovery
         .owner_contexts()
@@ -1289,6 +1334,76 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             return Err(error);
         }
     };
+    let key = PrivateOramMutationKey {
+        collection_id: detached.collection_id().to_string(),
+    };
+    let execution = acquire_private_oram_mutation_execution_v2(&key).await?;
+    let readiness_result: StorageResult<()> = async {
+        let auth = Auth::new_internal(Access::full("private ORAM mutation final owner readiness"));
+        let pass = auth.check_collection_access(
+            detached.collection_name(),
+            AccessRequirements::new().write(),
+            "private_oram_mutation_final_owner_readiness_v2",
+        )?;
+        let verification = new_unchecked_verification_pass();
+        let toc = dispatcher.toc(&auth, &verification);
+        let collection = toc.get_collection(&pass).await?;
+        let config = collection.config_snapshot().await;
+        if config.stable_crypto_id(collection.name())? != key.collection_id {
+            return Err(invalid_owner_prestage());
+        }
+        let owner_signing_key_id = &detached.immutable_manifest().manifest.owner_signing_key_id;
+        let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+            settings.as_ref(),
+            collection.name(),
+            collection.path(),
+            &config,
+            detached.vector_name(),
+            owner_signing_key_id,
+        )?;
+        let expectation = dispatcher.private_oram_owner_new_generation_readiness_expectation_v2(
+            &key,
+            dispatcher.this_peer_id(),
+        )?;
+        if expectation.consensus_aggregate_digest() != coordinated.prepared_aggregate_digest() {
+            return Err(invalid_owner_prestage());
+        }
+        PrivateOramOwnerPrestageStoreV2::try_new_pinned_absolute_v2(
+            PrivateHnswOramStore::new(hnsw_context.collection_path(), detached.vector_name())
+                .map_err(|_| invalid_owner_prestage())?
+                .root_path(),
+        )
+        .map_err(|_| invalid_owner_prestage())?
+        .require_ready_for_new_generation_v2(&expectation)
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM owner journal is not ready for a new generation".to_string(),
+        })?;
+        if collection.config_snapshot().await != config {
+            return Err(invalid_owner_prestage());
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = readiness_result {
+        drop(execution);
+        match reject_private_oram_coordinated_prestage_v2(
+            dispatcher.as_ref(),
+            settings.as_ref(),
+            identity.as_ref(),
+            &detached,
+            &coordinated,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = detached.mark_not_submitted();
+            }
+            Err(_) => {
+                let _ = detached.mark_preadmission_recovery_required();
+            }
+        }
+        return Err(error);
+    }
     let permit = match detached.bind_live_admission_permit(
         dispatcher.as_ref(),
         coordinated.admission(),
@@ -1296,6 +1411,7 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
     ) {
         Ok(permit) => permit,
         Err(error) => {
+            drop(execution);
             match reject_private_oram_coordinated_prestage_v2(
                 dispatcher.as_ref(),
                 settings.as_ref(),
@@ -1324,6 +1440,7 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
         )
         .await;
+    drop(execution);
     match outcome {
         Ok(PrivateOramMutationAdmissionOutcomeV2::AppliedExact) => {
             let handoff = complete_private_oram_admitted_handoff_v2(
@@ -1428,12 +1545,17 @@ async fn complete_private_oram_admitted_handoff_v2(
     detached: &PrivateOramDetachedMutationAppendV2,
     coordinated: &PrivateOramCoordinatedPrestageV2,
 ) -> StorageResult<()> {
+    let key = PrivateOramMutationKey {
+        collection_id: detached.collection_id().to_string(),
+    };
+    let _execution = acquire_private_oram_mutation_execution_v2(&key).await?;
     require_exact_admitted_recovery_manifest_v2(dispatcher, coordinated)?;
     // Outcome ACK remains pending until point staging and the replicated recovery-readiness
     // certificate are durable. Startup reconciliation is not yet allowed to rely on sequence 2 as
     // the sole replacement for reservation retention.
     detached.mark_admitted_ack_pending()?;
     storage::dispatcher::private_oram_crash_point("mutation_v2_after_admission");
+    private_oram_mutation_pause_after_admission_v2().await;
     let parent =
         materialize_private_oram_admitted_parent_v2(dispatcher, settings, detached, coordinated)
             .await?;
@@ -1724,6 +1846,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     collection_name: &str,
     key: &PrivateOramMutationKey,
 ) -> StorageResult<()> {
+    let _execution = acquire_private_oram_mutation_execution_v2(key).await?;
     let consensus = dispatcher
         .consensus_state()
         .ok_or_else(invalid_owner_prestage)?;
@@ -1740,6 +1863,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     if active_lease.collection_id != key.collection_id
         || active_lease.owner_peer_id != identity.peer_id()
         || active_lease.owner_peer_id != dispatcher.this_peer_id()
+        || !matches!(active_lease.phase, PrivateOramMutationLeasePhase::Preparing)
     {
         return Err(invalid_owner_prestage());
     }
@@ -1766,7 +1890,6 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
     let auth = Auth::new_internal(Access::full("private ORAM admitted restart reconciliation"));
     let pass = auth.check_collection_access(
         collection_name,
@@ -1870,7 +1993,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
                 expected_state_sequence: expected_old_state.state_sequence,
                 expected_old_state_digest: &old_state_digest,
                 expected_visible_point_record,
-                now_unix: mutation.issued_at_unix,
+                now_unix: mutation.new_state.state.signed_at_unix,
                 max_mutation_ttl_secs: PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS,
                 public_key: hnsw_context.public_key(),
             },
@@ -1971,6 +2094,12 @@ fn require_exact_admitted_recovery_manifest_v2(
     dispatcher: &Dispatcher,
     coordinated: &impl PrivateOramAdmittedPlanContextV2,
 ) -> StorageResult<()> {
+    if !matches!(
+        coordinated.admission().lease().phase,
+        PrivateOramMutationLeasePhase::Preparing
+    ) {
+        return Err(invalid_owner_prestage());
+    }
     let retained = dispatcher
         .private_oram_mutation_v2_exact_admitted_recovery_manifest(coordinated.admission().lease())?
         .ok_or_else(invalid_owner_prestage)?;
@@ -2792,12 +2921,16 @@ pub(crate) async fn coordinate_private_oram_owner_prestage_v2(
         .map_err(|_| invalid_owner_prestage())?;
         let owner_result: StorageResult<_> = async {
             if owner_peer_id == coordinator_peer_id {
-                let receipt = install_private_oram_owner_prestage_v2(
+                let receipt = install_private_oram_owner_prestage_with_paired_sessions_v2(
                     toc,
                     settings,
                     consensus,
                     &verified_request,
                     &package_canonical_json,
+                    PrivateOramOwnerPrestagePairedSessionsV2 {
+                        hnsw_session_id: validated.paired_hnsw_session_id(),
+                        result_session_id: validated.paired_result_session_id(),
+                    },
                 )
                 .await?;
                 let resolution_receipt = confirm_private_oram_owner_installed_reservation_v3(
@@ -3008,12 +3141,56 @@ async fn resolve_private_oram_reserved_attempt_rejection_v2(
     }
 }
 
+#[derive(Clone, Copy)]
+struct PrivateOramOwnerPrestagePairedSessionsV2<'a> {
+    hnsw_session_id: &'a str,
+    result_session_id: Option<&'a str>,
+}
+
 pub(crate) async fn install_private_oram_owner_prestage_v2(
     toc: &storage::content_manager::toc::TableOfContent,
     settings: &Settings,
     consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
     verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
     package_canonical_json: &[u8],
+) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
+    install_private_oram_owner_prestage_inner_v2(
+        toc,
+        settings,
+        consensus,
+        verified_request,
+        package_canonical_json,
+        None,
+    )
+    .await
+}
+
+async fn install_private_oram_owner_prestage_with_paired_sessions_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
+    package_canonical_json: &[u8],
+    paired_sessions: PrivateOramOwnerPrestagePairedSessionsV2<'_>,
+) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
+    install_private_oram_owner_prestage_inner_v2(
+        toc,
+        settings,
+        consensus,
+        verified_request,
+        package_canonical_json,
+        Some(paired_sessions),
+    )
+    .await
+}
+
+async fn install_private_oram_owner_prestage_inner_v2(
+    toc: &storage::content_manager::toc::TableOfContent,
+    settings: &Settings,
+    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
+    verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
+    package_canonical_json: &[u8],
+    paired_sessions: Option<PrivateOramOwnerPrestagePairedSessionsV2<'_>>,
 ) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
     let request = verified_request.request();
     let package = decode_private_oram_owner_prestage_package_v2(package_canonical_json)
@@ -3036,19 +3213,35 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
-    let _hnsw_lifecycle = begin_private_hnsw_collection_lifecycle(collection.name(), &config)?;
     let has_result = package
         .immutable_manifest
         .manifest
         .indexes
         .iter()
         .any(|index| index.kind() == qdrant_sec::PrivateOramIndexKindV2::Result);
-    let _result_lifecycle = if has_result {
-        Some(begin_private_result_oram_collection_lifecycle(
+    if paired_sessions.is_some_and(|sessions| has_result != sessions.result_session_id.is_some()) {
+        return Err(invalid_owner_prestage());
+    }
+    let _hnsw_lifecycle = if let Some(sessions) = paired_sessions {
+        begin_private_hnsw_collection_lifecycle_for_paired_mutation(
             collection.name(),
             &config,
-        )?)
+            &request.vector_name,
+            sessions.hnsw_session_id,
+        )?
+    } else {
+        begin_private_hnsw_collection_lifecycle(collection.name(), &config)?
+    };
+    let _result_lifecycle = if let Some(result_session_id) =
+        paired_sessions.and_then(|sessions| sessions.result_session_id)
+    {
+        begin_private_result_oram_collection_lifecycle_for_paired_mutation(
+            collection.name(),
+            &config,
+            result_session_id,
+        )?
+    } else if has_result {
+        begin_private_result_oram_collection_lifecycle(collection.name(), &config)?
     } else {
         None
     };
@@ -3130,7 +3323,6 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
     let hnsw_store = PrivateHnswOramStore::new(collection.path(), &request.vector_name)?;
     let hnsw_current = hnsw_store.read_current_epoch()?;
     let old_hnsw = package
@@ -3178,7 +3370,6 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
             return Err(invalid_owner_prestage());
         }
     }
-
     let staged_frame = decode_prestage_frame(&package)?;
     let point_id = staged_frame
         .as_ref()
@@ -3468,6 +3659,36 @@ pub(crate) async fn coordinate_private_oram_recovery_readiness_v2(
         hnsw_context.public_key().to_vec(),
     )
     .map_err(|_| invalid_recovery_readiness())?;
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let linearizable = consensus
+        .linearizable_private_oram_mutation_reconcile_snapshot_v2(
+            &key,
+            coordinator_peer_id,
+            Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+        )
+        .await?;
+    let applied_parent_sequence = linearizable.active_parent_watermark_sequence().unwrap_or(0);
+    let pending_parent_progress = journal
+        .point_stage_parent_progress_proposals_v2()
+        .map_err(|_| invalid_recovery_readiness())?;
+    let applied_parent_count =
+        usize::try_from(applied_parent_sequence).map_err(|_| invalid_recovery_readiness())?;
+    if applied_parent_count > pending_parent_progress.len() {
+        return Err(invalid_recovery_readiness());
+    }
+    for progress in pending_parent_progress
+        .into_iter()
+        .skip(applied_parent_count)
+    {
+        dispatcher
+            .submit_private_oram_mutation_parent_progress_v2(
+                progress,
+                Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+            )
+            .await?;
+    }
     let layout = dispatcher
         .private_oram_consensus_layout(&PrivateOramLayoutKey {
             collection_id: collection_id.clone(),

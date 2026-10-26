@@ -12,6 +12,9 @@ thread_local! {
     static FAIL_IMMUTABLE_JSON_AFTER_RENAME_V2: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static FAIL_TERMINAL_ARCHIVE_AFTER_DIRECTORY_RENAME_V2: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(test)]
@@ -19,9 +22,23 @@ pub(super) fn set_fail_immutable_json_after_rename_v2(enabled: bool) {
     FAIL_IMMUTABLE_JSON_AFTER_RENAME_V2.set(enabled);
 }
 
+#[cfg(test)]
+pub(super) fn set_fail_terminal_archive_after_directory_rename_v2(enabled: bool) {
+    FAIL_TERMINAL_ARCHIVE_AFTER_DIRECTORY_RENAME_V2.set(enabled);
+}
+
 fn fail_immutable_json_after_rename_v2() -> Result<(), PrivateOramMutationJournalError> {
     #[cfg(test)]
     if FAIL_IMMUTABLE_JSON_AFTER_RENAME_V2.get() {
+        return Err(PrivateOramMutationJournalError::Indeterminate);
+    }
+    Ok(())
+}
+
+fn fail_terminal_archive_after_directory_rename_v2() -> Result<(), PrivateOramMutationJournalError>
+{
+    #[cfg(test)]
+    if FAIL_TERMINAL_ARCHIVE_AFTER_DIRECTORY_RENAME_V2.get() {
         return Err(PrivateOramMutationJournalError::Indeterminate);
     }
     Ok(())
@@ -1930,6 +1947,7 @@ impl PrivateOramMutationJournal {
             std::ffi::OsStr::new(LOCAL_CLEANUP_COMPLETE_FILE_V2),
             &complete,
             MAX_LOCAL_CLEANUP_COMPLETE_BYTES_V2,
+            PrivateOramImmutableJsonMismatchV2::ConcurrentActivePublication,
         )?;
         let installed_complete: PrivateOramMutationLocalCleanupCompleteV2 =
             installed.deserialize()?;
@@ -1964,7 +1982,7 @@ impl PrivateOramMutationJournal {
     pub fn archive_private_oram_mutation_after_clear_v2(
         &self,
         permit: PrivateOramMutationClearedPendingArchivePermitV2,
-    ) -> Result<(), PrivateOramMutationJournalError> {
+    ) -> Result<PrivateOramArchivedParentTerminalBindingV2, PrivateOramMutationJournalError> {
         validate_private_directory(&self.root)?;
         validate_private_directory(&self.temp_path())?;
         let lock = self.acquire_lock()?;
@@ -2000,6 +2018,7 @@ impl PrivateOramMutationJournal {
             // root descriptor, so this one directory fsync covers both removal and installation.
             root.sync_all()
                 .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
+            fail_terminal_archive_after_directory_rename_v2()?;
             Some(namespace)
         } else if !archive_exists {
             return Err(PrivateOramMutationJournalError::Corrupt);
@@ -2058,14 +2077,117 @@ impl PrivateOramMutationJournal {
             std::ffi::OsStr::new(TERMINAL_ARCHIVE_FILE_V2),
             &archive,
             MAX_TERMINAL_ARCHIVE_BYTES_V2,
+            PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay,
         )?;
         let installed_archive: PrivateOramMutationTerminalArchiveV2 = installed.deserialize()?;
         validate_terminal_archive_v2(&installed_archive)?;
         if installed_archive != archive {
-            return Err(PrivateOramMutationJournalError::ConcurrentMutation);
+            return Err(PrivateOramMutationJournalError::Corrupt);
         }
+        let local_terminals = archived
+            .state
+            .local_terminals
+            .as_ref()
+            .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+        if local_terminals.kind != PrivateOramMutationOwnerTerminalKindV2::FinalizedNew
+            || local_terminals.owners.len() != 1
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let owner_terminal = &local_terminals.owners[0];
+        let receipt = permit.owner_prestage_receipt();
+        if owner_terminal.owner_peer_id != permit.owner_peer_id()
+            || owner_terminal.journal_descriptor_digest != receipt.owner_journal_descriptor_digest()
+            || owner_terminal.prepared_state_digest != receipt.prepared_state_digest()
+            || owner_terminal.parent_descriptor_digest != permit.descriptor_digest()
+            || receipt.parent_descriptor_digest() != permit.descriptor_digest()
+            || receipt.owner_peer_id() != permit.owner_peer_id()
+            || receipt.lease_generation() != permit.generation()
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let indexes = owner_terminal
+            .indexes
+            .iter()
+            .map(|index| {
+                PrivateOramOwnerCommittedArchiveGrantIndexV1::try_new(
+                    index.kind,
+                    index.index_name.clone(),
+                    index.prepared_journal_digest.clone(),
+                    index.terminal_state_digest.clone(),
+                )
+                .map_err(|_| PrivateOramMutationJournalError::InvalidTransition)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminal_archive_file_len = u64::try_from(installed.bytes().len())
+            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+        let terminal_archive_file_sha256 =
+            BASE64URL_NOPAD.encode(&Sha256::digest(installed.bytes()));
+        let grant = PrivateOramOwnerCommittedArchiveGrantV1::try_new(
+            terminal_archive_file_len,
+            terminal_archive_file_sha256,
+            permit.vector_name().to_string(),
+            receipt.clone(),
+            permit.terminal_record_digest().to_string(),
+            installed_archive.archive_digest.clone(),
+            permit.archive_binding_digest().to_string(),
+            permit.clear_receipt_digest().to_string(),
+            owner_terminal.terminal_record_digest.clone(),
+            owner_terminal.decision_authority_record_digest.clone(),
+            owner_terminal.reconciliation_authority_digest.clone(),
+            owner_terminal.terminal_evidence_digest.clone(),
+            indexes,
+        )
+        .map_err(|_| PrivateOramMutationJournalError::InvalidTransition)?;
+        let expected_grant_bytes = encode_private_oram_owner_committed_archive_grant_v1(&grant)
+            .map_err(|_| PrivateOramMutationJournalError::InvalidTransition)?;
+        let installed_grant = publish_immutable_private_oram_json_v2(
+            &namespace,
+            &namespace.active,
+            std::ffi::OsStr::new(PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1),
+            &grant,
+            PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_MAX_BYTES_V1,
+            PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay,
+        )?;
+        let decoded_grant =
+            decode_private_oram_owner_committed_archive_grant_v1(installed_grant.bytes())
+                .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+        if decoded_grant != grant || installed_grant.bytes() != expected_grant_bytes {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        }
+        installed
+            .file
+            .sync_all()
+            .and_then(|()| installed_grant.file.sync_all())
+            .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
+        namespace
+            .active
+            .sync()
+            .and_then(|()| root.sync_all().map_err(PrivateOramMutationJournalError::Io))
+            .map_err(|_| PrivateOramMutationJournalError::Indeterminate)?;
+        installed.validate_binding_and_contents(&namespace.active.file)?;
+        installed_grant.validate_binding_and_contents(&namespace.active.file)?;
+        let binding = PrivateOramArchivedParentTerminalBindingV2 {
+            ready: PrivateOramArchivedParentReadyV2 {
+                key: PrivateOramMutationKey {
+                    collection_id: permit.collection_id().to_string(),
+                },
+                vector_name: permit.vector_name().to_string(),
+                owner_signing_key_id: permit.owner_signing_key_id().to_string(),
+                generation: permit.generation(),
+                owner_peer_id: permit.owner_peer_id(),
+                descriptor_digest: permit.descriptor_digest().to_string(),
+                terminal_record_digest: permit.terminal_record_digest().to_string(),
+                parent_archive_record_digest: installed_archive.archive_digest.clone(),
+                pending_tombstone_digest: permit.archive_binding_digest().to_string(),
+                clear_receipt_digest: permit.clear_receipt_digest().to_string(),
+                prestage_receipt_digest: receipt.receipt_digest().to_string(),
+                owner_terminal_evidence_digest: owner_terminal.terminal_evidence_digest.clone(),
+            },
+        };
         namespace.validate_bindings(&lock)?;
-        lock.validate_root_identity()
+        lock.validate_root_identity()?;
+        Ok(binding)
     }
 
     pub(super) fn validated_decision_for_v2_state(
@@ -3800,12 +3922,19 @@ fn publish_immutable_state_record_v2(
     candidate.keep_after_publish()
 }
 
+#[derive(Clone, Copy)]
+enum PrivateOramImmutableJsonMismatchV2 {
+    ConcurrentActivePublication,
+    CorruptSealedReplay,
+}
+
 fn publish_immutable_private_oram_json_v2<T>(
     namespace: &PrivateOramPinnedActiveNamespaceV2<'_>,
     destination: &PrivateOramPinnedDirectoryV2,
     destination_name: &std::ffi::OsStr,
     value: &T,
     max_bytes: u64,
+    mismatch: PrivateOramImmutableJsonMismatchV2,
 ) -> Result<PrivateOramPinnedFileV2, PrivateOramMutationJournalError>
 where
     T: Serialize + DeserializeOwned + PartialEq,
@@ -3815,7 +3944,14 @@ where
     {
         let existing: T = existing_file.deserialize()?;
         if existing != *value {
-            return Err(PrivateOramMutationJournalError::ConcurrentMutation);
+            return Err(match mismatch {
+                PrivateOramImmutableJsonMismatchV2::ConcurrentActivePublication => {
+                    PrivateOramMutationJournalError::ConcurrentMutation
+                }
+                PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay => {
+                    PrivateOramMutationJournalError::Corrupt
+                }
+            });
         }
         existing_file.validate_binding_and_contents(&destination.file)?;
         sync_private_oram_publish_directories_v2(destination, &namespace.active_temp)?;
@@ -3836,7 +3972,14 @@ where
         if let Some(installed) = installed {
             let existing: T = installed.deserialize()?;
             if existing != *value {
-                return Err(PrivateOramMutationJournalError::ConcurrentMutation);
+                return Err(match mismatch {
+                    PrivateOramImmutableJsonMismatchV2::ConcurrentActivePublication => {
+                        PrivateOramMutationJournalError::ConcurrentMutation
+                    }
+                    PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay => {
+                        PrivateOramMutationJournalError::Corrupt
+                    }
+                });
             }
             installed.validate_binding_and_contents(&destination.file)?;
             sync_private_oram_publish_directories_v2(destination, &namespace.active_temp)?;
@@ -3972,6 +4115,100 @@ fn state_record_file_name(sequence: u64) -> Result<String, PrivateOramMutationJo
 #[cfg(all(test, target_os = "linux"))]
 mod fd_relative_tests {
     use super::*;
+
+    fn immutable_replay_mismatch_without_mutation(
+        destination_name: &std::ffi::OsStr,
+        mismatch: PrivateOramImmutableJsonMismatchV2,
+    ) -> PrivateOramMutationJournalError {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root_temp_path = root_path.join(TEMP_DIR);
+        let archive_path = root_path.join("sealed-parent");
+        let archive_temp_path = archive_path.join(ACTIVE_TEMP_DIR);
+        create_private_directory(&root_path).unwrap();
+        create_private_directory(&root_temp_path).unwrap();
+        create_private_directory(&archive_path).unwrap();
+        create_private_directory(&archive_temp_path).unwrap();
+
+        let root = std::fs::File::open(&root_path).unwrap();
+        let namespace = PrivateOramPinnedActiveNamespaceV2 {
+            root: &root,
+            namespace_name: std::ffi::OsString::from("sealed-parent"),
+            root_temp: PrivateOramPinnedDirectoryV2::open_at(&root, std::ffi::OsStr::new(TEMP_DIR))
+                .unwrap(),
+            active: PrivateOramPinnedDirectoryV2::open_at(
+                &root,
+                std::ffi::OsStr::new("sealed-parent"),
+            )
+            .unwrap(),
+            active_temp: PrivateOramPinnedDirectoryV2::open_at(
+                &std::fs::File::open(&archive_path).unwrap(),
+                std::ffi::OsStr::new(ACTIVE_TEMP_DIR),
+            )
+            .unwrap(),
+            records: None,
+        };
+        let installed = write_new_private_oram_json_at_v2(
+            &namespace.active,
+            destination_name,
+            &serde_json::json!({"generation": 7, "digest": "installed"}),
+            MAX_FORMAT_BYTES,
+        )
+        .unwrap();
+        let before_bytes = installed.bytes().to_vec();
+        let before_metadata = installed.file.metadata().unwrap();
+
+        let error = publish_immutable_private_oram_json_v2(
+            &namespace,
+            &namespace.active,
+            destination_name,
+            &serde_json::json!({"generation": 7, "digest": "expected"}),
+            MAX_FORMAT_BYTES,
+            mismatch,
+        )
+        .unwrap_err();
+
+        let after = PrivateOramPinnedFileV2::open_at(
+            &namespace.active.file,
+            destination_name,
+            MAX_FORMAT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(after.bytes(), before_bytes);
+        ensure_same_file(&before_metadata, &after.file.metadata().unwrap()).unwrap();
+        assert_eq!(std::fs::read_dir(&archive_temp_path).unwrap().count(), 0);
+        error
+    }
+
+    #[test]
+    fn canonical_parent_terminal_archive_replay_mismatch_is_corrupt_without_mutation() {
+        let error = immutable_replay_mismatch_without_mutation(
+            std::ffi::OsStr::new(TERMINAL_ARCHIVE_FILE_V2),
+            PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay,
+        );
+        assert!(matches!(error, PrivateOramMutationJournalError::Corrupt));
+    }
+
+    #[test]
+    fn canonical_parent_archive_grant_replay_mismatch_is_corrupt_without_mutation() {
+        let error = immutable_replay_mismatch_without_mutation(
+            std::ffi::OsStr::new(PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1),
+            PrivateOramImmutableJsonMismatchV2::CorruptSealedReplay,
+        );
+        assert!(matches!(error, PrivateOramMutationJournalError::Corrupt));
+    }
+
+    #[test]
+    fn active_cleanup_replay_mismatch_remains_concurrent_without_mutation() {
+        let error = immutable_replay_mismatch_without_mutation(
+            std::ffi::OsStr::new(LOCAL_CLEANUP_COMPLETE_FILE_V2),
+            PrivateOramImmutableJsonMismatchV2::ConcurrentActivePublication,
+        );
+        assert!(matches!(
+            error,
+            PrivateOramMutationJournalError::ConcurrentMutation
+        ));
+    }
 
     #[test]
     fn v2_fd_relative_namespace_rejects_rebinding_symlinks_and_traversal() {

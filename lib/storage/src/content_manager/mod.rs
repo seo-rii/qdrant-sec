@@ -55,8 +55,6 @@ pub mod consensus_ops {
 
     const PRIVATE_ORAM_SHARD_LAYOUT_DIGEST_DOMAIN: &[u8] =
         b"qdrant-sec/private-oram-shard-layout-digest/v1";
-    const PRIVATE_ORAM_INDEX_STATE_DIGEST_DOMAIN: &[u8] =
-        b"qdrant-sec/private-oram-index-state-digest/v1";
     const PRIVATE_ORAM_CONSENSUS_STATE_CORE_DIGEST_DOMAIN: &[u8] =
         b"qdrant-sec/private-oram-consensus-state-core-digest/v2";
     const PRIVATE_ORAM_CONSENSUS_STATE_RECORD_DIGEST_DOMAIN: &[u8] =
@@ -72,6 +70,7 @@ pub mod consensus_ops {
     pub const PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION: u16 = 2;
     pub const PRIVATE_ORAM_MUTATION_CLEAR_RECEIPT_VERSION: u16 = 1;
     pub const PRIVATE_ORAM_MUTATION_ACTIVATION_BARRIER_VERSION: u16 = 1;
+    pub const PRIVATE_ORAM_SNAPSHOT_BARRIER_VERSION: u16 = 1;
     pub const PRIVATE_ORAM_MUTATION_MATERIAL_OPERATION_VERSION: u16 = 6;
     pub const PRIVATE_ORAM_MUTATION_MATERIAL_OPERATION_VERSION_V7: u16 = 7;
     pub const PRIVATE_ORAM_MUTATION_ACTIVATION_PROOF_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -450,6 +449,31 @@ pub mod consensus_ops {
         }
     }
 
+    /// Atomically binds an already replicated V1 epoch/root set to a signed V2 genesis state.
+    ///
+    /// Initial V1 uploads intentionally publish epochs without writeback digests. Enrollment is
+    /// the only transition allowed to replace those missing digests while also publishing the
+    /// first collection layout, mutation state, and empty mutation authority slot.
+    #[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+    #[serde(deny_unknown_fields)]
+    pub struct EnrollPrivateOramMutationStateV2 {
+        pub key: PrivateOramMutationKey,
+        pub layout: PrivateOramConsensusLayout,
+        pub state: PrivateOramConsensusCollectionStateV2,
+    }
+
+    impl fmt::Debug for EnrollPrivateOramMutationStateV2 {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("EnrollPrivateOramMutationStateV2")
+                .field("key", &self.key)
+                .field("layout_generation", &self.layout.generation)
+                .field("owner_count", &self.layout.owner_peer_ids.len())
+                .field("state_sequence", &self.state.state_sequence)
+                .field("index_count", &self.state.indexes.len())
+                .finish()
+        }
+    }
+
     #[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
     #[serde(deny_unknown_fields)]
     pub struct CompareAndSwapPrivateOramMutationLease {
@@ -811,6 +835,7 @@ pub mod consensus_ops {
             }
         }
 
+        #[cfg(test)]
         pub(crate) fn abort_decision(
             key: PrivateOramMutationKey,
             expected_aggregate_digest: String,
@@ -1117,6 +1142,14 @@ pub mod consensus_ops {
         Installing,
     }
 
+    #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PrivateOramExternalRecoveryAuthority {
+        #[default]
+        LegacyV1,
+        MutationV2,
+    }
+
     #[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
     pub struct PrivateOramExternalRecoveryLease {
         pub owner_peer_id: PeerId,
@@ -1125,6 +1158,8 @@ pub mod consensus_ops {
         pub backup_generation: u64,
         pub issued_at_unix: u64,
         pub expires_at_unix: u64,
+        #[serde(default)]
+        pub authority: PrivateOramExternalRecoveryAuthority,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub install_intent_digest: Option<String>,
         #[serde(default)]
@@ -1140,6 +1175,7 @@ pub mod consensus_ops {
                 .field("backup_generation", &self.backup_generation)
                 .field("issued_at_unix", &self.issued_at_unix)
                 .field("expires_at_unix", &self.expires_at_unix)
+                .field("authority", &self.authority)
                 .field(
                     "has_install_intent_digest",
                     &self.install_intent_digest.is_some(),
@@ -2372,65 +2408,28 @@ pub mod consensus_ops {
         collection_id: &str,
         states: &[(PrivateOramEpochKey, PrivateOramConsensusEpoch)],
     ) -> Result<String, StorageError> {
-        if !valid_private_oram_collection_id(collection_id)
-            || states.is_empty()
-            || states.len() > PRIVATE_ORAM_CONSENSUS_MAX_RECORDS
-        {
-            return Err(invalid_private_oram_index_state_digest_input());
-        }
-
-        let mut states = states.to_vec();
-        states.sort_by(|(left, _), (right, _)| {
-            private_oram_index_kind_tag(left.index_kind)
-                .cmp(&private_oram_index_kind_tag(right.index_kind))
-                .then_with(|| left.index_name.as_bytes().cmp(right.index_name.as_bytes()))
-        });
-        if states.windows(2).any(|states| {
-            states[0].0.index_kind == states[1].0.index_kind
-                && states[0].0.index_name == states[1].0.index_name
-        }) {
-            return Err(invalid_private_oram_index_state_digest_input());
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(PRIVATE_ORAM_INDEX_STATE_DIGEST_DOMAIN);
-        update_private_oram_length_prefixed(&mut hasher, collection_id.as_bytes());
-        hasher.update((states.len() as u64).to_be_bytes());
-        for (key, state) in states {
-            let valid_key = key.collection_id == collection_id
-                && match key.index_kind {
-                    PrivateOramIndexKind::Hnsw => {
-                        !key.index_name.is_empty() && key.index_name.len() <= 128
-                    }
-                    PrivateOramIndexKind::ResultPayload => key.index_name.is_empty(),
-                };
-            let Some(root_hash) = decode_private_oram_sha256_digest(&state.root_hash) else {
-                return Err(invalid_private_oram_index_state_digest_input());
-            };
-            let writeback_digest = match state.writeback_digest {
-                Some(digest) => Some(
-                    decode_private_oram_sha256_digest(&digest)
-                        .ok_or_else(invalid_private_oram_index_state_digest_input)?,
-                ),
-                None => None,
-            };
-            if !valid_key {
-                return Err(invalid_private_oram_index_state_digest_input());
-            }
-
-            hasher.update([private_oram_index_kind_tag(key.index_kind)]);
-            update_private_oram_length_prefixed(&mut hasher, key.index_name.as_bytes());
-            hasher.update(state.index_epoch.to_be_bytes());
-            hasher.update(root_hash);
-            match writeback_digest {
-                Some(digest) => {
-                    hasher.update([1]);
-                    hasher.update(digest);
-                }
-                None => hasher.update([0]),
-            }
-        }
-        Ok(BASE64URL_NOPAD.encode(&hasher.finalize()))
+        let states = states
+            .iter()
+            .map(
+                |(key, state)| qdrant_sec::PrivateOramRecoveryIndexStateRef {
+                    collection_id: &key.collection_id,
+                    index_kind: match key.index_kind {
+                        PrivateOramIndexKind::Hnsw => {
+                            qdrant_sec::PrivateOramRecoveryIndexKind::Hnsw
+                        }
+                        PrivateOramIndexKind::ResultPayload => {
+                            qdrant_sec::PrivateOramRecoveryIndexKind::ResultPayload
+                        }
+                    },
+                    index_name: &key.index_name,
+                    index_epoch: state.index_epoch,
+                    root_hash: &state.root_hash,
+                    writeback_digest: state.writeback_digest.as_deref(),
+                },
+            )
+            .collect::<Vec<_>>();
+        qdrant_sec::canonical_private_oram_recovery_index_state_digest(collection_id, &states)
+            .map_err(|_| invalid_private_oram_index_state_digest_input())
     }
 
     pub fn private_oram_index_keys_for_config(
@@ -2624,6 +2623,30 @@ pub mod consensus_ops {
         }
     }
 
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
+    #[serde(deny_unknown_fields)]
+    pub struct PrivateOramSnapshotBarrierV2 {
+        pub version: u16,
+        pub requester_peer_id: PeerId,
+        pub process_incarnation: [u8; 16],
+        pub sequence: u64,
+    }
+
+    impl PrivateOramSnapshotBarrierV2 {
+        pub(crate) fn validate(&self) -> Result<(), StorageError> {
+            if self.version != PRIVATE_ORAM_SNAPSHOT_BARRIER_VERSION
+                || self.requester_peer_id == 0
+                || self.process_incarnation == [0; 16]
+                || self.sequence == 0
+            {
+                return Err(StorageError::bad_request(
+                    "private ORAM snapshot consensus barrier is invalid",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     /// Operation that should pass consensus
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
     pub enum ConsensusOperations {
@@ -2644,6 +2667,7 @@ pub mod consensus_ops {
         CompareAndSwapPrivateOramEpoch(CompareAndSwapPrivateOramEpoch),
         CompareAndSwapPrivateOramSessionLease(CompareAndSwapPrivateOramSessionLease),
         InitializePrivateOramMutationState(InitializePrivateOramMutationState),
+        EnrollPrivateOramMutationStateV2(EnrollPrivateOramMutationStateV2),
         CompareAndSwapPrivateOramMutationLease(CompareAndSwapPrivateOramMutationLease),
         ConfirmPrivateOramMutationAuthorityV2(ConfirmPrivateOramMutationAuthorityV2),
         ApplyPrivateOramMutation(ApplyPrivateOramMutation),
@@ -2655,6 +2679,7 @@ pub mod consensus_ops {
         /// binary without enrollment support fails to decode the entry instead of applying it
         /// differently.
         EnrollPrivateOramMutationCollectionV2(InitializePrivateOramMutationState),
+        PrivateOramSnapshotBarrierV2(PrivateOramSnapshotBarrierV2),
         CompareAndSwapPrivateOramLayout(CompareAndSwapPrivateOramLayout),
         RequestSnapshot,
         ReportSnapshot {
@@ -2855,6 +2880,13 @@ pub mod consensus_ops {
                     .field("state_sequence", &operation.state.state_sequence)
                     .field("index_count", &operation.state.indexes.len())
                     .finish(),
+                ConsensusOperations::EnrollPrivateOramMutationStateV2(operation) => f
+                    .debug_struct("EnrollPrivateOramMutationStateV2")
+                    .field("layout_generation", &operation.layout.generation)
+                    .field("owner_count", &operation.layout.owner_peer_ids.len())
+                    .field("state_sequence", &operation.state.state_sequence)
+                    .field("index_count", &operation.state.indexes.len())
+                    .finish(),
                 ConsensusOperations::CompareAndSwapPrivateOramMutationLease(operation) => f
                     .debug_struct("CompareAndSwapPrivateOramMutationLease")
                     .field("expected_has_active", &operation.expected.active.is_some())
@@ -2885,6 +2917,11 @@ pub mod consensus_ops {
                     .debug_tuple("ApplyPrivateOramMutationMaterialV2")
                     .field(operation)
                     .finish(),
+                ConsensusOperations::PrivateOramSnapshotBarrierV2(operation) => f
+                    .debug_struct("PrivateOramSnapshotBarrierV2")
+                    .field("requester_peer_id", &operation.requester_peer_id)
+                    .field("sequence", &operation.sequence)
+                    .finish_non_exhaustive(),
                 ConsensusOperations::ApplyPrivateOramExternalRecovery(operation) => f
                     .debug_tuple("ApplyPrivateOramExternalRecovery")
                     .field(operation)
@@ -3069,16 +3106,17 @@ mod test {
         PRIVATE_ORAM_MUTATION_RECEIPT_VERSION, PrivateOramCollectionLayoutTransition,
         PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
         PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2,
-        PrivateOramEpochKey, PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryLease,
-        PrivateOramExternalRecoveryLeasePhase, PrivateOramExternalRecoveryOperation,
-        PrivateOramExternalRecoveryPhase, PrivateOramExternalRecoveryState, PrivateOramIndexKind,
-        PrivateOramLayoutIndexStateBinding, PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding,
-        PrivateOramLayoutTransitionState, PrivateOramMutationActivationBarrierV2,
-        PrivateOramMutationKey, PrivateOramMutationLease, PrivateOramMutationLeasePhase,
-        PrivateOramMutationLeaseSlotV2, PrivateOramMutationReceiptV2,
-        PrivateOramReshardingLayoutTransition, PrivateOramSessionLease,
-        PrivateOramShardKeyLayoutChange, PrivateOramShardKeyLayoutChangeKind,
-        PrivateOramShardLayoutEntry, canonical_private_oram_index_state_digest,
+        PrivateOramEpochKey, PrivateOramExternalRecoveryAuthority, PrivateOramExternalRecoveryKey,
+        PrivateOramExternalRecoveryLease, PrivateOramExternalRecoveryLeasePhase,
+        PrivateOramExternalRecoveryOperation, PrivateOramExternalRecoveryPhase,
+        PrivateOramExternalRecoveryState, PrivateOramIndexKind, PrivateOramLayoutIndexStateBinding,
+        PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding, PrivateOramLayoutTransitionState,
+        PrivateOramMutationActivationBarrierV2, PrivateOramMutationKey, PrivateOramMutationLease,
+        PrivateOramMutationLeasePhase, PrivateOramMutationLeaseSlotV2,
+        PrivateOramMutationReceiptV2, PrivateOramReshardingLayoutTransition,
+        PrivateOramSessionLease, PrivateOramShardKeyLayoutChange,
+        PrivateOramShardKeyLayoutChangeKind, PrivateOramShardLayoutEntry,
+        canonical_private_oram_index_state_digest,
         canonical_private_oram_resharding_post_layout_digest,
         canonical_private_oram_shard_layout_digest,
         classify_private_oram_replica_removal_layout_transition,
@@ -3456,6 +3494,7 @@ mod test {
                             backup_generation: 7,
                             issued_at_unix: 100,
                             expires_at_unix: 160,
+                            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                             install_intent_digest: None,
                             phase: PrivateOramExternalRecoveryLeasePhase::Staging,
                         }),

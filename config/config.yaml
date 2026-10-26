@@ -30,6 +30,20 @@ storage:
     #   access_key: ""
     #   secret_key: ""
 
+  # Resource limits for strict Private ORAM external restore. Sizes are bytes.
+  private_oram_external_recovery:
+    # Preserve the historical absolute archive limit of 1 TiB.
+    max_snapshot_bytes: 1099511627776
+    # Archive plus unpacked verification trees reserved across the node.
+    # Must exceed max_unpacked_bytes so at least one archive byte can be admitted.
+    max_total_staged_bytes: 2199023255552
+    # Maximum cumulative logical regular-file bytes after sparse expansion.
+    max_unpacked_bytes: 1099511627776
+    # Every upload, verification, and install keeps this filesystem reserve.
+    min_free_space_bytes: 1073741824
+    # Verify and install share this node-wide worker pool.
+    max_concurrent_verify_prepare: 1
+
   # Where to store temporary files
   # If null, temporary snapshots are stored in: storage/snapshots_temp/
   temp_path: null

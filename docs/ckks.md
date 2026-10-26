@@ -350,6 +350,13 @@ after the decision fail closed; same-phase renewal remains available while
 durable abort cleanup runs. Only exact old plus this phase is returned as
 `ExactOldAbortDecided` abort authority.
 
+The transition is intentionally recovery-readable but production-disabled.
+No production route, supervisor branch, timeout, lease expiry, owner absence,
+or generic reconciliation failure can propose `AbortDecided`. A future issuer
+must add canonical owner abort intent, reservation-outcome acknowledgement,
+worker-quiescence evidence, and an absolute durable policy deadline; exact old
+state alone is not sufficient authority.
+
 `AbortDecided` is a new named serde variant in Raft entries, persistent state,
 and snapshots. It must not be proposed until every peer advertises support for
 both the variant and the strengthened clear transition, and downgrade is not
@@ -648,9 +655,20 @@ not take over work when that peer is absent.
 Follower confirmation has an explicit local-applied barrier. The forwarded Raft
 confirmation returns the entry index applied by the calling node, and the
 reconcile snapshot is captured only after that node's persistent `last_applied`
-has reached the receipt. Terminal resume and archive/ack work are additionally
-serialized by collection key, so independently minted supervisor permits cannot
-race the same mutation while unrelated collections continue independently.
+has reached the receipt. Fresh admitted completion, admitted restart
+reconciliation, terminal resume, and post-clear archive installation share one
+process-local owner-execution guard keyed by stable collection identity. Each path reacquires
+its exact authoritative phase after the guard, so a stale `Preparing`
+observation cannot overlap `ConsensusCommitted` cleanup while unrelated
+collections continue independently. Commit postflight reads state and lease
+under one applied-state guard, retries only the exact-old/preparing projection
+for a bounded interval, accepts only the exact committed projection, and fails
+closed immediately on every third state.
+
+The exact Raft clear acknowledgement is submitted after archive installation
+returns and releases that guard. At that boundary the lifecycle still retains
+the pending tombstone, which blocks the next admission, and the immutable-owner
+process fence prevents a second local supervisor from taking over the ACK.
 
 Local cleanup is a quiescence claim, not a registry deletion. Claiming the exact
 generation blocks new jobs, sessions, and phase mutations, waits for the detached
@@ -689,6 +707,28 @@ are also retained until a separate consensus-backed physical-GC policy is
 activated. The generic lease CAS is not cleanup authority and is not used by the
 V2 terminal coordinator.
 
+Cleared-pending acknowledgement discovery is independent of the active-lease
+scan. After clear, only the immutable owner may reopen the exact pending
+generation, archive the parent namespace, and submit acknowledgement. Restart
+retries archive idempotently when either the active namespace or the exact
+generation archive exists. Process regressions terminate the owner both before
+archive and after archive but before acknowledgement; each restart preserves
+the pending tombstone, validates the archive binding, acknowledges once, and
+reopens private sessions.
+
+Parent archive completion is also the only safe-API authority for retiring the
+collection-owned HNSW child journal. Storage publishes a canonical
+`owner_child_archive_grant_v1.json` beside the exact parent terminal in the
+fixed completed-generation directory. The grant binds the exact terminal byte
+length and SHA-256, collection/mutation/vector/owner/fence context, the pre-ACK
+tombstone and clear receipt, and the parent/child evidence digests. The child
+archive API accepts only a generation, derives and pins the parent ancestry from
+its own HNSW root, and fsyncs and rebinds the terminal and grant before the first
+child mutation. New-generation readiness reloads the retained grant and requires
+the parent terminal, parent archive, tombstone, clear receipt, and child archive
+to form the same chain. Caller-supplied paths, evidence objects, or grant bytes
+cannot authorize retirement.
+
 The cleanup marker and archive receipt use immutable no-replace publication:
 bounded canonical temp write, file fsync, rename, both affected directory fsyncs,
 and exact installed-byte validation. Archive source identity and the complete
@@ -702,6 +742,22 @@ durability. Acknowledged recovery and terminal certificates remain
 attached until the next admission atomically converts them into a retained GC
 obligation; incomplete or non-acknowledged material blocks reservation.
 
+While that clear acknowledgement is pending, Raft apply rejects ordinary
+non-replica collection configuration changes and crypto migration plans for the
+same stable collection ID. The fence reads persistent pending-ACK state at apply
+time, so an operation proposed earlier cannot cross the pending interval and an
+owner restart or foreign-leader election does not remove it. Applying the exact
+ACK releases the fence. The predicate is collection-scoped; a pending key for
+collection A does not block collection B.
+
+Process coverage retains and verifies three consecutive parent grant/child
+archive chains, including exact terminal byte length and hash, while proving
+earlier generations are not overwritten. Removing both the canonical child
+archive and its retired adopted intent blocks the next admission before a Raft
+proposal. Separate crash cases stop the owner before parent archive and after
+archive but before ACK; both converge after restart, and the latter keeps live
+metadata and crypto requests fenced until ACK.
+
 If the immutable coordinator remains absent for 300 seconds while the same foreign
 generation is pending, the durable protocol state remains `Pending` and the
 operational status becomes `Blocked: ImmutableCoordinatorUnavailable`. This is an
@@ -714,11 +770,44 @@ subset: signed manifest/state/mutation contracts, fixed-window Path ORAM client
 transactions, owner reservation and prestage, collection-wide consensus apply,
 dedicated REST/internal transport, restart terminal reconciliation, and cleanup
 are all present. Normal Qdrant upsert/update and ordinary search remain rejected.
-Production release still requires the V2-E Linux multi-process crash matrix,
-leader/supervisor concurrency E2E, complete snapshot/WAL leakage scans,
+An RF=1 single- and multi-shard process gate now commits both HNSW and result
+stores, sends `SIGKILL` to the owner, restarts the same peer directory, verifies
+the HNSW Merkle proof and node AEAD plus the result Merkle commitments against
+client-pinned roots, rejects response tampering, and completes the next epoch
+writeback. This establishes persistence after an acknowledged commit; it does
+not establish crash atomicity inside an fsync, rename, or Raft-CAS boundary.
+Another RF=1 process gate snapshots the committed epoch and scans live storage,
+the shard WAL, collection metadata WAL, Raft state files, the snapshot archive
+and its extracted files, and captured stdout logs for raw and encoded plaintext
+vector, node/token, and client-RK sentinels. Before snapshot creation, the client
+refreshes and signs both manifests at the committed epoch/root. Preflight
+requires those signed anchors to equal current state, then validates every
+mixed-epoch bucket against its own commitment context and the signed current
+Merkle root. This scan does not cover stderr, panic reports, metrics, or every
+result-payload/client-state representation.
+The ten-phase external-restore process abort/restart matrix is complete. The
+last two points terminate after durable staging finalization and after the
+process-local reservation release. Restart reconstructs no stale reservation
+once the operation directory is gone and still republishes the committed
+collection.
+That external path is narrower than the general V2 topology machinery: it
+requires configured RF=1, automatic sharding, one or two shards, and the same
+sole active owner for every shard.
+Production release still requires syscall-level durability fault injection,
+the remaining leakage surfaces, production signer/SDK provenance enforcement,
+recovery orphan collection and resource telemetry,
 performance benchmarks, and operational backup/restore drills. Coordinator
 takeover, dynamic resize/update/delete, physical evidence GC, and true
 multi-writer remain outside V2.
+
+The deterministic paired-store fixture remains behind the explicit collection
+`testing` feature for cross-crate recovery tests. The root Qdrant binary and
+production storage dependency graph do not enable that feature, including the
+root all-features graph. The feature-public fixture cannot publish a canonical
+parent grant, invoke child retirement, or fabricate clear ACK authority, but it
+can write fixture-shaped local store state. Production builds must not enable
+it; moving the fixture into a separate test-support crate remains defense-in-depth
+follow-up work.
 
 The append contract carries ciphertext hashes and commitments, not raw bucket
 bodies. The owner-prepare wire package supplies those encrypted bodies, and the
@@ -1005,8 +1094,12 @@ flag is set. On restart, the earlier durable apply-progress queue replays the
 same committed entry: an old persistent image applies the transition, while a
 new image takes the exact no-op replay path. Fault tests cover definitive
 pre-publish rollback, old-disk/new-memory replay, rename-ahead recovery, and
-parent-fsync retry and exhaustion. A real power-loss/process crash matrix
-remains a D5 release gate.
+parent-fsync retry and exhaustion. The private HNSW store's corresponding
+temp-fsync/pre-rename and post-rename/pre-parent-fsync boundaries also have
+process `SIGKILL` coverage and an opt-in ext4/`dm-flakey` write-loss matrix in
+`tests/consensus_tests/test_private_oram_durability.py`. That targeted matrix
+does not close the broader D3 consensus persistent-image or external-recovery
+archive/live-tree power-loss gate.
 
 D3-B1 adds a durable collection-level parent journal for the exact seven-phase
 mutation sequence. It binds the signed mutation and old consensus record,
@@ -1046,6 +1139,58 @@ rejects unknown JSON fields, unsupported versions, zero generation or snapshot
 size, empty, duplicated, or unsorted owner/shard sets, a source outside the
 owner set, malformed digests, malformed signatures, and owner-key mismatch.
 Deterministic message-digest and Ed25519 known-answer tests pin this encoding.
+The process fixture uses a distinct recovery signing key and a predeclared
+signing intent that pins collection, generation, source and shard set, layout,
+snapshot size and hash, client-state digest, and signing key id. Before signing,
+it independently hashes the archive and recomputes the canonical digest of the
+complete HNSW/result kind, name, epoch, root, and writeback-digest set. The
+signer, server admission path, and staged/loaded validators use the same crypto
+crate canonical helper.
+
+Consensus records carry an explicit external-recovery authority mode.
+Pre-V2 persisted images and Raft snapshots decode to `LegacyV1`; an enrolled
+collection requires `MutationV2` and the exact owner-archive readiness
+expectation. The two forms have separate digest domains and cannot be renewed
+or replayed as each other. Recovery begin/renew and mutation genesis enrollment
+are cross-fenced in the same Raft state machine in both operation orders. A
+genesis enrollment retry is idempotent only while the collection state, layout,
+and every bound epoch/root/writeback digest still exactly equal the signed
+genesis image; an evolved collection rejects that retry.
+
+Mutation enrollment is enabled only after the stable voter set has signed the
+wire-8 capability epoch. Its V3 capability descriptor explicitly requires
+external-recovery authority tagging, the private snapshot barrier, and the
+enrollment floor. The activation manifest pins the exact
+`required_binary_capability_digest`; startup and snapshot admission require the
+running binary to match that digest and the minimum reader/writer protocol.
+Changing voter/process capability evidence or the binary digest requires a new
+membership generation. A peer that cannot acknowledge wire 8 cannot activate
+the write floor or admit a new enrollment.
+
+`tests/consensus_tests/test_private_oram_upgrade_compatibility.py` executes
+both boundaries with real processes. A pinned previous binary must exit before
+serving when opened on a wire-8-enrolled data directory and must not change any
+protected Raft, floor, or private-ORAM file. In a three-voter rolling-upgrade
+fixture, retaining one real previous-binary voter prevents the wire-8 successor
+authority from collecting acknowledgements; the format floor stays inactive
+and enrollment remains open but inadmissible. The fixture requires a separately
+built or supplied previous binary and never substitutes a current-process
+feature flag for downgrade evidence. Supply it with
+`QDRANT_PRIVATE_ORAM_PREVIOUS_BINARY`, or set
+`QDRANT_BUILD_PRIVATE_ORAM_PREVIOUS_BINARY=1` to build the revision pinned by
+the fixture; CI treats an unavailable previous binary as a gate failure.
+
+The applied format floor is mirrored outside installed Raft snapshots in a
+monotonic local checkpoint. That checkpoint retains a non-removable enrollment
+floor for every collection key and, once activated owner authority exists, its
+monotonic authority floor. The first checkpoint may pin collections that were
+already enrolled when the format floor was installed, but may not invent an
+activated authority floor. Snapshot load and restart reject removal or mutation
+of an enrollment floor, authority ordinal rollback, an older format epoch, or a
+different binary capability. Post-activation enrollment writes tagged activated
+authority anchored to the current format-floor locator and digest. Recovery
+state is valid only as `LegacyV1` with no enrollment or `MutationV2` with an
+enrollment, so restoring either side without the other fails closed.
 
 The server now consumes this checkpoint through a distributed, admin-only
 external recovery admission protocol:
@@ -1065,6 +1210,11 @@ collection before hashing it, records an exact old/new durable install marker,
 and moves the recovery lease from `Staging` to `Installing` before any rename.
 
 `begin` is accepted only on the same peer identity named as the signed source.
+The currently proven V2-C topology requires configured replication factor 1,
+automatic sharding, and exactly one or two shards, each having that peer as its
+sole `Active` replica. Healthy or degraded configured-RF2, custom sharding, and
+split-owner layouts are rejected before snapshot creation, staging creation, or
+layout-state mutation.
 It requires the current stable collection UUID and crypto config, the exact
 canonical local shard set, the exact consensus layout and every private index
 epoch/root, no private ORAM session lease, no pending generic snapshot recovery
@@ -1084,6 +1234,160 @@ per-collection file locking, atomic state replacement, fsync ordering, and
 crash reconciliation that truncates an uncommitted archive suffix. Duplicate
 chunks are idempotent only when their stored bytes hash identically.
 
+`storage.private_oram_external_recovery` bounds this protocol with
+`max_snapshot_bytes`, `max_total_staged_bytes`, `max_unpacked_bytes`,
+`min_free_space_bytes`, and `max_concurrent_verify_prepare`. Admission reserves
+the signed archive size plus the configured maximum unpacked size, rather than
+trusting an archive compression ratio. Startup securely scans valid staging
+state and reconstructs these reservations; malformed, symlinked, or path-mismatched
+state fails startup. A node already above a newly lowered quota remains
+readable and abortable, but no new reservation is admitted. Upload checks the
+remaining chunk allocation against the filesystem reserve. Verification scans
+the tar before extraction, accepts only directories, regular files, and Qdrant's
+GNU sparse WAL entries, and counts each sparse entry by its logical restored
+size. Links, devices, malformed size fields, arithmetic overflow, excessive
+entries, and cumulative logical expansion over the configured bound fail
+closed before unpacking. Verify and install share the same process-wide
+non-blocking worker budget; archive hashing, scanning, and extraction execute
+on the blocking runtime. The controller is process-local under the same
+peer-identity process-lock assumption as the execution coordinator. A
+two-collection process regression fixes the configured cap at one, holds one
+verification after worker acquisition, observes `workers_in_use=1`, requires a
+second collection's verification to fail immediately with HTTP 429, and then
+repeats the held verification against that collection's install/commit path.
+Both rejected requests leave the rejected operation directory's entry set and
+every file digest unchanged. Releasing the permit must allow the verification
+and install retries to succeed and return `workers_in_use` to zero.
+Node-wide
+telemetry exposes only aggregate `reserved_bytes`, `staging_reservations`,
+`worker_limit`, `workers_in_use`, `preflight_scanned_logical_bytes`, and
+`preflight_scanned_entries`.
+Prometheus exports the corresponding unlabelled
+`qdrant_private_oram_external_recovery_*` gauges and successful-preflight
+`preflight_scanned_logical_bytes_total`/`preflight_scanned_entries_total`
+counters. Scan counters
+advance only after a complete accepted archive preflight and reset on process
+restart; rejected partial scans are not counted. These values never include a
+collection name, operation id, path label, root hash, or ciphertext value.
+Generic anonymized telemetry drops the entire private ORAM external-recovery
+resource field, so exact recovery activity is not sent by anonymous usage
+reporting. The non-anonymized operator metrics endpoint retains the aggregate
+values; requesting anonymized metrics omits this field. On the main HTTP
+service, `/metrics` requires global access when API-key/JWT authorization is
+configured and rejects collection-scoped access. A configured standalone
+`service.metrics_port` is intentionally not protected by API keys, binds
+`service.host`, and must remain behind the deployment's trusted monitoring
+network boundary as required by its service configuration contract.
+Prometheus samples use its normal floating-point representation, so cumulative
+values above `2^53` are approximate; the controller's internal saturating `u64`
+accounting and all admission decisions remain independent of that representation.
+Expired consensus-unreferenced staging is still retained and charged until an
+explicit abort. Startup absence from persisted consensus is not proof that a
+staging operation is orphaned because an unapplied Raft `Begin` may commit after
+startup reconciliation. Automatic orphan garbage collection therefore requires
+a leader-side linearizable apply/read barrier and remains a V2-E release gate.
+Configuration validation also requires `max_total_staged_bytes` to fit at least
+one byte of archive plus `max_unpacked_bytes`; an impossible node quota fails
+startup instead of silently disabling every recovery.
+
+The atomic staging-state and install-marker writers have deterministic unit
+fault injection at two durability boundaries. An injected ENOSPC before the
+temporary file `fsync` must leave no canonical replacement or temporary file;
+a failure of the parent-directory `fsync` after rename may leave the exact new
+image visible, and an identical retry must recognize it and converge. These
+tests do not emulate kernel power loss.
+
+Verification-output promotion and both live-tree install renames have a separate
+deterministic syscall-error matrix. A pre-rename error must preserve the source
+name, while an injected parent-sync error after rename must expose only the
+destination name. Install rollback must then restore the exact old tree and the
+durable `Prepared` marker before a retry can promote the verified tree. An
+unprivileged Unix regression also removes write permission from each real rename
+destination parent, requires the kernel rename to fail, restores the original
+mode, and verifies retry. The permission test is skipped for effective UID 0,
+which may bypass discretionary access checks.
+
+An explicit ignored Linux release regression exercises real archive-write
+exhaustion without filling the host filesystem. It recursively runs the storage
+test executable in a user/mount namespace, mounts a 4 MiB tmpfs, and calls the
+production `common::tar_unpack::tar_unpack_file` with 512 KiB left. The first
+128 KiB entry must be exact, the second 1 MiB entry must end partially with
+`ErrorKind::StorageFull`, and no promoted output may exist. After releasing the
+competing filler, the production verification-output reset must remove every
+partial entry before the same archive can be extracted and promoted. A local
+RAII guard attempts unmount on panic, while mount-namespace teardown contains
+abnormal child exit. Run it with:
+
+```text
+cargo test -p storage --lib archive_extraction_recovers_from_real_tmpfs_enospc -- --ignored --nocapture
+```
+
+The gate intentionally relocates only test-owned verification output paths;
+the uploaded archive identity and staging state remain on their normal paths.
+It uses a synthetic two-file tar and therefore does not by itself prove a signed
+valid collection or REST/process coordinator behavior.
+
+A separate opt-in Linux process gate covers that next boundary. It recursively
+runs pytest in a user/mount namespace, places a real Qdrant peer and its storage
+on a 256 MiB tmpfs, uploads large-profile signed HNSW and result ORAM stores,
+exports and independently signs a valid collection snapshot, and sends it
+through REST begin/upload. Verify pauses only after archive resource and signed
+checkpoint/runtime validation. The test then leaves 4 MiB free and requires the
+production collection unpacker to record an internal staging-only
+`ErrorKind::StorageFull`, a nonempty partial pending tree, no promoted tree, the
+durable `uploading` phase, and the active private-session fence. Releasing the
+filler must let the exact operation token and archive verify, commit, and reopen
+current private sessions. The error-kind marker is unavailable in non-staging
+builds and never changes the redacted HTTP response. Run it with a Qdrant binary
+built with `staging`:
+
+```text
+QDRANT_RUN_PRIVATE_ORAM_PROCESS_ENOSPC=1 \
+  tests/.venv/bin/pytest -q -s \
+  tests/consensus_tests/test_private_oram_sessions.py::test_private_oram_external_restore_recovers_from_process_enospc
+```
+
+This process gate was first validated with the non-RocksDB `staging` binary and
+then repeated three times with a `rocksdb,staging` binary. The RocksDB run
+explicitly disabled the payload-index/storage skip flags and the automatic
+RocksDB migration flags. A normal signed RF=1 restore left `CURRENT`,
+`MANIFEST-*`, `OPTIONS-*`, and `LOG` files in both restored segment payload-index
+directories, confirming that the runner exercised live RocksDB artifacts rather
+than merely linking the feature. Build the runner with:
+
+```text
+CARGO_INCREMENTAL=0 cargo build --bin qdrant --features 'rocksdb staging'
+```
+
+Run the process gates with `QDRANT__FEATURE_FLAGS__ALL=false`, all three
+`PAYLOAD_*_SKIP_ROCKSDB=false` flags, and all four
+`MIGRATE_ROCKSDB_*=false` flags exported to the pytest/Qdrant processes.
+
+Install preparation has an additional deterministic process regression for the
+two durability flushes that precede creation of the install marker. A staging-only
+bounded JSON selector scopes a one-shot `ENOSPC` result to an exact operation hash
+and either the verified-tree or current-live-tree `bulk_sync_dir` boundary. Before
+the selected operation runs, a separately signed control collection completes the
+same bulk-sync boundary without consuming the fault. Each selected case must leave
+the local and consensus-bound status `verified`,
+create neither `install.json` nor `live_collection.backup`, reload the exact old
+live collection under the active recovery fence, redact checkpoint and ORAM root
+values, operation tokens, and signatures, and let the same operation token commit
+successfully on retry. The hardened gate
+was locally repeated five times for both targets. Run both targets with:
+
+```text
+tests/.venv/bin/pytest -q \
+  tests/consensus_tests/test_private_oram_sessions.py::test_private_oram_external_restore_retries_install_bulk_sync_enospc
+```
+
+It validates coordinator and
+install-transaction handling of a bulk-sync storage-full result; it does not
+claim that tmpfs, ext4, XFS, overlayfs, or RocksDB will surface delayed writeback
+failure identically. Real filesystem `syncfs`/`fsync` exhaustion, a crash within
+rename or `fsync`, journal replay, controller loss, and host power failure remain
+separate release gates.
+
 Status accepts the operation token only in
 `x-qdrant-private-oram-recovery-token`; query-string tokens are ignored.
 Handler-generated recovery responses carry `Cache-Control: no-store`, access
@@ -1091,7 +1395,8 @@ logs redact query and unexpected suffix values throughout the recovery
 namespace, and metrics accept only the six fixed route shapes. Abort requires
 the same owner peer and operation token, but remains available after lease
 expiry so an expired operation can be cleared. A later valid begin may take
-over an expired lease and best-effort removes superseded local staging.
+place only after the owner has explicitly aborted and removed the expired
+operation; begin never supersedes an active lease in place.
 
 Verification rechecks the checkpoint signature and current consensus binding,
 then restores the closed snapshot in isolation. It requires byte-for-byte
@@ -1105,6 +1410,13 @@ It reconstructs the full canonical owner topology and requires the signed
 layout digest exactly. The inspector does not replay WAL, repair segments,
 write defaults, or start workers. A stale layout, index state, archive,
 signature, bucket set, or lease fails closed.
+
+Verification persists both the full candidate-tree digest and private-state
+digest. Install preparation recomputes both and binds them into the durable
+marker, so replacing either tree after verification fails closed. The staged
+candidate, the actually loaded collection, and the `Loaded` state immediately
+before Commit each exact-match every HNSW/result kind, name, epoch, root, and
+writeback digest and recompute the shared canonical index-state digest.
 
 Commit uses a collection-registry tombstone while the live `Collection` is
 detached. Ordinary reads return a recovery-install lock instead of `NotFound`;
@@ -1121,6 +1433,28 @@ fails closed. On the install owner, durable local marker reconciliation must
 independently prove the old-tree rollback before the fence can be cleared. A
 lagging non-owner has no local install tree and can apply the authoritative
 transition directly.
+
+Begin, commit, and abort share one per-collection execution mutex. Begin cannot
+supersede an active lease, and abort cannot invalidate staging between collection
+detach and the Prepare consensus CAS. If a Prepared marker is written
+but the Installing CAS is not observed, Qdrant removes that exact marker and
+validates and republishes the old collection before returning the error.
+Commit and abort resolve only the exact operation-bound detached state or active
+live binding. An operation-specific validation error is never retried through an
+ordinary live collection lookup, and a call whose binding is already gone fails
+closed.
+The execution coordinator is process-local. In the supported V2-enabled cluster
+mode, the peer-identity capability retains a nonblocking exclusive `flock` on
+the identity directory for the process lifetime. A second V2-enabled process
+therefore cannot obtain the same peer identity or enter reconciliation against
+that storage until the first process exits. This is not a general storage-root
+lock for every Qdrant mode and is not a distributed recovery lock; shared
+network filesystems and processes that bypass the V2 identity capability are
+outside the supported deployment contract.
+The REST handler submits the complete commit future to the TOC runtime
+before awaiting it, so client disconnect or handler cancellation does not drop
+an in-progress install, rollback, or finalization halfway through a durable
+transition.
 
 Every prepare writes a fresh 256-bit install-attempt nonce into the durable
 marker and install-intent digest. A delayed Prepare or rollback from an earlier
@@ -1169,7 +1503,21 @@ peer identity; an archive bound to another peer is rejected unchanged.
 
 A complete external recovery set still consists of the Qdrant collection
 snapshot and signed checkpoint plus encrypted client recovery state retained
-out of band. Existing client snapshots protect position maps and stashes, but
+out of band. The operational procedure, key-custody split, exact generation
+inventory, restore sequence, loss drills, and RPO/RTO acceptance checklist are
+defined in [Private HNSW ORAM backup and recovery runbook](private-hnsw-oram-backup-recovery.md).
+For S3 storage, Qdrant hashes the local snapshot before multipart upload and
+returns that source SHA-256 in the immediate successful create/export response.
+The signed external-recovery checkpoint binds the same value, and clients must
+hash the downloaded object again before recovery. S3 list and later HEAD-derived
+snapshot descriptions remain checksumless because this value is not persisted
+as object metadata. Do not treat a later list response as an integrity proof.
+The digest-pinned MinIO process gate covers byte-for-byte object retrieval,
+checkpoint matching, restore, next-generation mutation, and deletion. It does
+not prove atomic cleanup when upload succeeds but local source deletion or the
+post-upload HEAD fails; such a failure can leave an unreported object that must
+be handled by operation-scoped inventory and retention procedures.
+Existing client snapshots protect position maps and stashes, but
 the complete recovery-state format must additionally protect the HNSW entry
 node and the local point-token mapping required by `ids_visible`. Client RK
 material, position maps, stashes, entry nodes, token maps, and encrypted
@@ -1184,8 +1532,27 @@ durable install marker, activation fence, exact Commit and rollback CAS, and
 restart reconciliation described above. Unit coverage pins marker-fsync
 ambiguity, stale-attempt rollback rejection, private-store substitution,
 delayed committed-marker resume, and load-before-cleanup ordering. The
-remaining release gate is the hard-crash/RF=1 single- and multi-shard process
-matrix plus the first proof-verified private read/writeback after restore.
+completed-commit RF=1 restart gate verifies the first private read and subsequent
+writeback with production proof and HNSW AEAD checks. The external-restore
+process matrix now aborts at `verified`, `prepared`, `old_moved`, `new_promoted`,
+`load_in_progress`, `loaded`, `post_consensus`, and `pre_finalize`, restarts the
+same peer directory and port, resumes the exact transaction, and reopens both
+private HNSW and result sessions at the checkpoint epoch/root for RF=1 same-peer
+one- and two-shard collections. A separate one- and two-shard restore/restart
+gate performs the production HNSW proof/AEAD and result commitment verification
+and commits the next writeback after archive install. The external-restore tests
+do not model power loss inside their archive or live-tree fsync/rename calls.
+The signed process ENOSPC gate above covers post-preflight archive extraction,
+while the deterministic install gate covers verified/live bulk-sync error
+handling before an install marker exists. A separate private-HNSW atomic-writer
+gate runs ext4 over `dm-flakey`, drops unacknowledged writes at
+temp-fsync/pre-rename and post-rename/pre-parent-fsync, remounts through journal
+recovery, verifies exact old-or-new bucket/Merkle/commit/current material, and
+performs the next signed writeback. Enable it only on an isolated privileged
+Linux runner with `QDRANT_RUN_PRIVATE_ORAM_DM_FLAKEY_DURABILITY=1`; it uses loop
+and device-mapper devices. Real filesystem delayed-write exhaustion and power
+loss inside the external-recovery archive/live-tree and consensus
+persistent-image writers remain release gates.
 Finally, the v2 mutable provider will use an immutable capacity manifest plus a
 monotonic owner-signed state record and one collection-wide HNSW/result
 mutation CAS. Until those process gates pass, operators should treat external
@@ -2142,6 +2509,34 @@ active private ORAM sessions or manifest/bucket upload write windows, and it
 also keeps collection/full snapshots from overlapping lifecycle operations.
 While the lifecycle operation is in flight, new private ORAM sessions/uploads
 and new collection/full snapshots fail closed.
+Snapshot archive construction is separated from publication. Collection
+archives remain under a non-listable `TempPath` while the held V1 or V2
+authority is revalidated. Full snapshot creation pins one exact sorted
+collection and alias plan under the collection lifecycle lock, prepares each
+collection archive, and consumes those private children into one self-contained
+full archive; it does not publish child snapshots. Only after every authority
+guard passes again does Qdrant publish the collection archive or the single full
+archive. A deterministic post-prepare process test mutates the retained V2 owner
+archive namespace before that revalidation and verifies that collection and
+full snapshot APIs expose no new list entry or public snapshot file and clean
+their staged files.
+For an enrolled collection, post-prepare validation first proposes a dedicated
+`PrivateOramSnapshotBarrierV2` and waits for its local applied-index receipt.
+Each barrier identity includes requester peer, a random process incarnation,
+and a checked monotonic sequence, so an earlier identical-looking no-op cannot
+satisfy the waiter. Validation after that receipt exact-matches the collection
+configuration, mutation readiness/owner archive chain, and the complete inactive
+external-recovery consensus state captured by the guard. An active recovery,
+including an expired lease that has not been explicitly aborted, always rejects
+collection and full snapshots.
+
+A three-voter staging regression pauses owner application of an
+`UpdateCollection` submitted through another peer. The remote request commits
+and returns while the owner remains locally stale; after archive preparation,
+the second barrier must remain blocked until that entry applies. The subsequent
+configuration mismatch rejects publication and leaves the public snapshot list
+unchanged. Separate process coverage fixes active-recovery rejection for both
+collection and full snapshots, explicit abort, and successful snapshot resume.
 REST and gRPC route fixtures cover both directions of this exclusion for private
 HNSW ORAM and private result ORAM session/upload APIs, collection/full snapshot
 creation with active lifecycle or active session guards, shard snapshot
@@ -3897,6 +4292,28 @@ API surface. gRPC private HNSW/result ORAM services use the same collection
 telemetry wrapper as other collection-scoped services, but the wrapper attaches
 only `collection_name` and not vector names, session ids, path labels, bucket
 ids, roots, ciphertext, client-state fields, or `*_ciphertext_sha256` aliases.
+
+The Private ORAM deterministic byte-sentinel regression gate uses
+client-AEAD-sealed HNSW nodes and
+real private-result payload blocks, rather than patterned placeholder result
+ciphertext. Its client fixture also serializes and encrypts a result ORAM
+position map and non-empty stash. Qdrant receives only the authorized SHA-256
+digest of that canonical whole encrypted client recovery backup. That digest
+is expected recovery metadata; the whole backup bytes, component client-state
+ciphertext, and component ciphertext SHA-256 remain forbidden. The gate scans raw,
+base64url, padded/unpadded base64, lower/upper hex, byte-array JSON, and decoded
+JSON forms of the vector, node/token, result payload, client RK, client-state
+stash, and complete encrypted recovery backup across live storage, shard and
+collection metadata WAL, Raft state, pre-writeback recovery snapshot, refreshed
+post-writeback snapshot, extracted snapshot files, and combined process stdout
+and stderr. It also scans non-anonymous operator `/metrics` and `/telemetry`
+responses in memory. Panic-hook log redaction, panic-report JSON serialization,
+and the exact HTTP request body handed to a loopback transport use the same
+result/client-state sentinel strings in focused unit regressions. Qdrant does
+not create a separate local panic artifact file; a
+remote telemetry-report sink, host core dump, or kernel crash artifact is not
+covered by this process gate.
+
 Client-side-only envelope collections must use `raw` or `redacted`; requesting
 `decrypted` fails closed because Qdrant has no client data key.
 The REST single-point `GET /collections/{collection}/points/{id}` endpoint has

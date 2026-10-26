@@ -10,6 +10,10 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use collection::private_oram_owner_journal::{
+    PrivateOramOwnerAcknowledgedArchiveExpectationV2,
+    PrivateOramOwnerNewGenerationReadinessExpectationV2,
+};
 use data_encoding::BASE64URL_NOPAD;
 use qdrant_sec::{
     PrivateOramOwnerCleanupSignerV1, PrivateOramOwnerEnrollmentGenesisCommitmentV1,
@@ -17,8 +21,9 @@ use qdrant_sec::{
     SignedPrivateOramOwnerReservationResolutionReceiptV1,
     decode_signed_private_oram_owner_reservation_resolution_receipt_v1,
     encode_signed_private_oram_owner_reservation_resolution_receipt_v1,
-    private_oram_mutation_protocol_capability_digest_v2,
+    prepare_private_oram_owner_enrollment_v1, private_oram_mutation_protocol_capability_digest_v2,
     private_oram_owner_cleanup_signer_from_peer_key_v1,
+    private_oram_owner_lifecycle_genesis_state_v1,
     validate_self_consistent_signed_private_oram_owner_reservation_resolution_receipt_v1,
 };
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -52,8 +57,9 @@ use super::{
     acknowledge_private_oram_mutation_clear_v2, active_admitted, applied_operation_digest_v2,
     apply_private_oram_mutation_admission_v2, apply_private_oram_mutation_cleanup_witness_v2,
     apply_private_oram_mutation_clear_pending_v2, apply_private_oram_mutation_clear_v2,
-    apply_private_oram_mutation_parent_progress_v2, locator_is_at_or_after,
-    locator_is_strictly_after, private_oram_mutation_admission_request_digest_v2,
+    apply_private_oram_mutation_parent_progress_v2, clear_resolution_digest_v2,
+    cleared_state_digest_v2, locator_is_at_or_after, locator_is_strictly_after,
+    private_oram_mutation_admission_request_digest_v2,
     private_oram_mutation_cleanup_lifecycle_genesis_v2, private_oram_mutation_lease_slot_digest_v2,
     private_oram_mutation_lease_state_digest_v2, validate_apply_locator_v2,
     validate_cleared_state_v2, validate_digest, validate_lease_slot_v2, validate_lease_v2,
@@ -1375,6 +1381,94 @@ impl PrivateOramMutationConsensusAggregateV2 {
         &self.outstanding_gc_obligations
     }
 
+    pub(crate) fn owner_new_generation_readiness_expectation(
+        &self,
+        collection_id: &str,
+        owner_peer_id: u64,
+    ) -> Result<PrivateOramOwnerNewGenerationReadinessExpectationV2, PrivateOramMutationJournalError>
+    {
+        validate_aggregate_v2(self)?;
+        if owner_peer_id == 0
+            || private_oram_collection_id_digest_v2(collection_id)?
+                != self.activation.authority_key.collection_key_digest
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let mut checkpoints = self
+            .owner_checkpoint_table
+            .checkpoints()
+            .iter()
+            .filter(|checkpoint| checkpoint.owner_peer_id() == owner_peer_id);
+        let checkpoint = checkpoints
+            .next()
+            .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+        if checkpoints.next().is_some() {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        }
+        let expected = self.acknowledged_owner_archive_expectations(owner_peer_id)?;
+        PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+            collection_id.to_string(),
+            checkpoint.owner_store_incarnation_digest().to_string(),
+            self.aggregate_digest.clone(),
+            expected,
+        )
+        .map_err(|_| PrivateOramMutationJournalError::Corrupt)
+    }
+
+    pub(crate) fn acknowledged_owner_archive_expectations(
+        &self,
+        owner_peer_id: u64,
+    ) -> Result<
+        Vec<PrivateOramOwnerAcknowledgedArchiveExpectationV2>,
+        PrivateOramMutationJournalError,
+    > {
+        validate_aggregate_v2(self)?;
+        if owner_peer_id == 0 {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let mut expected = std::collections::BTreeMap::new();
+        let mut retain = |cleared: &PrivateOramMutationClearedStateV2| {
+            if !matches!(
+                cleared.resolution,
+                PrivateOramMutationClearResolutionV2::Acknowledged(_)
+            ) || cleared.owner_peer_id != owner_peer_id
+            {
+                return Err(PrivateOramMutationJournalError::InvalidTransition);
+            }
+            let mut pending = cleared.clone();
+            pending.resolution = PrivateOramMutationClearResolutionV2::Pending;
+            pending.resolution_digest = clear_resolution_digest_v2(&pending)?;
+            pending.tombstone_digest = cleared_state_digest_v2(&pending)?;
+            validate_cleared_state_v2(&pending)?;
+            let archive = PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                cleared.generation,
+                cleared.owner_peer_id,
+                cleared.terminal_record_digest.clone(),
+                pending.tombstone_digest,
+                cleared.clear_receipt_digest.clone(),
+            )
+            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+            if let Some(existing) = expected.insert(cleared.generation, archive.clone())
+                && existing != archive
+            {
+                return Err(PrivateOramMutationJournalError::Corrupt);
+            }
+            Ok(())
+        };
+        for obligation in &self.outstanding_gc_obligations {
+            retain(&obligation.acknowledged_tombstone)?;
+        }
+        if let Some(cleared) = self.lifecycle.last_cleared.as_ref()
+            && matches!(
+                cleared.resolution,
+                PrivateOramMutationClearResolutionV2::Acknowledged(_)
+            )
+        {
+            retain(cleared)?;
+        }
+        Ok(expected.into_values().collect())
+    }
+
     pub(crate) fn rejected_admissions(&self) -> &[PrivateOramMutationRejectedAdmissionV2] {
         &self.rejected_admissions
     }
@@ -1536,6 +1630,93 @@ impl PrivateOramMutationConsensusAggregateV2 {
             .map(|cleared| cleared.clear_core_digest.as_str())
             .ok_or(PrivateOramMutationJournalError::InvalidTransition)
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PrivateOramMutationOwnerEnrollmentPlanV2 {
+    Missing(PrivateOramOwnerEnrollmentPreparedV1),
+    Pending(PrivateOramOwnerEnrollmentPreparedV1),
+    Active,
+}
+
+pub(crate) fn private_oram_mutation_owner_enrollment_plan_v2(
+    current: &PrivateOramMutationAuthorityStateV2,
+    collection_id: &str,
+    owner_peer_id: u64,
+    owner_signer: PrivateOramOwnerCleanupSignerV1,
+    owner_store_incarnation_digest: String,
+    owner_enrollment_id: String,
+    authority_registry_digest: String,
+    owner_registry_digest: String,
+    enrollment_operation_id: String,
+) -> Result<PrivateOramMutationOwnerEnrollmentPlanV2, PrivateOramMutationJournalError> {
+    let aggregate = require_aggregate_v2(current)?;
+    let expected_genesis_state =
+        private_oram_owner_lifecycle_genesis_state_v1(owner_store_incarnation_digest.clone())
+            .map_err(|_| PrivateOramMutationJournalError::InvalidInput("owner_lifecycle"))?;
+    let membership_epoch = aggregate
+        .owner_checkpoint_table
+        .roster_membership_epoch()
+        .unwrap_or(aggregate.activation.activation_applied.index);
+    let prepared = prepare_private_oram_owner_enrollment_v1(PrivateOramOwnerEnrollmentPreparedV1 {
+        version: 0,
+        consensus_history_id_digest: aggregate
+            .activation
+            .authority_key
+            .consensus_history_id_digest
+            .clone(),
+        raft_group_id_digest: aggregate
+            .activation
+            .authority_key
+            .raft_group_id_digest
+            .clone(),
+        collection_id: collection_id.to_string(),
+        collection_lifetime_id_digest: aggregate
+            .activation
+            .authority_key
+            .collection_lifetime_id_digest
+            .clone(),
+        collection_incarnation_digest: aggregate.activation.collection_incarnation_digest.clone(),
+        activation_anchor_digest: aggregate.activation.anchor_digest.clone(),
+        capability_epoch: aggregate.activation.compatibility_epoch,
+        protocol_capability_digest: private_oram_mutation_protocol_capability_digest_v2(),
+        membership_epoch,
+        owner_enrollment_id,
+        owner_peer_id,
+        owner_signer,
+        owner_store_incarnation_digest,
+        expected_genesis_state: expected_genesis_state.clone(),
+        authority_registry_digest,
+        owner_registry_digest,
+        enrollment_operation_id,
+        prepared_record_digest: String::new(),
+    })
+    .map_err(|_| PrivateOramMutationJournalError::InvalidInput("owner_enrollment"))?;
+
+    if let Some(checkpoint) = aggregate
+        .owner_checkpoint_table
+        .checkpoint_for_owner(owner_peer_id)
+    {
+        if checkpoint.owner_enrollment_id() != prepared.owner_enrollment_id
+            || checkpoint.owner_signer() != &prepared.owner_signer
+            || checkpoint.owner_store_incarnation_digest()
+                != prepared.owner_store_incarnation_digest
+            || checkpoint.lifecycle_state() != &expected_genesis_state
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        return Ok(PrivateOramMutationOwnerEnrollmentPlanV2::Active);
+    }
+    if let Some(pending) = aggregate
+        .owner_checkpoint_table
+        .pending_enrollment_for_owner(owner_peer_id)
+    {
+        if pending != &prepared {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        return Ok(PrivateOramMutationOwnerEnrollmentPlanV2::Pending(prepared));
+    }
+    Ok(PrivateOramMutationOwnerEnrollmentPlanV2::Missing(prepared))
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -7443,6 +7624,112 @@ mod wire_tests {
         )
         .unwrap();
         assert_eq!(retried, enrolled);
+    }
+
+    #[test]
+    fn owner_enrollment_planner_is_deterministic_and_resumes_pending_then_active() {
+        let owner_key = Ed25519KeyPair::from_seed_unchecked(&[61; 32]).unwrap();
+        let owner_signer = private_oram_owner_cleanup_signer_v1(&owner_key, 3).unwrap();
+        let activated = activated_authority();
+        let plan = || {
+            private_oram_mutation_owner_enrollment_plan_v2(
+                &activated,
+                "collection-a",
+                11,
+                owner_signer.clone(),
+                digest(62),
+                digest(63),
+                digest(64),
+                digest(65),
+                digest(66),
+            )
+        };
+        let PrivateOramMutationOwnerEnrollmentPlanV2::Missing(prepared) = plan().unwrap() else {
+            panic!("fresh authority must require owner enrollment prepare");
+        };
+        let PrivateOramMutationOwnerEnrollmentPlanV2::Missing(repeated) = plan().unwrap() else {
+            panic!("unchanged authority must retain the deterministic prepare plan");
+        };
+        assert_eq!(prepared, repeated);
+        assert_eq!(prepared.membership_epoch, 10);
+
+        let prepare_context = private_oram_mutation_aggregate_apply_context_for_test(
+            &activated,
+            PrivateOramMutationMaterialOperationV2::OwnerEnrollmentPrepared,
+            prepared.prepared_record_digest.clone(),
+            1,
+            11,
+        )
+        .unwrap();
+        let pending = apply_private_oram_mutation_authority_owner_enrollment_prepared_v2(
+            &activated,
+            prepared.clone(),
+            prepare_context,
+        )
+        .unwrap();
+        assert!(matches!(
+            private_oram_mutation_owner_enrollment_plan_v2(
+                &pending,
+                "collection-a",
+                11,
+                owner_signer.clone(),
+                digest(62),
+                digest(63),
+                digest(64),
+                digest(65),
+                digest(66),
+            )
+            .unwrap(),
+            PrivateOramMutationOwnerEnrollmentPlanV2::Pending(ref retained)
+                if retained == &prepared
+        ));
+
+        let commitment =
+            sign_private_oram_owner_enrollment_genesis_commitment_v1(&owner_key, &prepared)
+                .unwrap();
+        let activate_context = private_oram_mutation_aggregate_apply_context_for_test(
+            &pending,
+            PrivateOramMutationMaterialOperationV2::OwnerEnrollmentActivated,
+            commitment.commitment_digest.clone(),
+            1,
+            12,
+        )
+        .unwrap();
+        let active = apply_private_oram_mutation_authority_owner_enrollment_activated_v2(
+            &pending,
+            commitment,
+            activate_context,
+        )
+        .unwrap();
+        assert!(matches!(
+            private_oram_mutation_owner_enrollment_plan_v2(
+                &active,
+                "collection-a",
+                11,
+                owner_signer.clone(),
+                digest(62),
+                digest(63),
+                digest(64),
+                digest(65),
+                digest(66),
+            )
+            .unwrap(),
+            PrivateOramMutationOwnerEnrollmentPlanV2::Active
+        ));
+        assert!(
+            private_oram_mutation_owner_enrollment_plan_v2(
+                &active,
+                "collection-a",
+                11,
+                owner_signer,
+                digest(99),
+                digest(63),
+                digest(64),
+                digest(65),
+                digest(66),
+            )
+            .is_err()
+        );
     }
 
     #[test]

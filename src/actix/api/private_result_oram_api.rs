@@ -475,6 +475,7 @@ pub fn config_private_result_oram_api(cfg: &mut web::ServiceConfig) {
 mod private_result_oram_rest_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use actix_web::http::StatusCode;
     use actix_web::{App, test as actix_test, web};
@@ -3221,7 +3222,7 @@ mod private_result_oram_rest_tests {
             );
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 COLLECTION_NAME,
             )

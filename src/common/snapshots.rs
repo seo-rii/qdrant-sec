@@ -30,11 +30,34 @@ use super::private_hnsw::{
     PrivateHnswCollectionSnapshotGuard, begin_private_hnsw_collection_lifecycle,
     begin_private_hnsw_collection_snapshot,
 };
+use super::private_oram_mutation_session::acquire_private_oram_mutation_snapshot_guard_v2;
 use super::private_result_oram::{
     PrivateResultOramCollectionSnapshotGuard, begin_private_result_oram_collection_lifecycle,
     begin_private_result_oram_collection_snapshot,
 };
 use crate::settings::Settings;
+
+#[cfg(debug_assertions)]
+const PRIVATE_ORAM_SNAPSHOT_POST_PREPARE_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_SNAPSHOT_POST_PREPARE_PAUSE_FILE";
+
+#[cfg(debug_assertions)]
+pub(crate) async fn private_oram_snapshot_pause_after_prepare(scope: &str) {
+    let Some(pause_file) = std::env::var_os(PRIVATE_ORAM_SNAPSHOT_POST_PREPARE_PAUSE_FILE_ENV)
+    else {
+        return;
+    };
+    if pause_file.is_empty() {
+        return;
+    }
+    log::warn!("Private ORAM staging {scope} snapshot post-prepare pause reached");
+    while std::path::Path::new(&pause_file).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) async fn private_oram_snapshot_pause_after_prepare(_scope: &str) {}
 
 pub fn validate_snapshot_url_api_key_policy(
     url: &Url,
@@ -173,12 +196,32 @@ pub async fn do_create_full_snapshot(
         auth.check_global_access(AccessRequirements::new().manage(), "create_full_snapshot")?;
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(&auth, &pass).clone();
+    let _collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
 
-    let mut private_hnsw_snapshot_guards = Vec::new();
-    let mut private_result_snapshot_guards = Vec::new();
-    for collection_pass in toc.multipass_into_collections(&collections_pass).await {
+    let collection_passes = toc.multipass_into_collections(&collections_pass).await;
+    let mut collections = Vec::new();
+    for collection_pass in &collection_passes {
         let collection = toc.get_collection(&collection_pass).await?;
         let config = collection.config_snapshot().await;
+        collections.push((collection, config));
+    }
+    collections.sort_by(|(left, _), (right, _)| left.name().cmp(right.name()));
+
+    let mut private_oram_mutation_snapshot_guards = Vec::new();
+    for (collection, config) in &collections {
+        if let Some(snapshot_guard) = acquire_private_oram_mutation_snapshot_guard_v2(
+            dispatcher,
+            Arc::clone(collection),
+            config,
+        )
+        .await?
+        {
+            private_oram_mutation_snapshot_guards.push(snapshot_guard);
+        }
+    }
+    let mut private_hnsw_snapshot_guards = Vec::new();
+    let mut private_result_snapshot_guards = Vec::new();
+    for (collection, config) in &collections {
         if let Some(snapshot_guard) =
             begin_private_hnsw_collection_snapshot(collection.name(), &config)?
         {
@@ -191,10 +234,37 @@ pub async fn do_create_full_snapshot(
         }
     }
 
-    let snapshot = snapshots::do_create_full_snapshot(dispatcher, auth).await;
+    let mut alias_mapping = std::collections::HashMap::new();
+    for collection_pass in &collection_passes {
+        for alias in toc
+            .all_collection_aliases(collection_pass.name(), &collections_pass)
+            .await
+        {
+            alias_mapping.insert(alias, collection_pass.name().to_string());
+        }
+    }
+    let plan = snapshots::FullSnapshotPlan::new(
+        collections
+            .iter()
+            .map(|(collection, _)| Arc::clone(collection))
+            .collect(),
+        alias_mapping,
+    )?;
+    let prepared = snapshots::prepare_full_snapshot(&toc, plan).await?;
+    private_oram_snapshot_pause_after_prepare("full").await;
+    if !private_oram_mutation_snapshot_guards.is_empty() {
+        dispatcher
+            .linearizable_private_oram_snapshot_barrier(None)
+            .await?;
+    }
+    for guard in &private_oram_mutation_snapshot_guards {
+        guard.validate_held(dispatcher).await?;
+    }
+    let snapshot = snapshots::publish_full_snapshot(&toc, prepared).await?;
     drop(private_result_snapshot_guards);
     drop(private_hnsw_snapshot_guards);
-    snapshot
+    drop(private_oram_mutation_snapshot_guards);
+    Ok(snapshot)
 }
 
 /// # Cancel safety

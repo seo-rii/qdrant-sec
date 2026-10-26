@@ -119,6 +119,26 @@ async fn _test_snapshot_collection(node_type: NodeType) {
     .unwrap();
 
     let snapshots_temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    let prepared_snapshot = collection
+        .prepare_snapshot(snapshots_temp_dir.path(), 0)
+        .await
+        .unwrap();
+    let prepared_archive_path = prepared_snapshot.archive_path().to_path_buf();
+    let prepared_public_path = snapshots_path.path().join(prepared_snapshot.name());
+    let (prepared_size, prepared_checksum) = prepared_snapshot.size_and_checksum().await.unwrap();
+    assert!(prepared_size > 0);
+    assert_eq!(prepared_checksum.len(), 64);
+    assert!(prepared_archive_path.is_file());
+    assert!(!prepared_public_path.exists());
+    assert!(
+        std::fs::read_dir(snapshots_path.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    drop(prepared_snapshot);
+    assert!(!prepared_archive_path.exists());
+
     let snapshot_description = collection
         .create_snapshot(snapshots_temp_dir.path(), 0)
         .await

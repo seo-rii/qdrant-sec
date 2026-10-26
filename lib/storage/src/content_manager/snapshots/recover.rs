@@ -15,6 +15,10 @@ use collection::operations::snapshot_ops::{SnapshotPriority, SnapshotRecover};
 use collection::operations::types::CollectionError;
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::private_hnsw_oram_store::PRIVATE_HNSW_ORAM_DIR;
+use collection::private_oram_owner_journal::{
+    PRIVATE_ORAM_OWNER_JOURNAL_DIR, PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+    PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+};
 use collection::private_result_oram_store::PRIVATE_RESULT_ORAM_DIR;
 use collection::shards::check_shard_path;
 use collection::shards::replica_set::replica_set_state::{
@@ -144,6 +148,73 @@ pub fn verify_private_oram_external_recovery_snapshot(
 
 fn invalid_private_oram_external_recovery_snapshot() -> StorageError {
     StorageError::bad_input("private ORAM external recovery snapshot preflight failed")
+}
+
+const ORDINARY_PRIVATE_ORAM_V2_RECOVERY_REJECTION: &str = "snapshot contains distributed private ORAM V2 owner/parent state; ordinary snapshot recovery is forbidden; use consensus-qualified private ORAM external recovery";
+
+/// Rejects V2 owner/parent state on recovery paths that cannot bind it to consensus authority.
+///
+/// This must run after unpacking into an isolated temporary directory and before any collection,
+/// replica, or persisted startup state is replaced. External recovery intentionally does not call
+/// this boundary because it verifies the consensus-qualified checkpoint and owner authority.
+pub fn reject_ordinary_private_oram_v2_snapshot_recovery(
+    collection_path: &Path,
+) -> Result<(), StorageError> {
+    if snapshot_entry_exists(&collection_path.join(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2))? {
+        return Err(StorageError::bad_input(
+            ORDINARY_PRIVATE_ORAM_V2_RECOVERY_REJECTION,
+        ));
+    }
+
+    let hnsw_root = collection_path.join(PRIVATE_HNSW_ORAM_DIR);
+    let hnsw_root_metadata = match std::fs::symlink_metadata(&hnsw_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => metadata,
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(private_oram_v2_boundary_inspection_failed()),
+    };
+    debug_assert!(hnsw_root_metadata.file_type().is_dir());
+
+    let vector_entries =
+        std::fs::read_dir(&hnsw_root).map_err(|_| private_oram_v2_boundary_inspection_failed())?;
+    for vector_entry in vector_entries {
+        let vector_entry =
+            vector_entry.map_err(|_| private_oram_v2_boundary_inspection_failed())?;
+        let file_type = vector_entry
+            .file_type()
+            .map_err(|_| private_oram_v2_boundary_inspection_failed())?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+
+        let owner_temp = vector_entry.path().join("temp");
+        for owner_root in [
+            PRIVATE_ORAM_OWNER_JOURNAL_DIR,
+            PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+        ] {
+            if snapshot_entry_exists(&owner_temp.join(owner_root))? {
+                return Err(StorageError::bad_input(
+                    ORDINARY_PRIVATE_ORAM_V2_RECOVERY_REJECTION,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn snapshot_entry_exists(path: &Path) -> Result<bool, StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(private_oram_v2_boundary_inspection_failed()),
+    }
+}
+
+fn private_oram_v2_boundary_inspection_failed() -> StorageError {
+    StorageError::bad_input(
+        "ordinary snapshot recovery could not verify absence of distributed private ORAM V2 owner/parent state",
+    )
 }
 
 pub async fn activate_shard(
@@ -299,6 +370,7 @@ async fn _do_recover_from_snapshot(
 
     let snapshot_config = CollectionConfigInternal::load(tmp_collection_dir.path())?;
     snapshot_config.validate_and_warn();
+    reject_ordinary_private_oram_v2_snapshot_recovery(tmp_collection_dir.path())?;
     validate_private_oram_snapshot_restore_layouts(
         collection_pass.name(),
         &snapshot_config,
@@ -627,6 +699,8 @@ fn validate_private_oram_snapshot_restore_layouts(
     snapshot_config: &CollectionConfigInternal,
     collection_path: &std::path::Path,
 ) -> Result<(), StorageError> {
+    Collection::validate_private_oram_mutation_journal_snapshot_restore_layout(collection_path)
+        .map_err(StorageError::from)?;
     Collection::validate_private_hnsw_oram_snapshot_restore_layout(
         collection_name,
         snapshot_config,
@@ -862,11 +936,16 @@ mod tests {
     use collection::operations::types::CollectionError;
     use collection::optimizers_builder::OptimizersConfig;
     use collection::private_hnsw_oram_store::PRIVATE_HNSW_ORAM_DIR;
+    use collection::private_oram_owner_journal::{
+        PRIVATE_ORAM_OWNER_JOURNAL_DIR, PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+        PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+    };
     use collection::private_result_oram_store::PRIVATE_RESULT_ORAM_DIR;
     use segment::types::HnswConfig;
     use uuid::Uuid;
 
     use super::{
+        reject_ordinary_private_oram_v2_snapshot_recovery,
         reject_private_oram_replica_priority_snapshot_recovery_until_supported,
         sanitize_private_hnsw_snapshot_layout_error,
         sanitize_private_result_oram_snapshot_layout_error,
@@ -908,6 +987,74 @@ mod tests {
             max_optimization_threads: Some(0),
             prevent_unoptimized: None,
         }
+    }
+
+    #[test]
+    fn ordinary_collection_snapshot_recovery_rejects_private_oram_v2_parent_state() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-oram-v2-parent-ordinary-recovery")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir(temp_dir.path().join(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2)).unwrap();
+
+        let err = reject_ordinary_private_oram_v2_snapshot_recovery(temp_dir.path())
+            .expect_err("ordinary recovery must reject V2 parent state");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("ordinary snapshot recovery is forbidden"));
+        assert!(rendered.contains("consensus-qualified private ORAM external recovery"));
+        assert!(!rendered.contains(temp_dir.path().to_string_lossy().as_ref()));
+        assert!(!rendered.contains(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2));
+    }
+
+    #[test]
+    fn ordinary_collection_snapshot_recovery_rejects_private_oram_v2_owner_state() {
+        for owner_root in [
+            PRIVATE_ORAM_OWNER_JOURNAL_DIR,
+            PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+        ] {
+            let temp_dir = tempfile::Builder::new()
+                .prefix("private-oram-v2-owner-ordinary-recovery")
+                .tempdir()
+                .unwrap();
+            std::fs::create_dir_all(
+                temp_dir
+                    .path()
+                    .join(PRIVATE_HNSW_ORAM_DIR)
+                    .join("text")
+                    .join("temp")
+                    .join(owner_root),
+            )
+            .unwrap();
+
+            let err = reject_ordinary_private_oram_v2_snapshot_recovery(temp_dir.path())
+                .expect_err("ordinary recovery must reject V2 owner state");
+            let rendered = err.to_string();
+
+            assert!(rendered.contains("ordinary snapshot recovery is forbidden"));
+            assert!(rendered.contains("consensus-qualified private ORAM external recovery"));
+            assert!(!rendered.contains(temp_dir.path().to_string_lossy().as_ref()));
+            assert!(!rendered.contains(owner_root));
+        }
+    }
+
+    #[test]
+    fn ordinary_collection_snapshot_recovery_allows_private_oram_without_v2_state() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-oram-no-v2-ordinary-recovery")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir_all(
+            temp_dir
+                .path()
+                .join(PRIVATE_HNSW_ORAM_DIR)
+                .join("text")
+                .join("temp"),
+        )
+        .unwrap();
+
+        reject_ordinary_private_oram_v2_snapshot_recovery(temp_dir.path())
+            .expect("ordinary recovery boundary must allow snapshots without V2 state");
     }
 
     #[test]

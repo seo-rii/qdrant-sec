@@ -27,6 +27,74 @@ use validator::{Validate, ValidationError};
 pub type PeerAddressById = HashMap<PeerId, Uri>;
 pub type PeerMetadataById = HashMap<PeerId, PeerMetadata>;
 
+pub const PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES: u64 = 1 << 40;
+
+const fn default_private_oram_external_recovery_max_snapshot_bytes() -> u64 {
+    PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
+}
+
+const fn default_private_oram_external_recovery_max_total_staged_bytes() -> u64 {
+    2 * PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
+}
+
+const fn default_private_oram_external_recovery_max_unpacked_bytes() -> u64 {
+    PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
+}
+
+const fn default_private_oram_external_recovery_min_free_space_bytes() -> u64 {
+    1 << 30
+}
+
+fn default_private_oram_external_recovery_max_concurrent_verify_prepare() -> NonZeroUsize {
+    NonZeroUsize::new(1).expect("one is non-zero")
+}
+
+#[derive(Clone, Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_private_oram_external_recovery_config"))]
+pub struct PrivateOramExternalRecoveryConfig {
+    #[serde(default = "default_private_oram_external_recovery_max_snapshot_bytes")]
+    #[validate(range(min = 1_u64, max = 1_099_511_627_776_u64))]
+    pub max_snapshot_bytes: u64,
+    #[serde(default = "default_private_oram_external_recovery_max_total_staged_bytes")]
+    #[validate(range(min = 1))]
+    pub max_total_staged_bytes: u64,
+    #[serde(default = "default_private_oram_external_recovery_max_unpacked_bytes")]
+    #[validate(range(min = 1))]
+    pub max_unpacked_bytes: u64,
+    #[serde(default = "default_private_oram_external_recovery_min_free_space_bytes")]
+    pub min_free_space_bytes: u64,
+    #[serde(default = "default_private_oram_external_recovery_max_concurrent_verify_prepare")]
+    pub max_concurrent_verify_prepare: NonZeroUsize,
+}
+
+fn validate_private_oram_external_recovery_config(
+    config: &PrivateOramExternalRecoveryConfig,
+) -> Result<(), ValidationError> {
+    let minimum_reservation = config
+        .max_unpacked_bytes
+        .checked_add(1)
+        .ok_or_else(|| ValidationError::new("private_oram_external_recovery_limits"))?;
+    if config.max_total_staged_bytes < minimum_reservation {
+        return Err(ValidationError::new(
+            "private_oram_external_recovery_limits",
+        ));
+    }
+    Ok(())
+}
+
+impl Default for PrivateOramExternalRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_snapshot_bytes: default_private_oram_external_recovery_max_snapshot_bytes(),
+            max_total_staged_bytes: default_private_oram_external_recovery_max_total_staged_bytes(),
+            max_unpacked_bytes: default_private_oram_external_recovery_max_unpacked_bytes(),
+            min_free_space_bytes: default_private_oram_external_recovery_min_free_space_bytes(),
+            max_concurrent_verify_prepare:
+                default_private_oram_external_recovery_max_concurrent_verify_prepare(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Validate)]
 pub struct PerformanceConfig {
     pub max_search_threads: usize,
@@ -72,6 +140,9 @@ pub struct StorageConfig {
     pub snapshots_path: PathBuf,
     #[serde(default)]
     pub snapshots_config: SnapshotsConfig,
+    #[serde(default)]
+    #[validate(nested)]
+    pub private_oram_external_recovery: PrivateOramExternalRecoveryConfig,
     #[validate(custom(function = validate_path))]
     #[serde(default)]
     pub temp_path: Option<PathBuf>,
@@ -255,4 +326,33 @@ pub enum ConsensusThreadStatus {
     Working { last_update: DateTime<Utc> },
     Stopped,
     StoppedWithErr { err: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_oram_external_recovery_config_requires_one_possible_reservation() {
+        let valid = PrivateOramExternalRecoveryConfig {
+            max_total_staged_bytes: 2,
+            max_unpacked_bytes: 1,
+            ..Default::default()
+        };
+        assert!(validator::Validate::validate(&valid).is_ok());
+
+        let impossible = PrivateOramExternalRecoveryConfig {
+            max_total_staged_bytes: 1,
+            max_unpacked_bytes: 1,
+            ..Default::default()
+        };
+        assert!(validator::Validate::validate(&impossible).is_err());
+
+        let overflowing = PrivateOramExternalRecoveryConfig {
+            max_total_staged_bytes: u64::MAX,
+            max_unpacked_bytes: u64::MAX,
+            ..Default::default()
+        };
+        assert!(validator::Validate::validate(&overflowing).is_err());
+    }
 }

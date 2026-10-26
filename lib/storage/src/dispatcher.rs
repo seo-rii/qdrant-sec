@@ -17,6 +17,9 @@ use collection::operations::verification::VerificationPass;
 use collection::private_hnsw_oram_store::{
     PrivateHnswOramConsensusWriteback, PrivateHnswOramWritebackBatch,
 };
+use collection::private_oram_owner_journal::{
+    PrivateOramOwnerArchivedGenerationV1, PrivateOramOwnerNewGenerationReadinessExpectationV2,
+};
 use collection::private_result_oram_store::{
     PrivateResultOramConsensusWriteback, PrivateResultOramWritebackBatch,
 };
@@ -30,31 +33,39 @@ use data_encoding::BASE64URL_NOPAD;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
+use qdrant_sec::{
+    PrivateOramOwnerCleanupSignerV1, PrivateOramOwnerEnrollmentGenesisCommitmentV1,
+    PrivateOramOwnerEnrollmentPreparedV1,
+};
 use segment::types::ShardKey;
 
 use crate::content_manager::collection_meta_ops::AliasOperations;
-use crate::content_manager::consensus_manager::ConsensusProposalOutcome;
+use crate::content_manager::consensus_manager::{
+    ConsensusProposalOutcome, PrivateOramOwnerEnrollmentPlanV2,
+};
 use crate::content_manager::consensus_ops::{
     CompareAndSwapPrivateOramEpoch, CompareAndSwapPrivateOramLayout,
-    CompareAndSwapPrivateOramSessionLease, InitializePrivateOramMutationState,
-    PrivateOramCollectionLayoutTransition, PrivateOramConsensusCollectionStateV2,
-    PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramEpochKey,
-    PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryOperation,
-    PrivateOramExternalRecoveryState, PrivateOramIndexKind, PrivateOramLayoutIndexStateBinding,
-    PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding, PrivateOramMutationKey,
-    PrivateOramMutationLease, PrivateOramMutationLeaseSlotV2,
-    PrivateOramReshardingLayoutTransition, PrivateOramReshardingOperation, PrivateOramSessionLease,
-    PrivateOramShardKeyLayoutChange, PrivateOramShardKeyLayoutChangeKind,
-    PrivateOramShardLayoutEntry, PrivateOramShardTransferStart,
-    canonical_private_oram_index_state_digest,
+    CompareAndSwapPrivateOramSessionLease, EnrollPrivateOramMutationStateV2,
+    InitializePrivateOramMutationState, PrivateOramCollectionLayoutTransition,
+    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusEpoch, PrivateOramConsensusLayout,
+    PrivateOramConsensusTransitionV2, PrivateOramEpochKey, PrivateOramExternalRecoveryKey,
+    PrivateOramExternalRecoveryOperation, PrivateOramExternalRecoveryState, PrivateOramIndexKind,
+    PrivateOramLayoutIndexStateBinding, PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding,
+    PrivateOramMutationKey, PrivateOramMutationLease, PrivateOramMutationLeasePhase,
+    PrivateOramMutationLeaseSlotV2, PrivateOramReshardingLayoutTransition,
+    PrivateOramReshardingOperation, PrivateOramSessionLease, PrivateOramShardKeyLayoutChange,
+    PrivateOramShardKeyLayoutChangeKind, PrivateOramShardLayoutEntry,
+    PrivateOramShardTransferStart, canonical_private_oram_consensus_state_record_digest,
+    canonical_private_oram_index_state_digest, canonical_private_oram_mutation_receipt_digest,
     canonical_private_oram_resharding_post_layout_digest,
     canonical_private_oram_shard_layout_digest,
     canonical_private_oram_shard_transfer_post_layout_digest,
     private_oram_shard_key_post_layout_entries,
 };
 use crate::content_manager::private_oram_mutation_journal::{
-    PrivateOramMutationAdmissionPlanV2, PrivateOramMutationAllOwnersPrestagedV2,
-    PrivateOramMutationClearPendingProposalV2, PrivateOramMutationNeedCleanupWitnessV2,
+    PrivateOramArchivedParentReadyV2, PrivateOramMutationAdmissionPlanV2,
+    PrivateOramMutationAllOwnersPrestagedV2, PrivateOramMutationClearPendingProposalV2,
+    PrivateOramMutationLocalArchiveReadyV2, PrivateOramMutationNeedCleanupWitnessV2,
     PrivateOramMutationNeedClearV2, PrivateOramMutationNeedParentProgressV2,
     PrivateOramMutationRecoveryReadinessProposalV2,
     encode_private_oram_mutation_admission_recovery_manifest_v2,
@@ -122,6 +133,30 @@ pub struct Dispatcher {
 
 const PRIVATE_ORAM_LIVE_ADMISSION_MAX_RECORDS: usize = 1_024;
 const PRIVATE_ORAM_LIVE_ADMISSION_MAX_LEASE_SECS: u64 = 600;
+const PRIVATE_ORAM_COMMIT_PROJECTION_POLL_ATTEMPTS: usize = 40;
+const PRIVATE_ORAM_COMMIT_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(debug_assertions)]
+const PRIVATE_ORAM_MUTATION_PRE_COMMIT_PROJECTION_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_PRE_COMMIT_PROJECTION_PAUSE_FILE";
+
+#[cfg(debug_assertions)]
+async fn private_oram_mutation_pause_before_commit_projection_v2() {
+    let Some(pause_file) =
+        std::env::var_os(PRIVATE_ORAM_MUTATION_PRE_COMMIT_PROJECTION_PAUSE_FILE_ENV)
+    else {
+        return;
+    };
+    if pause_file.is_empty() {
+        return;
+    }
+    log::warn!("Private ORAM staging mutation commit pre-projection pause reached");
+    while std::path::Path::new(&pause_file).exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn private_oram_mutation_pause_before_commit_projection_v2() {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrivateOramLiveAdmissionRecordPhaseV2 {
@@ -689,8 +724,6 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Proposes the enrollment of a collection into mutation V2 on an active V2 cluster. A
-    /// re-proposal of the genesis state that is already enrolled applies as a no-op.
     pub async fn submit_private_oram_mutation_enroll_v2(
         &self,
         operation: InitializePrivateOramMutationState,
@@ -710,6 +743,112 @@ impl Dispatcher {
         if !applied {
             return Err(StorageError::service_error(
                 "private ORAM mutation V2 enrollment was not applied",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn submit_private_oram_mutation_genesis_enrollment_v2(
+        &self,
+        operation: EnrollPrivateOramMutationStateV2,
+        wait_timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error(
+                "private ORAM mutation genesis enrollment requires distributed mode",
+            )
+        })?;
+        let applied = consensus_state
+            .propose_consensus_op_with_await(
+                ConsensusOperations::EnrollPrivateOramMutationStateV2(operation),
+                wait_timeout,
+            )
+            .await?;
+        if !applied {
+            return Err(StorageError::service_error(
+                "private ORAM mutation genesis enrollment was not applied",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn linearizable_private_oram_snapshot_barrier(
+        &self,
+        wait_timeout: Option<Duration>,
+    ) -> Result<Option<u64>, StorageError> {
+        let Some(consensus_state) = self.consensus_state.as_ref() else {
+            return Ok(None);
+        };
+        consensus_state
+            .linearizable_private_oram_snapshot_barrier(wait_timeout)
+            .await
+            .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn private_oram_mutation_v2_owner_enrollment_plan(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: PeerId,
+        owner_signer: PrivateOramOwnerCleanupSignerV1,
+        owner_store_incarnation_digest: String,
+        owner_enrollment_id: String,
+        authority_registry_digest: String,
+        owner_registry_digest: String,
+        enrollment_operation_id: String,
+    ) -> Result<PrivateOramOwnerEnrollmentPlanV2, StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error("private ORAM owner enrollment requires distributed mode")
+        })?;
+        consensus_state.private_oram_mutation_v2_owner_enrollment_plan(
+            key,
+            owner_peer_id,
+            owner_signer,
+            owner_store_incarnation_digest,
+            owner_enrollment_id,
+            authority_registry_digest,
+            owner_registry_digest,
+            enrollment_operation_id,
+        )
+    }
+
+    pub async fn submit_private_oram_owner_enrollment_prepared_v2(
+        &self,
+        prepared: &PrivateOramOwnerEnrollmentPreparedV1,
+        wait_timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error("private ORAM owner enrollment requires distributed mode")
+        })?;
+        let operation = consensus_state
+            .private_oram_mutation_v2_owner_enrollment_prepared_operation(prepared)?;
+        if !consensus_state
+            .propose_consensus_op_with_await(operation, wait_timeout)
+            .await?
+        {
+            return Err(StorageError::service_error(
+                "private ORAM owner enrollment prepare was not applied",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn submit_private_oram_owner_enrollment_activated_v2(
+        &self,
+        commitment: &PrivateOramOwnerEnrollmentGenesisCommitmentV1,
+        wait_timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error("private ORAM owner enrollment requires distributed mode")
+        })?;
+        let operation = consensus_state
+            .private_oram_mutation_v2_owner_enrollment_activated_operation(commitment)?;
+        if !consensus_state
+            .propose_consensus_op_with_await(operation, wait_timeout)
+            .await?
+        {
+            return Err(StorageError::service_error(
+                "private ORAM owner enrollment activation was not applied",
             ));
         }
         Ok(())
@@ -2529,6 +2668,18 @@ impl Dispatcher {
         Ok(consensus_state.private_oram_mutation_lease_slot(key))
     }
 
+    pub fn private_oram_owner_new_generation_readiness_expectation_v2(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: PeerId,
+    ) -> Result<PrivateOramOwnerNewGenerationReadinessExpectationV2, StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error("private ORAM owner readiness requires distributed mode")
+        })?;
+        consensus_state
+            .private_oram_mutation_owner_new_generation_readiness_expectation_v2(key, owner_peer_id)
+    }
+
     pub fn private_oram_consensus_layout(
         &self,
         key: &PrivateOramLayoutKey,
@@ -3028,6 +3179,88 @@ impl Dispatcher {
         Ok(())
     }
 
+    pub async fn submit_private_oram_mutation_consensus_commit_v2(
+        &self,
+        plan: &PrivateOramMutationAdmissionPlanV2,
+        wait_timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error(
+                "private ORAM mutation consensus commit requires distributed mode",
+            )
+        })?;
+        let key = PrivateOramMutationKey {
+            collection_id: plan.lease().collection_id.clone(),
+        };
+        let (current_state, current_slot) = consensus_state
+            .private_oram_mutation_commit_projection_v2(&key)
+            .ok_or_else(|| {
+                StorageError::service_error(
+                    "private ORAM mutation consensus commit projection is unavailable",
+                )
+            })?;
+        if current_state != *plan.expected_new_state()
+            && (current_state != *plan.expected_old_state()
+                || current_slot.active.as_ref() != Some(plan.lease()))
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM mutation consensus commit authority changed".to_string(),
+            });
+        }
+
+        let operation = consensus_state.private_oram_mutation_v2_consensus_commit_operation(
+            plan.lease().generation,
+            plan.expected_new_state().clone(),
+        )?;
+        let _ = consensus_state
+            .propose_consensus_op_with_await(operation, wait_timeout)
+            .await;
+        private_oram_mutation_pause_before_commit_projection_v2().await;
+
+        let PrivateOramConsensusTransitionV2::Mutation(receipt) =
+            &plan.expected_new_state().last_transition
+        else {
+            return Err(StorageError::service_error(
+                "private ORAM mutation consensus commit plan is invalid",
+            ));
+        };
+        let mut expected_committed_lease = plan.lease().clone();
+        expected_committed_lease.phase = PrivateOramMutationLeasePhase::ConsensusCommitted {
+            committed_record_digest: canonical_private_oram_consensus_state_record_digest(
+                plan.expected_new_state(),
+            )?,
+            committed_state_sequence: plan.expected_new_state().state_sequence,
+            committed_signed_state_digest: plan.expected_new_state().signed_state_digest.clone(),
+            receipt_digest: canonical_private_oram_mutation_receipt_digest(receipt)?,
+        };
+
+        for attempt in 0..=PRIVATE_ORAM_COMMIT_PROJECTION_POLL_ATTEMPTS {
+            let Some((committed_state, committed_slot)) =
+                consensus_state.private_oram_mutation_commit_projection_v2(&key)
+            else {
+                return Err(StorageError::service_error(
+                    "private ORAM mutation consensus commit outcome requires recovery",
+                ));
+            };
+            if committed_state == *plan.expected_new_state()
+                && committed_slot.active.as_ref() == Some(&expected_committed_lease)
+            {
+                return Ok(());
+            }
+            let exact_old = committed_state == *plan.expected_old_state()
+                && committed_slot.active.as_ref() == Some(plan.lease());
+            if !exact_old || attempt == PRIVATE_ORAM_COMMIT_PROJECTION_POLL_ATTEMPTS {
+                return Err(StorageError::service_error(
+                    "private ORAM mutation consensus commit outcome requires recovery",
+                ));
+            }
+            tokio::time::sleep(PRIVATE_ORAM_COMMIT_PROJECTION_POLL_INTERVAL).await;
+        }
+        Err(StorageError::service_error(
+            "private ORAM mutation consensus commit outcome requires recovery",
+        ))
+    }
+
     pub fn private_oram_mutation_cleanup_witness_operation_v2(
         &self,
         permit: PrivateOramMutationNeedCleanupWitnessV2,
@@ -3097,11 +3330,30 @@ impl Dispatcher {
         Ok(())
     }
 
+    pub fn private_oram_mutation_local_archive_ready_v2(
+        &self,
+        parent: PrivateOramArchivedParentReadyV2,
+        owner: PrivateOramOwnerArchivedGenerationV1,
+    ) -> Result<PrivateOramMutationLocalArchiveReadyV2, StorageError> {
+        let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error(
+                "private ORAM mutation archive readiness requires distributed mode",
+            )
+        })?;
+        let current = consensus_state.private_oram_mutation_cleared_pending_archive_permit(
+            parent.key(),
+            parent.owner_peer_id(),
+            parent.generation(),
+        )?;
+        PrivateOramMutationLocalArchiveReadyV2::try_from_exact_archives(parent, owner, &current)
+            .map_err(|_| {
+                StorageError::service_error("private ORAM mutation archive chain is inconsistent")
+            })
+    }
+
     pub async fn submit_private_oram_mutation_clear_acknowledgement_v2(
         &self,
-        key: PrivateOramMutationKey,
-        expected_owner_peer_id: PeerId,
-        expected_generation: u64,
+        ready: PrivateOramMutationLocalArchiveReadyV2,
         wait_timeout: Option<Duration>,
     ) -> Result<(), StorageError> {
         let consensus_state = self.consensus_state.as_ref().ok_or_else(|| {
@@ -3109,6 +3361,17 @@ impl Dispatcher {
                 "private ORAM mutation clear acknowledgement requires distributed mode",
             )
         })?;
+        let current = consensus_state.private_oram_mutation_cleared_pending_archive_permit(
+            ready.key(),
+            ready.owner_peer_id(),
+            ready.generation(),
+        )?;
+        if !ready.matches_permit(&current) {
+            return Err(StorageError::service_error(
+                "private ORAM mutation archive readiness is stale",
+            ));
+        }
+        let (key, expected_owner_peer_id, expected_generation) = ready.into_ack_parts();
         let operation = consensus_state.private_oram_mutation_v2_clear_acknowledgement_operation(
             key,
             expected_owner_peer_id,

@@ -63,6 +63,38 @@ pub struct TelemetryData {
     pub(crate) memory: Option<MemoryTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hardware: Option<HardwareTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    // Exact aggregates are operator-only; anonymous telemetry must omit the whole field.
+    #[anonymize(value = None)]
+    pub(crate) private_oram_external_recovery: Option<PrivateOramExternalRecoveryTelemetry>,
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+#[anonymize(false)]
+pub struct PrivateOramExternalRecoveryTelemetry {
+    pub reserved_bytes: u64,
+    pub staging_reservations: u64,
+    pub worker_limit: u64,
+    pub workers_in_use: u64,
+    pub preflight_scanned_logical_bytes: u64,
+    pub preflight_scanned_entries: u64,
+}
+
+impl From<storage::content_manager::toc::PrivateOramExternalRecoveryResourceSnapshot>
+    for PrivateOramExternalRecoveryTelemetry
+{
+    fn from(
+        snapshot: storage::content_manager::toc::PrivateOramExternalRecoveryResourceSnapshot,
+    ) -> Self {
+        Self {
+            reserved_bytes: snapshot.reserved_bytes,
+            staging_reservations: snapshot.staging_reservations,
+            worker_limit: snapshot.worker_limit,
+            workers_in_use: snapshot.workers_in_use,
+            preflight_scanned_logical_bytes: snapshot.preflight_scanned_logical_bytes,
+            preflight_scanned_entries: snapshot.preflight_scanned_entries,
+        }
+    }
 }
 
 impl TelemetryCollector {
@@ -99,11 +131,15 @@ impl TelemetryCollector {
         // Use blocking pool because the collection telemetry acquires several sync. locks.
         let is_stopped_guard = StoppingGuard::new();
         let is_stopped = is_stopped_guard.get_is_stopped();
+        let toc = self
+            .dispatcher
+            .toc(auth, &new_unchecked_verification_pass())
+            .clone();
+        let private_oram_external_recovery = Some(
+            toc.private_oram_external_recovery_resource_snapshot()
+                .into(),
+        );
         let collections_telemetry_handle = {
-            let toc = self
-                .dispatcher
-                .toc(auth, &new_unchecked_verification_pass())
-                .clone();
             let runtime_handle = toc.general_runtime_handle().clone();
             let access_collection = access.clone();
 
@@ -165,6 +201,7 @@ impl TelemetryCollector {
                 .flatten(),
             hardware: (detail.level > DetailsLevel::Level0)
                 .then(|| HardwareTelemetry::new(&self.dispatcher, access)),
+            private_oram_external_recovery,
         })
     }
 }
@@ -205,6 +242,7 @@ impl TryFrom<grpc::PeerTelemetry> for TelemetryData {
             requests: None,
             memory: None,
             hardware: None,
+            private_oram_external_recovery: None,
         })
     }
 }
@@ -221,6 +259,7 @@ impl TryFrom<TelemetryData> for grpc::PeerTelemetry {
             requests: _,
             memory: _,
             hardware: _,
+            private_oram_external_recovery: _,
         } = telemetry_data;
 
         let app = app.map(grpc::AppTelemetry::from);
@@ -247,5 +286,39 @@ impl TryFrom<TelemetryData> for grpc::PeerTelemetry {
             collections,
             cluster: cluster.map(grpc::ClusterTelemetry::from),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_telemetry_drops_private_oram_recovery_activity() {
+        let telemetry = TelemetryData {
+            id: "node-1".to_string(),
+            app: None,
+            collections: CollectionsTelemetry::default(),
+            cluster: None,
+            requests: None,
+            memory: None,
+            hardware: None,
+            private_oram_external_recovery: Some(PrivateOramExternalRecoveryTelemetry {
+                reserved_bytes: 11,
+                staging_reservations: 2,
+                worker_limit: 3,
+                workers_in_use: 1,
+                preflight_scanned_logical_bytes: 17,
+                preflight_scanned_entries: 5,
+            }),
+        };
+
+        let anonymous = telemetry.anonymize();
+        assert!(anonymous.private_oram_external_recovery.is_none());
+        assert!(
+            !serde_json::to_string(&anonymous)
+                .unwrap()
+                .contains("private_oram_external_recovery")
+        );
     }
 }

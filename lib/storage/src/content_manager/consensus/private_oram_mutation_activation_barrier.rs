@@ -195,6 +195,9 @@ pub(crate) fn validate_private_oram_mutation_activation_pending_v2(
                 .eligible_process_incarnations_digest()
                 .to_string(),
             capability_manifest_digest: proof.expected_runtime_capability_fingerprint().to_string(),
+            required_binary_capability_digest: proof
+                .required_binary_capability_digest()
+                .to_string(),
             activation_enabled,
             term: pending.prepare_entry_term,
             index: pending.prepare_entry_index,
@@ -377,6 +380,9 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                 .eligible_process_incarnations_digest()
                 .to_string(),
             capability_manifest_digest: proof.expected_runtime_capability_fingerprint().to_string(),
+            required_binary_capability_digest: proof
+                .required_binary_capability_digest()
+                .to_string(),
             activation_enabled,
             term: facts.entry_term,
             index: facts.entry_index,
@@ -406,6 +412,9 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                         .to_string(),
                     capability_manifest_digest: proof
                         .expected_runtime_capability_fingerprint()
+                        .to_string(),
+                    required_binary_capability_digest: proof
+                        .required_binary_capability_digest()
                         .to_string(),
                     activation_enabled: false,
                     term: current_pending.ok_or_else(invalid)?.prepare_entry_term(),
@@ -453,6 +462,9 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                         .to_string(),
                     capability_manifest_digest: proof
                         .expected_runtime_capability_fingerprint()
+                        .to_string(),
+                    required_binary_capability_digest: proof
+                        .required_binary_capability_digest()
                         .to_string(),
                     activation_enabled: true,
                     term: pending.prepare_entry_term(),

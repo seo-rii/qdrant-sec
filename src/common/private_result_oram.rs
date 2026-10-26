@@ -607,6 +607,75 @@ impl PrivateResultOramSessionRegistry {
         Ok(())
     }
 
+    fn begin_collection_lifecycle_operation_for_paired_session(
+        &mut self,
+        collection_id: &str,
+        session_id: &str,
+        now_unix: u64,
+    ) -> StorageResult<()> {
+        self.expire(now_unix);
+        if self
+            .active_snapshot_by_collection
+            .contains_key(collection_id)
+        {
+            return Err(StorageError::bad_request(
+                "private result ORAM collection lifecycle operation requires no active collection snapshot",
+            ));
+        }
+        if self.active_lifecycle_by_collection.contains(collection_id) {
+            return Err(StorageError::bad_request(
+                "private result ORAM collection lifecycle operation requires no active collection lifecycle operation",
+            ));
+        }
+        if self.has_active_upload_collection(collection_id) {
+            return Err(StorageError::bad_request(
+                "private result ORAM collection lifecycle operation requires no active private ORAM upload",
+            ));
+        }
+
+        let exact_session = self.sessions.get(session_id).is_some_and(|session| {
+            session.owner == PrivateResultOramSessionOwner::PairedMutation
+                && session.collection_id == collection_id
+                && !session.commit_in_progress
+        });
+        if !exact_session
+            || !self
+                .active_writer_by_collection
+                .get(collection_id)
+                .is_some_and(|active| active == session_id)
+        {
+            return Err(StorageError::bad_request(
+                "private result ORAM collection lifecycle operation requires the exact paired mutation session",
+            ));
+        }
+        if self.sessions.iter().any(|(active_id, session)| {
+            active_id != session_id && session.collection_id == collection_id
+        }) {
+            return Err(StorageError::bad_request(
+                "private result ORAM collection lifecycle operation requires no other active private ORAM session",
+            ));
+        }
+
+        self.sessions.remove(session_id).ok_or_else(|| {
+            StorageError::service_error(
+                "private result ORAM paired lifecycle handoff lost its exact session",
+            )
+        })?;
+        if self
+            .active_writer_by_collection
+            .remove(collection_id)
+            .as_deref()
+            != Some(session_id)
+        {
+            return Err(StorageError::service_error(
+                "private result ORAM paired lifecycle handoff lost its exact writer lock",
+            ));
+        }
+        self.active_lifecycle_by_collection
+            .insert(collection_id.to_string());
+        Ok(())
+    }
+
     fn release_collection_snapshot(&mut self, collection_id: &str) {
         let Some(count) = self.active_snapshot_by_collection.get_mut(collection_id) else {
             return;
@@ -2840,6 +2909,32 @@ pub(crate) fn begin_private_result_oram_collection_lifecycle(
         StorageError::service_error("private result ORAM session registry poisoned")
     })?;
     registry.begin_collection_lifecycle_operation(&collection_crypto_id, now_unix)?;
+    Ok(Some(PrivateResultOramCollectionSnapshotGuard {
+        collection_id: collection_crypto_id,
+        kind: PrivateResultOramCollectionGuardKind::Lifecycle,
+    }))
+}
+
+pub(crate) fn begin_private_result_oram_collection_lifecycle_for_paired_mutation(
+    collection_name: &str,
+    config: &CollectionConfigInternal,
+    session_id: &str,
+) -> StorageResult<Option<PrivateResultOramCollectionSnapshotGuard>> {
+    if !collection_uses_private_result_oram(config) {
+        return Ok(None);
+    }
+
+    validate_private_result_oram_session_id_shape(session_id)?;
+    let collection_crypto_id = config.stable_crypto_id(collection_name)?;
+    let now_unix = current_unix_secs()?;
+    let mut registry = session_registry().lock().map_err(|_| {
+        StorageError::service_error("private result ORAM session registry poisoned")
+    })?;
+    registry.begin_collection_lifecycle_operation_for_paired_session(
+        &collection_crypto_id,
+        session_id,
+        now_unix,
+    )?;
     Ok(Some(PrivateResultOramCollectionSnapshotGuard {
         collection_id: collection_crypto_id,
         kind: PrivateResultOramCollectionGuardKind::Lifecycle,
@@ -5231,6 +5326,61 @@ mod private_result_oram_tests {
                 .is_ok()
         );
         registry.release_collection_lifecycle_operation("other-private-result-collection");
+    }
+
+    #[test]
+    fn paired_session_lifecycle_handoff_is_exact_and_blocks_new_sessions() {
+        let now = 10;
+        let collection_id = "collection-private-result-test";
+        let mut registry = PrivateResultOramSessionRegistry::default();
+        registry
+            .open(fixture_session("standalone-session", 20), now)
+            .unwrap();
+        let error = registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                collection_id,
+                "standalone-session",
+                now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exact paired mutation session"));
+        assert!(registry.has_active_collection(collection_id, now));
+        assert!(registry.close(collection_id, "standalone-session", now));
+
+        let mut paired = fixture_session("paired-session", 20);
+        paired.owner = PrivateResultOramSessionOwner::PairedMutation;
+        registry.open(paired, now).unwrap();
+        let error = registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                collection_id,
+                "wrong-session",
+                now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exact paired mutation session"));
+        assert!(registry.has_active_collection(collection_id, now));
+
+        registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                collection_id,
+                "paired-session",
+                now,
+            )
+            .unwrap();
+        assert!(!registry.has_active_collection(collection_id, now));
+        let error = registry
+            .open(fixture_session("new-session", 20), now)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session open requires no active collection lifecycle operation")
+        );
+
+        registry.release_collection_lifecycle_operation(collection_id);
+        registry
+            .open(fixture_session("new-session", 20), now)
+            .unwrap();
     }
 
     #[test]

@@ -22,11 +22,14 @@ use super::{
 };
 use crate::content_manager::private_oram_mutation_journal::PrivateOramMutationJournalError;
 
-const FORMAT_FLOOR_VERSION: u16 = 1;
+const FORMAT_FLOOR_VERSION: u16 = 2;
 const AUTHORITY_FLOOR_VERSION: u16 = 1;
+const ENROLLMENT_FLOOR_VERSION: u16 = 1;
 const FORMAT_FLOOR_DIGEST_DOMAIN_V2: &[u8] = b"qdrant-sec/private-oram-mutation-format-floor/v2";
 const AUTHORITY_FLOOR_DIGEST_DOMAIN_V2: &[u8] =
     b"qdrant-sec/private-oram-mutation-authority-floor/v2";
+const ENROLLMENT_FLOOR_DIGEST_DOMAIN_V2: &[u8] =
+    b"qdrant-sec/private-oram-mutation-enrollment-floor/v2";
 
 /// Cluster-wide irreversible minimum format known to one Raft history and group.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +46,7 @@ pub(crate) struct PrivateOramMutationFormatFloorV2 {
     eligible_peer_set_digest: String,
     eligible_process_incarnations_digest: String,
     capability_manifest_digest: String,
+    required_binary_capability_digest: String,
     tagged_write_required: bool,
     activation_enabled: bool,
     floor_applied: PrivateOramRaftApplyLocatorV2,
@@ -67,6 +71,7 @@ impl Debug for PrivateOramMutationFormatFloorV2 {
             .field("eligible_peer_set_digest", &"[redacted]")
             .field("eligible_process_incarnations_digest", &"[redacted]")
             .field("capability_manifest_digest", &"[redacted]")
+            .field("required_binary_capability_digest", &"[redacted]")
             .field("floor_digest", &"[redacted]")
             .finish()
     }
@@ -89,6 +94,30 @@ pub(crate) struct PrivateOramMutationAuthorityFloorV2 {
     latest_material_locator: PrivateOramRaftApplyLocatorV2,
     accepted_state_applied_index: u64,
     floor_digest: String,
+}
+
+/// Snapshot-independent proof that one collection entered the V2 mutation authority domain.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateOramMutationEnrollmentFloorV2 {
+    version: u16,
+    collection_key_digest: String,
+    manifest_digest: String,
+    enrollment_applied_index: u64,
+    floor_digest: String,
+}
+
+impl Debug for PrivateOramMutationEnrollmentFloorV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationEnrollmentFloorV2")
+            .field("version", &self.version)
+            .field("enrollment_applied_index", &self.enrollment_applied_index)
+            .field("collection_key_digest", &"[redacted]")
+            .field("manifest_digest", &"[redacted]")
+            .field("floor_digest", &"[redacted]")
+            .finish()
+    }
 }
 
 impl Debug for PrivateOramMutationAuthorityFloorV2 {
@@ -148,11 +177,19 @@ impl PrivateOramMutationFormatFloorV2 {
         self.tagged_write_required
     }
 
+    pub(crate) fn required_binary_capability_digest(&self) -> &str {
+        &self.required_binary_capability_digest
+    }
+
     pub(crate) fn floor_applied_index(&self) -> u64 {
         self.floor_applied.index
     }
 
-    pub(super) fn floor_digest(&self) -> &str {
+    pub(crate) fn floor_applied_locator(&self) -> &PrivateOramRaftApplyLocatorV2 {
+        &self.floor_applied
+    }
+
+    pub(crate) fn floor_digest(&self) -> &str {
         &self.floor_digest
     }
 }
@@ -175,6 +212,68 @@ impl PrivateOramMutationAuthorityFloorV2 {
     }
 }
 
+impl PrivateOramMutationEnrollmentFloorV2 {
+    pub(crate) fn collection_key_digest(&self) -> &str {
+        &self.collection_key_digest
+    }
+
+    pub(super) fn floor_digest(&self) -> &str {
+        &self.floor_digest
+    }
+}
+
+pub(crate) fn validate_private_oram_mutation_enrollment_floor_v2(
+    floor: &PrivateOramMutationEnrollmentFloorV2,
+) -> Result<(), PrivateOramMutationJournalError> {
+    if floor.version != ENROLLMENT_FLOOR_VERSION || floor.enrollment_applied_index == 0 {
+        return Err(PrivateOramMutationJournalError::Corrupt);
+    }
+    for digest in [
+        &floor.collection_key_digest,
+        &floor.manifest_digest,
+        &floor.floor_digest,
+    ] {
+        validate_digest(digest)?;
+    }
+    if floor.floor_digest != enrollment_floor_digest_v2(floor)? {
+        return Err(PrivateOramMutationJournalError::Corrupt);
+    }
+    Ok(())
+}
+
+pub(crate) fn plan_private_oram_mutation_enrollment_floor_v2(
+    current: Option<&PrivateOramMutationEnrollmentFloorV2>,
+    collection_key_digest: &str,
+    manifest_digest: &str,
+    applied_index: u64,
+) -> Result<PrivateOramMutationEnrollmentFloorV2, PrivateOramMutationJournalError> {
+    validate_digest(collection_key_digest)?;
+    validate_digest(manifest_digest)?;
+    if applied_index == 0 {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    if let Some(current) = current {
+        validate_private_oram_mutation_enrollment_floor_v2(current)?;
+        if current.collection_key_digest != collection_key_digest
+            || current.manifest_digest != manifest_digest
+            || applied_index < current.enrollment_applied_index
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        return Ok(current.clone());
+    }
+    let mut candidate = PrivateOramMutationEnrollmentFloorV2 {
+        version: ENROLLMENT_FLOOR_VERSION,
+        collection_key_digest: collection_key_digest.to_string(),
+        manifest_digest: manifest_digest.to_string(),
+        enrollment_applied_index: applied_index,
+        floor_digest: String::new(),
+    };
+    candidate.floor_digest = enrollment_floor_digest_v2(&candidate)?;
+    validate_private_oram_mutation_enrollment_floor_v2(&candidate)?;
+    Ok(candidate)
+}
+
 pub(crate) fn validate_private_oram_mutation_format_floor_v2(
     floor: &PrivateOramMutationFormatFloorV2,
 ) -> Result<(), PrivateOramMutationJournalError> {
@@ -195,6 +294,7 @@ pub(crate) fn validate_private_oram_mutation_format_floor_v2(
         &floor.eligible_peer_set_digest,
         &floor.eligible_process_incarnations_digest,
         &floor.capability_manifest_digest,
+        &floor.required_binary_capability_digest,
         &floor.floor_digest,
     ] {
         validate_digest(digest)?;
@@ -245,7 +345,8 @@ pub(crate) fn plan_private_oram_mutation_format_floor_transition_v2(
         != current.eligible_peer_set_digest
         || candidate.eligible_process_incarnations_digest
             != current.eligible_process_incarnations_digest
-        || candidate.capability_manifest_digest != current.capability_manifest_digest;
+        || candidate.capability_manifest_digest != current.capability_manifest_digest
+        || candidate.required_binary_capability_digest != current.required_binary_capability_digest;
     if membership_evidence_changed
         && candidate.membership_generation <= current.membership_generation
     {
@@ -417,6 +518,7 @@ fn format_floor_digest_v2(
     hash_digest(&mut hasher, &floor.eligible_peer_set_digest)?;
     hash_digest(&mut hasher, &floor.eligible_process_incarnations_digest)?;
     hash_digest(&mut hasher, &floor.capability_manifest_digest)?;
+    hash_digest(&mut hasher, &floor.required_binary_capability_digest)?;
     hasher.update([u8::from(floor.tagged_write_required)]);
     hasher.update([u8::from(floor.activation_enabled)]);
     hash_locator(&mut hasher, &floor.floor_applied)?;
@@ -440,6 +542,18 @@ fn authority_floor_digest_v2(
     hash_digest(&mut hasher, &floor.outer_binding_digest_at_ordinal)?;
     hash_locator(&mut hasher, &floor.latest_material_locator)?;
     hasher.update(floor.accepted_state_applied_index.to_be_bytes());
+    Ok(BASE64URL_NOPAD.encode(&hasher.finalize()))
+}
+
+fn enrollment_floor_digest_v2(
+    floor: &PrivateOramMutationEnrollmentFloorV2,
+) -> Result<String, PrivateOramMutationJournalError> {
+    let mut hasher = Sha256::new();
+    hasher.update(ENROLLMENT_FLOOR_DIGEST_DOMAIN_V2);
+    hasher.update(floor.version.to_be_bytes());
+    hash_digest(&mut hasher, &floor.collection_key_digest)?;
+    hash_digest(&mut hasher, &floor.manifest_digest)?;
+    hasher.update(floor.enrollment_applied_index.to_be_bytes());
     Ok(BASE64URL_NOPAD.encode(&hasher.finalize()))
 }
 
@@ -478,6 +592,7 @@ pub(crate) struct PrivateOramMutationFormatFloorBarrierInputV2 {
     pub(crate) eligible_peer_set_digest: String,
     pub(crate) eligible_process_incarnations_digest: String,
     pub(crate) capability_manifest_digest: String,
+    pub(crate) required_binary_capability_digest: String,
     pub(crate) activation_enabled: bool,
     pub(crate) term: u64,
     pub(crate) index: u64,
@@ -499,6 +614,7 @@ pub(crate) fn private_oram_mutation_format_floor_from_barrier_v2(
         eligible_peer_set_digest: input.eligible_peer_set_digest,
         eligible_process_incarnations_digest: input.eligible_process_incarnations_digest,
         capability_manifest_digest: input.capability_manifest_digest,
+        required_binary_capability_digest: input.required_binary_capability_digest,
         tagged_write_required: true,
         activation_enabled: input.activation_enabled,
         floor_applied: PrivateOramRaftApplyLocatorV2 {
@@ -527,6 +643,7 @@ pub(crate) struct PrivateOramMutationFormatFloorTestInputV2 {
     pub(crate) eligible_peer_set_digest: String,
     pub(crate) eligible_process_incarnations_digest: String,
     pub(crate) capability_manifest_digest: String,
+    pub(crate) required_binary_capability_digest: String,
     pub(crate) activation_enabled: bool,
     pub(crate) term: u64,
     pub(crate) index: u64,
@@ -548,6 +665,7 @@ pub(crate) fn private_oram_mutation_format_floor_for_test(
             eligible_peer_set_digest: input.eligible_peer_set_digest,
             eligible_process_incarnations_digest: input.eligible_process_incarnations_digest,
             capability_manifest_digest: input.capability_manifest_digest,
+            required_binary_capability_digest: input.required_binary_capability_digest,
             activation_enabled: input.activation_enabled,
             term: input.term,
             index: input.index,
@@ -602,6 +720,7 @@ mod tests {
             eligible_peer_set_digest: digest(3_u8.wrapping_add(format_epoch as u8)),
             eligible_process_incarnations_digest: digest(13_u8.wrapping_add(format_epoch as u8)),
             capability_manifest_digest: digest(23_u8.wrapping_add(format_epoch as u8)),
+            required_binary_capability_digest: digest(33_u8.wrapping_add(format_epoch as u8)),
             activation_enabled,
             term: 1,
             index,
@@ -698,6 +817,22 @@ mod tests {
             private_oram_mutation_format_floor_for_test(floor_input(2, 1, false, 6)).unwrap();
         assert!(matches!(
             plan_private_oram_mutation_format_floor_transition_v2(Some(&genesis), &candidate),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+
+        let mut binary_only_input = floor_input(2, 1, false, 6);
+        binary_only_input.eligible_peer_set_digest = genesis.eligible_peer_set_digest.clone();
+        binary_only_input.eligible_process_incarnations_digest =
+            genesis.eligible_process_incarnations_digest.clone();
+        binary_only_input.capability_manifest_digest = genesis.capability_manifest_digest.clone();
+        binary_only_input.required_binary_capability_digest = digest(99);
+        let binary_only_candidate =
+            private_oram_mutation_format_floor_for_test(binary_only_input).unwrap();
+        assert!(matches!(
+            plan_private_oram_mutation_format_floor_transition_v2(
+                Some(&genesis),
+                &binary_only_candidate,
+            ),
             Err(PrivateOramMutationJournalError::InvalidTransition)
         ));
     }
@@ -884,6 +1019,16 @@ mod tests {
     #[test]
     fn floor_codecs_reject_unknown_fields_and_digest_tampering() {
         let format_floor = activation_floor();
+        let mut missing_binary_digest = serde_json::to_value(&format_floor).unwrap();
+        missing_binary_digest
+            .as_object_mut()
+            .unwrap()
+            .remove("required_binary_capability_digest");
+        assert!(
+            serde_json::from_value::<PrivateOramMutationFormatFloorV2>(missing_binary_digest)
+                .is_err()
+        );
+
         let mut format_json = serde_json::to_value(&format_floor).unwrap();
         format_json
             .as_object_mut()
@@ -898,7 +1043,14 @@ mod tests {
             Err(PrivateOramMutationJournalError::Corrupt)
         ));
         let debug = format!("{format_floor:?}");
-        for secret in [digest(1), digest(2), digest(3), digest(13), digest(23)] {
+        for secret in [
+            digest(1),
+            digest(2),
+            digest(3),
+            digest(13),
+            digest(23),
+            digest(35),
+        ] {
             assert!(!debug.contains(&secret), "{debug}");
         }
     }
@@ -908,7 +1060,7 @@ mod tests {
         let format_floor = activation_floor();
         assert_eq!(
             format_floor.floor_digest,
-            "GShnI-Ey5y4rEjmVhYp0hLLXZaiMIDaHLxKM7RuwUY8"
+            "5Sh6_SDBwko9xTwYmvtyAt_kJoSbxaYryDJ7ZLZf2u0"
         );
 
         let authority_floor = plan_private_oram_mutation_authority_floor_acceptance_v2(

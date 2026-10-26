@@ -12,6 +12,7 @@ use log::info;
 use shard::snapshots::snapshot_data::SnapshotData;
 use storage::content_manager::alias_mapping::AliasPersistence;
 use storage::content_manager::snapshots::SnapshotConfig;
+use storage::content_manager::snapshots::recover::reject_ordinary_private_oram_v2_snapshot_recovery;
 use storage::content_manager::toc::{ALIASES_PATH, COLLECTIONS_DIR};
 
 use crate::common::crypto::validate_recovered_collection_crypto_config;
@@ -218,6 +219,12 @@ fn validate_restored_collection_crypto_runtime(
     let config = CollectionConfigInternal::load(collection_path).map_err(|err| {
         format!("Failed to load recovered snapshot config for collection {collection_name}: {err}",)
     })?;
+    reject_ordinary_private_oram_v2_snapshot_recovery(collection_path).map_err(|err| {
+        format!(
+            "Failed ordinary snapshot recovery preflight for recovered snapshot \
+             {collection_name}: {err}",
+        )
+    })?;
     validate_recovered_collection_crypto_config(settings, collection_name, &config).map_err(
         |err| {
             format!(
@@ -320,6 +327,7 @@ mod tests {
     use collection::private_hnsw_oram_store::{
         PRIVATE_HNSW_ORAM_DIR, PrivateHnswOramEpochState, PrivateHnswOramStore,
     };
+    use collection::private_oram_owner_journal::PRIVATE_ORAM_OWNER_JOURNAL_DIR;
     use collection::private_result_oram_store::{
         PRIVATE_RESULT_ORAM_DIR, PrivateResultOramEpochState, PrivateResultOramStore,
     };
@@ -792,6 +800,41 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains(SIGNING_KEY_ID), "{err}");
+    }
+
+    #[test]
+    fn cli_snapshot_preflight_rejects_private_oram_v2_owner_state() {
+        let fixture = PrivateHnswRouteWireFixture::build_uploaded();
+        let settings = fixture.route_settings();
+        let collection_dir = TempDir::new().unwrap();
+        write_recovered_private_hnsw_snapshot_fixture(collection_dir.path(), &fixture, false);
+        fs::create_dir_all(
+            collection_dir
+                .path()
+                .join(PRIVATE_HNSW_ORAM_DIR)
+                .join(VECTOR_NAME)
+                .join("temp")
+                .join(PRIVATE_ORAM_OWNER_JOURNAL_DIR),
+        )
+        .unwrap();
+
+        let err =
+            validate_restored_collection_crypto_runtime(&settings, "docs", collection_dir.path())
+                .expect_err("CLI recovery must reject V2 owner state before installation");
+
+        assert!(
+            err.contains("ordinary snapshot recovery is forbidden"),
+            "{err}"
+        );
+        assert!(
+            err.contains("consensus-qualified private ORAM external recovery"),
+            "{err}"
+        );
+        assert!(
+            !err.contains(collection_dir.path().to_string_lossy().as_ref()),
+            "{err}"
+        );
+        assert!(!err.contains(PRIVATE_ORAM_OWNER_JOURNAL_DIR), "{err}");
     }
 
     #[test]

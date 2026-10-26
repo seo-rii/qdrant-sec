@@ -1,5 +1,12 @@
 #![cfg(feature = "testing")]
 
+//! Cross-crate recovery fixtures for development builds.
+//!
+//! This module can construct deterministic prepared and exact-new store images, but it does not
+//! publish a canonical parent archive grant, archive an owner generation, or fabricate a clear
+//! acknowledgement. Those archive-chain helpers remain inside this file's nested `cfg(test)`
+//! module. Production binaries must use collection without the `testing` feature.
+
 use std::path::Path;
 
 use data_encoding::BASE64URL_NOPAD;
@@ -849,6 +856,8 @@ fn repeated_result_buckets(
 #[cfg(test)]
 mod prestage_tests {
     use std::fs;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use qdrant_sec::{
         PRIVATE_ORAM_OWNER_PRESTAGE_PROTOCOL_VERSION_V2,
@@ -874,6 +883,17 @@ mod prestage_tests {
     };
 
     use super::*;
+    use crate::private_oram_owner_journal::{
+        PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1, PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+        PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2, PRIVATE_ORAM_PARENT_TERMINAL_ARCHIVE_FILE_V2,
+        PrivateOramDurableOwnerFinalizedTokenV1, PrivateOramOwnerAcknowledgedArchiveExpectationV2,
+        PrivateOramOwnerArchivedGenerationV1, PrivateOramOwnerCommittedArchiveGrantIndexV1,
+        PrivateOramOwnerCommittedArchiveGrantV1,
+        PrivateOramOwnerNewGenerationReadinessExpectationV2,
+        encode_private_oram_owner_committed_archive_grant_v1,
+        set_fail_owner_archive_after_canonical_rename_v1,
+        set_fail_owner_archive_after_record_publish_v1,
+    };
     use crate::{
         PrivateOramOwnerCleanupRepairStateV2, PrivateOramOwnerJournalError,
         PrivateOramOwnerLocalIntentStateV2, PrivateOramOwnerPrepareParentV2,
@@ -889,6 +909,285 @@ mod prestage_tests {
         validated_prepare: qdrant_sec::PrivateOramValidatedOwnerPrepareV1,
         plan: PrivateOramOwnerPrestagePlanV2,
         parent: PrivateOramOwnerPrepareParentV2,
+    }
+
+    struct CommittedArchiveFixtureV1 {
+        generation: u64,
+        terminal_bytes: Vec<u8>,
+        grant_bytes: Vec<u8>,
+    }
+
+    trait ArchiveCommittedGenerationForTestV1 {
+        fn archive_committed_generation_v1(
+            &self,
+            fixture: CommittedArchiveFixtureV1,
+        ) -> Result<PrivateOramOwnerArchivedGenerationV1, PrivateOramOwnerJournalError>;
+    }
+
+    impl ArchiveCommittedGenerationForTestV1 for PrivateOramOwnerPrestageStoreV2 {
+        fn archive_committed_generation_v1(
+            &self,
+            fixture: CommittedArchiveFixtureV1,
+        ) -> Result<PrivateOramOwnerArchivedGenerationV1, PrivateOramOwnerJournalError> {
+            install_canonical_parent_fixture(self, &fixture, true);
+            self.archive_committed_generation_from_canonical_parent_v1(fixture.generation)
+        }
+    }
+
+    fn canonical_parent_completed_path(
+        store: &PrivateOramOwnerPrestageStoreV2,
+        generation: u64,
+    ) -> std::path::PathBuf {
+        let hnsw_root = store
+            .root_path()
+            .parent()
+            .and_then(Path::parent)
+            .expect("prestage root must be below the HNSW root");
+        let collection_root = hnsw_root
+            .parent()
+            .and_then(Path::parent)
+            .expect("HNSW root must be below the collection root");
+        collection_root
+            .join(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2)
+            .join(format!("completed-v2-{generation:020}"))
+    }
+
+    fn install_canonical_parent_fixture(
+        store: &PrivateOramOwnerPrestageStoreV2,
+        fixture: &CommittedArchiveFixtureV1,
+        include_grant: bool,
+    ) {
+        let completed = canonical_parent_completed_path(store, fixture.generation);
+        let parent_root = completed.parent().unwrap();
+        create_private_fixture_directory(parent_root);
+        write_private_fixture_file(
+            &parent_root.join(PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2),
+            &[],
+        );
+        create_private_fixture_directory(&parent_root.join("temp"));
+        create_private_fixture_directory(&completed);
+        create_private_fixture_directory(&completed.join("temp"));
+        let state_records = completed.join("state_records");
+        create_private_fixture_directory(&state_records);
+        for sequence in 1..=7 {
+            write_private_fixture_file(&state_records.join(format!("{sequence:020}.json")), b"{}");
+        }
+        for file_name in [
+            "descriptor.json",
+            "immutable_manifest.json",
+            "state.json",
+            "format.json",
+            "cleanup_complete_v2.json",
+        ] {
+            write_private_fixture_file(&completed.join(file_name), b"{}");
+        }
+        write_private_fixture_file(
+            &completed.join(PRIVATE_ORAM_PARENT_TERMINAL_ARCHIVE_FILE_V2),
+            &fixture.terminal_bytes,
+        );
+        if include_grant {
+            write_private_fixture_file(
+                &completed.join(PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1),
+                &fixture.grant_bytes,
+            );
+        }
+        fs::File::open(&completed).unwrap().sync_all().unwrap();
+        fs::File::open(parent_root).unwrap().sync_all().unwrap();
+    }
+
+    fn create_private_fixture_directory(path: &Path) {
+        if !path.exists() {
+            fs::create_dir(path).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    fn write_private_fixture_file(path: &Path, bytes: &[u8]) {
+        if path.exists() {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        } else {
+            fs::write(path, bytes).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::File::open(path).unwrap().sync_all().unwrap();
+    }
+
+    fn committed_archive_input(
+        receipt: &PrivateOramOwnerPrestageReceiptV2,
+        terminal: &PrivateOramDurableOwnerFinalizedTokenV1,
+        marker: u8,
+    ) -> CommittedArchiveFixtureV1 {
+        let indexes = terminal
+            .indexes()
+            .iter()
+            .map(|index| {
+                PrivateOramOwnerCommittedArchiveGrantIndexV1::try_new(
+                    index.kind(),
+                    index.index_name().to_string(),
+                    index.prepared_journal_digest().to_string(),
+                    index.finalized_state_digest().to_string(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let terminal_bytes = serde_json::to_vec(&(2_u16, marker)).unwrap();
+        let grant = PrivateOramOwnerCommittedArchiveGrantV1::try_new(
+            terminal_bytes.len() as u64,
+            BASE64URL_NOPAD.encode(&Sha256::digest(&terminal_bytes)),
+            TEST_HNSW_INDEX.to_string(),
+            receipt.clone(),
+            digest(marker),
+            digest(marker.wrapping_add(1)),
+            digest(marker.wrapping_add(2)),
+            digest(marker.wrapping_add(3)),
+            terminal.terminal_record_digest().to_string(),
+            terminal.consensus_authority_record_digest().to_string(),
+            terminal.reconciliation_authority_digest().to_string(),
+            digest(marker.wrapping_add(4)),
+            indexes,
+        )
+        .unwrap();
+        CommittedArchiveFixtureV1 {
+            generation: receipt.lease_generation(),
+            terminal_bytes,
+            grant_bytes: encode_private_oram_owner_committed_archive_grant_v1(&grant).unwrap(),
+        }
+    }
+
+    fn readiness_expectation(
+        store: &PrivateOramOwnerPrestageStoreV2,
+        archives: &[(&PrivateOramOwnerPrestageReceiptV2, u8)],
+        aggregate_marker: u8,
+    ) -> PrivateOramOwnerNewGenerationReadinessExpectationV2 {
+        let (first_receipt, _) = archives
+            .first()
+            .expect("readiness fixture requires at least one acknowledged archive");
+        let owner_store_incarnation_digest = store
+            .inspect_lifecycle_v2(first_receipt.intent_key())
+            .unwrap()
+            .owner_store_incarnation_digest()
+            .to_string();
+        let acknowledged_archives = archives
+            .iter()
+            .map(|(receipt, marker)| {
+                PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    receipt.lease_generation(),
+                    receipt.owner_peer_id(),
+                    digest(*marker),
+                    digest(marker.wrapping_add(2)),
+                    digest(marker.wrapping_add(3)),
+                )
+                .unwrap()
+            })
+            .collect();
+        PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+            TEST_COLLECTION_ID.to_string(),
+            owner_store_incarnation_digest,
+            digest(aggregate_marker),
+            acknowledged_archives,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn owner_snapshot_authority_digest_known_answer_binds_acknowledged_chain() {
+        let expectation = PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+            TEST_COLLECTION_ID.to_string(),
+            digest(201),
+            digest(202),
+            vec![
+                PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    7,
+                    11,
+                    digest(203),
+                    digest(204),
+                    digest(205),
+                )
+                .unwrap(),
+                PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    9,
+                    13,
+                    digest(206),
+                    digest(207),
+                    digest(208),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let authority_digest = expectation.snapshot_authority_digest_v2().unwrap();
+        assert_eq!(
+            authority_digest,
+            "NrHV8oWtPLdMmZzgUa8YyeEI2m_fd40nkGhAoJ5JaoA"
+        );
+
+        let changed = PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+            TEST_COLLECTION_ID.to_string(),
+            digest(201),
+            digest(202),
+            vec![
+                PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    7,
+                    11,
+                    digest(203),
+                    digest(204),
+                    digest(205),
+                )
+                .unwrap(),
+                PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    9,
+                    13,
+                    digest(206),
+                    digest(207),
+                    digest(209),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            changed.snapshot_authority_digest_v2().unwrap(),
+            authority_digest
+        );
+    }
+
+    fn install_adopt_and_finalize(
+        fixture: &PrivateOramOwnerStorePairTestFixtureV1,
+        store: &PrivateOramOwnerPrestageStoreV2,
+        material: &PrestageMaterial,
+    ) -> (
+        PrivateOramOwnerPrestageReceiptV2,
+        PrivateOramDurableOwnerFinalizedTokenV1,
+    ) {
+        let receipt = store
+            .install_v2(
+                &material.verified_request,
+                &material.package,
+                &material.package_bytes,
+                &material.validated_prepare,
+                &material.plan,
+            )
+            .unwrap();
+        store
+            .adopt_for_parent_v2(
+                receipt.intent_key(),
+                receipt.package_sha256(),
+                &material.parent,
+            )
+            .unwrap();
+        let terminal = fixture
+            .owner_journal()
+            .finalize_store_adapter_test_fixture_v1(&digest(201), &digest(202), 203)
+            .unwrap();
+        (receipt, terminal)
     }
 
     fn requirements(
@@ -1186,6 +1485,48 @@ mod prestage_tests {
     }
 
     #[test]
+    fn consensus_prepared_genesis_enrollment_is_durable_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [36; 32]);
+        let incarnation = digest(217);
+        let conflicting_incarnation = digest(218);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+
+        assert_eq!(
+            store.require_enrollment_v2(&incarnation),
+            Err(PrivateOramOwnerJournalError::NotEnrolled)
+        );
+        assert!(!store.root_path().exists());
+
+        store.install_genesis_enrollment_v2(&incarnation).unwrap();
+        store.require_enrollment_v2(&incarnation).unwrap();
+        store
+            .require_ready_for_new_generation_v2(
+                &PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+                    TEST_COLLECTION_ID.to_string(),
+                    incarnation.clone(),
+                    digest(219),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store.install_genesis_enrollment_v2(&incarnation).unwrap();
+
+        let reopened = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        reopened.require_enrollment_v2(&incarnation).unwrap();
+        assert_eq!(
+            reopened.install_genesis_enrollment_v2(&conflicting_incarnation),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+        assert_eq!(
+            reopened.require_enrollment_v2(&conflicting_incarnation),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+    }
+
+    #[test]
     fn active_reservation_fence_blocks_owner_state_mutations() {
         let temp = tempfile::tempdir().unwrap();
         let collection_path = temp.path().join("collection");
@@ -1363,6 +1704,27 @@ mod prestage_tests {
                 &second.parent,
             )
             .unwrap();
+        drop(store);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let recovered = store
+            .confirm_installed_reservation_resolution_v1(&resolution)
+            .unwrap();
+        assert_eq!(
+            recovered.durable_resolution(),
+            installed.durable_resolution()
+        );
+        assert_eq!(
+            recovered.installed_prestage_receipt_digest(),
+            installed.installed_prestage_receipt_digest()
+        );
+        assert_eq!(
+            recovered.installed_package_sha256(),
+            installed.installed_package_sha256()
+        );
+        assert_ne!(
+            recovered.installed_intent_marker_digest(),
+            installed.installed_intent_marker_digest()
+        );
     }
 
     #[test]
@@ -2888,5 +3250,675 @@ mod prestage_tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_parent_grant_is_required_before_child_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [51; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[111; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 181, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let parent = committed_archive_input(&receipt, &terminal, 231);
+        install_canonical_parent_fixture(&store, &parent, false);
+
+        assert!(matches!(
+            store.archive_committed_generation_from_canonical_parent_v1(parent.generation),
+            Err(PrivateOramOwnerJournalError::Corrupt)
+        ));
+        assert!(fixture.owner_journal().root_path().join("active").is_dir());
+        assert!(
+            store
+                .root_path()
+                .join("intents")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn canonical_parent_grant_binds_exact_terminal_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [52; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[112; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 182, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let mut parent = committed_archive_input(&receipt, &terminal, 232);
+        parent.terminal_bytes.push(b' ');
+        install_canonical_parent_fixture(&store, &parent, true);
+
+        assert!(matches!(
+            store.archive_committed_generation_from_canonical_parent_v1(parent.generation),
+            Err(PrivateOramOwnerJournalError::Corrupt)
+        ));
+        assert!(fixture.owner_journal().root_path().join("active").is_dir());
+        assert!(
+            store
+                .root_path()
+                .join("intents")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn canonical_parent_grant_rejects_relative_storage_root_without_child_mutation() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [54; 32]);
+        let absolute_store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[114; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 184, 2);
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &absolute_store, &material);
+        let parent = committed_archive_input(&receipt, &terminal, 234);
+        install_canonical_parent_fixture(&absolute_store, &parent, true);
+        let relative_hnsw_root = fixture.hnsw_store().root_path().strip_prefix(&cwd).unwrap();
+        let relative_store = PrivateOramOwnerPrestageStoreV2::new(relative_hnsw_root);
+
+        assert!(matches!(
+            relative_store.archive_committed_generation_from_canonical_parent_v1(parent.generation),
+            Err(PrivateOramOwnerJournalError::Corrupt)
+        ));
+        assert!(fixture.owner_journal().root_path().join("active").is_dir());
+        assert!(
+            absolute_store
+                .root_path()
+                .join("intents")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+
+        let pinned_store =
+            PrivateOramOwnerPrestageStoreV2::try_new_pinned_absolute_v2(relative_hnsw_root)
+                .unwrap();
+        assert!(pinned_store.root_path().is_absolute());
+        let archived = pinned_store
+            .archive_committed_generation_from_canonical_parent_v1(parent.generation)
+            .unwrap();
+        assert_eq!(archived.generation(), parent.generation);
+    }
+
+    #[test]
+    fn canonical_parent_grant_rejects_cross_incarnation_replay_without_child_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_fixture = PrivateOramOwnerStorePairTestFixtureV1::new(
+            &temp.path().join("source-collection"),
+            [55; 32],
+        );
+        let replay_fixture = PrivateOramOwnerStorePairTestFixtureV1::new(
+            &temp.path().join("replay-collection"),
+            [55; 32],
+        );
+        let source_store =
+            PrivateOramOwnerPrestageStoreV2::new(source_fixture.hnsw_store().root_path());
+        let replay_store =
+            PrivateOramOwnerPrestageStoreV2::new(replay_fixture.hnsw_store().root_path());
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[115; 32]).unwrap();
+        let material = material(&source_fixture, &peer_key_pair, 185, 2);
+        let (source_receipt, source_terminal) =
+            install_adopt_and_finalize(&source_fixture, &source_store, &material);
+        let (replay_receipt, _) =
+            install_adopt_and_finalize(&replay_fixture, &replay_store, &material);
+        assert_ne!(
+            source_receipt.owner_store_incarnation_digest(),
+            replay_receipt.owner_store_incarnation_digest()
+        );
+        let parent = committed_archive_input(&source_receipt, &source_terminal, 235);
+        install_canonical_parent_fixture(&replay_store, &parent, true);
+
+        assert!(matches!(
+            replay_store.archive_committed_generation_from_canonical_parent_v1(parent.generation),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        ));
+        assert!(
+            replay_fixture
+                .owner_journal()
+                .root_path()
+                .join("active")
+                .is_dir()
+        );
+        assert!(
+            replay_store
+                .root_path()
+                .join("intents")
+                .join(replay_receipt.intent_key())
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn owner_readiness_requires_retained_canonical_parent_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [53; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[113; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 183, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 233)], 243);
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 233))
+            .unwrap();
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+
+        let completed = canonical_parent_completed_path(&store, receipt.lease_generation());
+        fs::remove_file(completed.join(PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1)).unwrap();
+        fs::File::open(&completed).unwrap().sync_all().unwrap();
+
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+    }
+
+    #[test]
+    fn owner_snapshot_guard_rejects_unexpected_owner_and_parent_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [54; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[114; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 184, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 234)], 244);
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 234))
+            .unwrap();
+
+        store.acquire_snapshot_guard_v2(&readiness).unwrap();
+        fs::write(
+            store.root_path().join("unexpected.snapshot-entry"),
+            b"unexpected",
+        )
+        .unwrap();
+        assert!(store.acquire_snapshot_guard_v2(&readiness).is_err());
+        fs::remove_file(store.root_path().join("unexpected.snapshot-entry")).unwrap();
+
+        let completed = canonical_parent_completed_path(&store, receipt.lease_generation());
+        fs::write(completed.join("unexpected.snapshot-entry"), b"unexpected").unwrap();
+        assert!(store.acquire_snapshot_guard_v2(&readiness).is_err());
+    }
+
+    #[test]
+    fn owner_snapshot_guard_rejects_archive_pending_consensus_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [55; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[115; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 185, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let owner_store_incarnation_digest = store
+            .inspect_lifecycle_v2(receipt.intent_key())
+            .unwrap()
+            .owner_store_incarnation_digest()
+            .to_string();
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 235))
+            .unwrap();
+        let pending_ack = PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+            TEST_COLLECTION_ID.to_string(),
+            owner_store_incarnation_digest,
+            digest(245),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(store.acquire_snapshot_guard_v2(&pending_ack).is_err());
+    }
+
+    #[test]
+    fn owner_snapshot_guard_fences_concurrent_archive_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [56; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[116; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 186, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 236)], 246);
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 236))
+            .unwrap();
+
+        let guard = store.acquire_snapshot_guard_v2(&readiness).unwrap();
+        let replay_store = store.clone();
+        let replay = committed_archive_input(&receipt, &terminal, 236);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(replay_store.archive_committed_generation_v1(replay))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(150));
+        drop(guard);
+
+        match early {
+            Ok(Ok(_)) => panic!("archive publication succeeded while snapshot guard was held"),
+            Ok(Err(PrivateOramOwnerJournalError::ConcurrentMutation)) => {
+                store
+                    .archive_committed_generation_v1(committed_archive_input(
+                        &receipt, &terminal, 236,
+                    ))
+                    .unwrap();
+            }
+            Ok(Err(error)) => panic!("unexpected archive error while snapshot was held: {error}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("archive worker disconnected before reporting an outcome")
+            }
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn committed_owner_archive_replays_and_fences_stale_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [41; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[102; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 171, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 211)], 221);
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+
+        let archived = store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 211))
+            .unwrap();
+        let replayed = store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 211))
+            .unwrap();
+
+        assert_eq!(archived.generation(), 2);
+        assert_eq!(archived.owner_peer_id(), 11);
+        assert_eq!(archived.collection_id(), TEST_COLLECTION_ID);
+        assert_eq!(
+            archived.parent_archive_record_digest(),
+            replayed.parent_archive_record_digest()
+        );
+        assert_eq!(
+            archived.owner_archive_record_digest(),
+            replayed.owner_archive_record_digest()
+        );
+        assert_eq!(
+            archived.retired_prestage_receipt_digest(),
+            receipt.receipt_digest()
+        );
+        assert!(
+            !store
+                .root_path()
+                .join("intents")
+                .join(receipt.intent_key())
+                .exists()
+        );
+        assert!(
+            store
+                .root_path()
+                .join("retired")
+                .join(receipt.intent_key())
+                .exists()
+        );
+        assert!(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002")
+                .join("owner-terminal-archive-v1.json")
+                .is_file()
+        );
+        assert_eq!(
+            store.adopt_for_parent_v2(
+                receipt.intent_key(),
+                receipt.package_sha256(),
+                &material.parent,
+            ),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+        assert_eq!(
+            store.install_v2(
+                &material.verified_request,
+                &material.package,
+                &material.package_bytes,
+                &material.validated_prepare,
+                &material.plan,
+            ),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+        assert!(
+            fixture
+                .owner_journal()
+                .inspect_structural()
+                .unwrap()
+                .is_none()
+        );
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+    }
+
+    #[test]
+    fn owner_readiness_rejects_missing_completed_and_retired_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [45; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[106; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 176, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 215)], 225);
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 215))
+            .unwrap();
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+
+        fs::remove_dir_all(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002"),
+        )
+        .unwrap();
+        fs::remove_dir_all(store.root_path().join("retired").join(receipt.intent_key())).unwrap();
+
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        assert!(!fixture.owner_journal().root_path().join("active").exists());
+    }
+
+    #[test]
+    fn owner_readiness_rejects_missing_older_pair_when_newer_pair_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [46; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[107; 32]).unwrap();
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+
+        let first = material(&fixture, &peer_key_pair, 177, 2);
+        let (first_receipt, first_terminal) = install_adopt_and_finalize(&fixture, &store, &first);
+        store
+            .archive_committed_generation_v1(committed_archive_input(
+                &first_receipt,
+                &first_terminal,
+                216,
+            ))
+            .unwrap();
+
+        let second = material(&fixture, &peer_key_pair, 178, 3);
+        let (second_receipt, second_terminal) =
+            install_adopt_and_finalize(&fixture, &store, &second);
+        store
+            .archive_committed_generation_v1(committed_archive_input(
+                &second_receipt,
+                &second_terminal,
+                217,
+            ))
+            .unwrap();
+        let readiness = readiness_expectation(
+            &store,
+            &[(&first_receipt, 216), (&second_receipt, 217)],
+            226,
+        );
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+
+        fs::remove_dir_all(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002"),
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            store
+                .root_path()
+                .join("retired")
+                .join(first_receipt.intent_key()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        assert!(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000003")
+                .is_dir()
+        );
+        assert!(
+            store
+                .root_path()
+                .join("retired")
+                .join(second_receipt.intent_key())
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn committed_owner_archive_repairs_missing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [42; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[103; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 172, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 212)], 222);
+
+        set_fail_owner_archive_after_canonical_rename_v1(true);
+        let failed = store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 212));
+        set_fail_owner_archive_after_canonical_rename_v1(false);
+        assert!(matches!(
+            failed,
+            Err(PrivateOramOwnerJournalError::Indeterminate)
+        ));
+        let completed = fixture
+            .owner_journal()
+            .root_path()
+            .join("completed-v2-00000000000000000002");
+        assert!(completed.is_dir());
+        assert!(!completed.join("owner-terminal-archive-v1.json").exists());
+        assert!(!fixture.owner_journal().root_path().join("active").exists());
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        assert_eq!(
+            store.adopt_for_parent_v2(
+                receipt.intent_key(),
+                receipt.package_sha256(),
+                &material.parent,
+            ),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 212))
+            .unwrap();
+        assert!(completed.join("owner-terminal-archive-v1.json").is_file());
+        assert!(
+            store
+                .root_path()
+                .join("retired")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+    }
+
+    #[test]
+    fn committed_owner_archive_record_fences_unretired_adopted_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [43; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[104; 32]).unwrap();
+        let material = material(&fixture, &peer_key_pair, 173, 2);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+        let readiness = readiness_expectation(&store, &[(&receipt, 213)], 223);
+
+        set_fail_owner_archive_after_record_publish_v1(true);
+        let failed = store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 213));
+        set_fail_owner_archive_after_record_publish_v1(false);
+        assert!(matches!(
+            failed,
+            Err(PrivateOramOwnerJournalError::Indeterminate)
+        ));
+        assert!(
+            store
+                .root_path()
+                .join("intents")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+        assert!(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002")
+                .join("owner-terminal-archive-v1.json")
+                .is_file()
+        );
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        assert_eq!(
+            store.adopt_for_parent_v2(
+                receipt.intent_key(),
+                receipt.package_sha256(),
+                &material.parent,
+            ),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+        assert_eq!(
+            store.install_v2(
+                &material.verified_request,
+                &material.package,
+                &material.package_bytes,
+                &material.validated_prepare,
+                &material.plan,
+            ),
+            Err(PrivateOramOwnerJournalError::InvalidTransition)
+        );
+        assert!(!fixture.owner_journal().root_path().join("active").exists());
+
+        store
+            .archive_committed_generation_v1(committed_archive_input(&receipt, &terminal, 213))
+            .unwrap();
+        assert!(
+            store
+                .root_path()
+                .join("retired")
+                .join(receipt.intent_key())
+                .is_dir()
+        );
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+    }
+
+    #[test]
+    fn completed_generation_allows_next_generation_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [44; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[105; 32]).unwrap();
+        let first = material(&fixture, &peer_key_pair, 174, 2);
+        let second = material(&fixture, &peer_key_pair, 175, 3);
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let (first_receipt, first_terminal) = install_adopt_and_finalize(&fixture, &store, &first);
+        let readiness = readiness_expectation(&store, &[(&first_receipt, 214)], 224);
+        store
+            .archive_committed_generation_v1(committed_archive_input(
+                &first_receipt,
+                &first_terminal,
+                214,
+            ))
+            .unwrap();
+        store
+            .require_ready_for_new_generation_v2(&readiness)
+            .unwrap();
+
+        let second_receipt = store
+            .install_v2(
+                &second.verified_request,
+                &second.package,
+                &second.package_bytes,
+                &second.validated_prepare,
+                &second.plan,
+            )
+            .unwrap();
+        store
+            .adopt_for_parent_v2(
+                second_receipt.intent_key(),
+                second_receipt.package_sha256(),
+                &second.parent,
+            )
+            .unwrap();
+        assert_eq!(
+            store.require_ready_for_new_generation_v2(&readiness),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        let active = fixture
+            .owner_journal()
+            .inspect_structural()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            active.descriptor.descriptor_digest,
+            second_receipt.owner_journal_descriptor_digest()
+        );
+        assert!(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002")
+                .is_dir()
+        );
+        assert!(matches!(
+            store.archive_committed_generation_v1(committed_archive_input(
+                &first_receipt,
+                &first_terminal,
+                214,
+            )),
+            Err(PrivateOramOwnerJournalError::ConcurrentMutation)
+        ));
+        let active_after = fixture
+            .owner_journal()
+            .inspect_structural()
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_after, active);
     }
 }

@@ -242,19 +242,10 @@ async fn create_snapshot(
     params: valid::Query<SnapshottingParam>,
     ActixAuth(auth): ActixAuth,
 ) -> impl Responder {
-    // Nothing to verify.
-    let pass = new_unchecked_verification_pass();
-
     let collection_name = collection.into_inner().collection_name;
 
-    let future = async move {
-        do_create_snapshot(
-            dispatcher.toc(&auth, &pass).clone(),
-            &auth,
-            &collection_name,
-        )
-        .await
-    };
+    let future =
+        async move { do_create_snapshot(dispatcher.into_inner(), &auth, &collection_name).await };
 
     helpers::time_or_accept(future, params.wait.unwrap_or(true)).await
 }

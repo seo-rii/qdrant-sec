@@ -1484,6 +1484,20 @@ impl PrivateResultOramStore {
         Ok(epoch)
     }
 
+    pub fn read_current_epoch_with_writeback_digest(
+        &self,
+    ) -> CollectionResult<(PrivateResultOramEpochState, Option<String>)> {
+        self.with_owner_store_lock_v1(|_| {
+            let (manifest, _) = self.read_manifest()?;
+            validate_private_result_oram_manifest_shape(&manifest)
+                .map_err(private_result_oram_error)?;
+            self.ensure_no_pending_live_replication()?;
+            let current = self.read_current_epoch()?;
+            let writeback_digest = self.live_writeback_digest(&manifest, &current)?;
+            Ok((current, writeback_digest))
+        })
+    }
+
     pub fn compare_and_swap_epoch(
         &self,
         old: &PrivateResultOramEpochState,
@@ -2715,6 +2729,7 @@ impl PrivateResultOwnerStoreLockV1<'_> {
         &'lock self,
         context: PrivateResultOwnerStoreVerificationContextV1<'_>,
     ) -> CollectionResult<PrivateResultOwnerExactNewStoreTokenV1<'lock>> {
+        self.ensure_owner_recovery_temp_dir_v1()?;
         let mut snapshot = self.revalidated_owner_recovery_snapshot_v1(context)?;
         let written_prefix = match snapshot.progress {
             PrivateResultOwnerRecoveryProgressV1::S0 => 0,
@@ -2752,6 +2767,94 @@ impl PrivateResultOwnerStoreLockV1<'_> {
             ));
         }
         self.verify_exact_new(context)
+    }
+
+    fn ensure_owner_recovery_temp_dir_v1(&self) -> CollectionResult<()> {
+        validate_owner_store_directory_identity(&self.directory, &self.store.root)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let name = CString::new(TEMP_DIR).map_err(|_| {
+                CollectionError::service_error(
+                    "private result ORAM recovery directory name is invalid",
+                )
+            })?;
+            // SAFETY: `name` is NUL-terminated and the locked root descriptor stays alive.
+            let created =
+                unsafe { nix::libc::mkdirat(self.directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            let created = if created == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(nix::libc::EEXIST) {
+                    return Err(CollectionError::service_error(
+                        "failed to create private result ORAM recovery directory",
+                    ));
+                }
+                false
+            };
+
+            // SAFETY: `name` is NUL-terminated and openat does not retain either pointer.
+            let descriptor = unsafe {
+                nix::libc::openat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(CollectionError::service_error(
+                    "private result ORAM recovery directory is invalid",
+                ));
+            }
+            // SAFETY: the checked descriptor is uniquely transferred into this File.
+            let directory = unsafe { File::from_raw_fd(descriptor) };
+            let opened = directory.metadata().map_err(|_| {
+                CollectionError::service_error(
+                    "failed to inspect private result ORAM recovery directory",
+                )
+            })?;
+            let current = fs::symlink_metadata(self.store.temp_dir()).map_err(|_| {
+                CollectionError::service_error(
+                    "failed to inspect private result ORAM recovery directory",
+                )
+            })?;
+            let effective_uid = nix::unistd::Uid::effective().as_raw();
+            if !opened.file_type().is_dir()
+                || current.file_type().is_symlink()
+                || !current.file_type().is_dir()
+                || opened.uid() != effective_uid
+                || current.uid() != effective_uid
+                || opened.permissions().mode() & 0o077 != 0
+                || current.permissions().mode() & 0o077 != 0
+                || opened.dev() != current.dev()
+                || opened.ino() != current.ino()
+            {
+                return Err(CollectionError::service_error(
+                    "private result ORAM recovery directory is invalid",
+                ));
+            }
+            if created {
+                self.directory.sync_all().map_err(|_| {
+                    CollectionError::service_error(
+                        "failed to sync private result ORAM recovery directory",
+                    )
+                })?;
+            }
+            validate_owner_store_directory_identity(&self.directory, &self.store.root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(CollectionError::service_error(
+                "private result ORAM owner recovery is unsupported on this platform",
+            ))
+        }
     }
 
     fn write_owner_recovery_next_bucket_v1(
@@ -5662,6 +5765,89 @@ mod tests {
                 public_key,
             },
         }
+    }
+
+    #[test]
+    fn current_epoch_with_writeback_digest_validates_initial_and_committed_state() {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[57; 32]).unwrap();
+        let public_key = key_pair.public_key();
+        let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old = store.write_initial_upload_bundle(&bundle, 128).unwrap();
+        let verification = || PrivateResultOramSignatureVerification {
+            expected_key_id: "tenant-a/private-result-signing-v1",
+            public_key: public_key.as_ref(),
+        };
+
+        assert_eq!(
+            store.read_current_epoch_with_writeback_digest().unwrap(),
+            (old.clone(), None),
+        );
+
+        let consensus_writeback = store
+            .prepare_durable_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                128,
+                &signature,
+                verification(),
+            )
+            .unwrap();
+        store
+            .commit_prepared_writeback_with_signature(128, verification())
+            .unwrap();
+        assert_eq!(
+            store.read_current_epoch_with_writeback_digest().unwrap(),
+            (
+                new.clone(),
+                Some(consensus_writeback.writeback_digest.clone()),
+            ),
+        );
+
+        let commit_path = store.commit_epoch_path(new.index_epoch);
+        fs::remove_file(&commit_path).unwrap();
+        let missing = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("current commit is missing"));
+
+        write_json_atomic(
+            &store.root,
+            &store.temp_dir(),
+            &commit_path,
+            &PrivateResultOramEpochCommit {
+                index_epoch: new.index_epoch,
+                root_hash: root_hash(91),
+                writeback_digest: Some(consensus_writeback.writeback_digest),
+            },
+        )
+        .unwrap();
+        let mismatch = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("commit does not match current state"));
+
+        write_json_atomic(
+            &store.root,
+            &store.temp_dir(),
+            &commit_path,
+            &PrivateResultOramEpochCommit {
+                index_epoch: new.index_epoch,
+                root_hash: new.root_hash,
+                writeback_digest: None,
+            },
+        )
+        .unwrap();
+        let missing_digest = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(missing_digest.contains("current commit has no consensus digest"));
     }
 
     fn fixture_owner_states(
@@ -9281,6 +9467,55 @@ mod tests {
                 assert_eq!(replay.index_name(), context.index_name);
             });
         }
+    }
+
+    #[test]
+    fn owner_recovery_recreates_snapshot_omitted_temp_dir() {
+        with_owner_recovery_fixture(|store, context| {
+            fs::remove_dir(store.temp_dir()).unwrap();
+            let lock = store.lock_owner_store_v1().unwrap();
+
+            lock.resume_owner_recovery_context_to_exact_new_v1(context)
+                .unwrap();
+
+            validate_private_dir(&store.temp_dir()).unwrap();
+            assert_eq!(
+                lock.revalidated_owner_recovery_snapshot_v1(context)
+                    .unwrap()
+                    .progress,
+                PrivateResultOwnerRecoveryProgressV1::S4,
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_recovery_rejects_symlinked_missing_temp_replacement() {
+        use std::os::unix::fs::symlink;
+
+        with_owner_recovery_fixture(|store, context| {
+            fs::remove_dir(store.temp_dir()).unwrap();
+            let outside = store
+                .root_path()
+                .parent()
+                .unwrap()
+                .join("outside-recovery-temp");
+            create_private_dir(&outside).unwrap();
+            symlink(&outside, store.temp_dir()).unwrap();
+            let lock = store.lock_owner_store_v1().unwrap();
+
+            let rendered = lock
+                .resume_owner_recovery_context_to_exact_new_v1(context)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                rendered.contains("recovery directory is invalid"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("outside-recovery-temp"), "{rendered}");
+            assert!(fs::read_dir(outside).unwrap().next().is_none());
+        });
     }
 
     #[test]

@@ -7,6 +7,7 @@ use actix_multipart::form::text::Text;
 use actix_web::http::header::{CACHE_CONTROL, HeaderValue};
 use actix_web::{FromRequest, HttpRequest, HttpResponse, get, post, web};
 use actix_web_validator::{Json, Path};
+use collection::operations::verification::new_unchecked_verification_pass;
 use serde::{Deserialize, Serialize};
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::dispatcher::Dispatcher;
@@ -21,6 +22,7 @@ use crate::common::auth::Auth;
 use crate::common::private_oram_recovery::{
     PrivateOramExternalRecoveryChunk, do_abort_private_oram_external_recovery,
     do_begin_private_oram_external_recovery, do_commit_private_oram_external_recovery,
+    do_export_private_oram_external_recovery_checkpoint_context,
     do_get_private_oram_external_recovery_status, do_upload_private_oram_external_recovery_chunk,
     do_verify_private_oram_external_recovery,
 };
@@ -49,6 +51,28 @@ impl Debug for BeginPrivateOramExternalRecoveryRequest {
 pub struct PrivateOramExternalRecoveryOperationRequest {
     #[validate(length(equal = 43))]
     pub operation_token: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ExportPrivateOramExternalRecoveryCheckpointRequest {
+    pub expected_committed_backup_generation: u64,
+    pub backup_generation: u64,
+    #[validate(length(equal = 43))]
+    pub client_recovery_state_digest: String,
+    #[validate(length(min = 1, max = 256))]
+    pub owner_signing_key_id: String,
+}
+
+impl Debug for ExportPrivateOramExternalRecoveryCheckpointRequest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExportPrivateOramExternalRecoveryCheckpointRequest")
+            .field("expected_committed_backup_generation", &"[redacted]")
+            .field("backup_generation", &"[redacted]")
+            .field("client_recovery_state_digest", &"[redacted]")
+            .field("owner_signing_key_id", &"[redacted]")
+            .finish()
+    }
 }
 
 impl Debug for PrivateOramExternalRecoveryOperationRequest {
@@ -111,6 +135,31 @@ async fn begin_recovery(
             checkpoint: request.checkpoint,
             signature: request.signature,
         },
+    )
+    .await;
+    process_recovery_response(result, timing)
+}
+
+#[post("/collections/{collection_name}/private-oram/recovery/export-context")]
+async fn export_recovery_checkpoint_context(
+    dispatcher: web::Data<Dispatcher>,
+    settings: web::Data<Settings>,
+    path: Path<CollectionPath>,
+    PrivateOramRecoveryManageAuth(auth): PrivateOramRecoveryManageAuth,
+    request: Json<ExportPrivateOramExternalRecoveryCheckpointRequest>,
+) -> HttpResponse {
+    let timing = Instant::now();
+    let path = path.into_inner();
+    let request = request.into_inner();
+    let result = do_export_private_oram_external_recovery_checkpoint_context(
+        dispatcher.get_ref(),
+        &auth,
+        settings.get_ref(),
+        &path.collection_name,
+        request.expected_committed_backup_generation,
+        request.backup_generation,
+        &request.client_recovery_state_digest,
+        &request.owner_signing_key_id,
     )
     .await;
     process_recovery_response(result, timing)
@@ -226,14 +275,26 @@ async fn commit_recovery(
     let timing = Instant::now();
     let path = path.into_inner();
     let request = request.into_inner();
-    let result = do_commit_private_oram_external_recovery(
-        dispatcher.get_ref(),
-        &auth,
-        settings.get_ref(),
-        &path.collection_name,
-        &request.operation_token,
-    )
-    .await;
+    let runtime = dispatcher
+        .toc(&auth, &new_unchecked_verification_pass())
+        .general_runtime_handle()
+        .clone();
+    let result = runtime
+        .spawn(async move {
+            do_commit_private_oram_external_recovery(
+                dispatcher.get_ref(),
+                &auth,
+                settings.get_ref(),
+                &path.collection_name,
+                &request.operation_token,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            StorageError::service_error("private ORAM external recovery commit task failed")
+        })
+        .and_then(|result| result);
     process_recovery_response(result, timing)
 }
 
@@ -267,6 +328,7 @@ fn invalid_recovery_request() -> StorageError {
 
 pub fn config_private_oram_recovery_api(cfg: &mut web::ServiceConfig) {
     cfg.service(begin_recovery)
+        .service(export_recovery_checkpoint_context)
         .service(upload_recovery_chunk)
         .service(recovery_status)
         .service(verify_recovery)
@@ -291,6 +353,21 @@ mod tests {
         };
         let rendered = format!("{operation:?}");
         assert!(!rendered.contains(token));
+        assert!(rendered.contains("[redacted]"));
+
+        let client_state_digest = "client-recovery-state-digest-sentinel";
+        let signing_key_id = "private-oram-recovery-key-sentinel";
+        let export = ExportPrivateOramExternalRecoveryCheckpointRequest {
+            expected_committed_backup_generation: 17,
+            backup_generation: 18,
+            client_recovery_state_digest: client_state_digest.to_string(),
+            owner_signing_key_id: signing_key_id.to_string(),
+        };
+        let rendered = format!("{export:?}");
+        assert!(!rendered.contains("17"));
+        assert!(!rendered.contains("18"));
+        assert!(!rendered.contains(client_state_digest));
+        assert!(!rendered.contains(signing_key_id));
         assert!(rendered.contains("[redacted]"));
     }
 

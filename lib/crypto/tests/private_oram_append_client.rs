@@ -4530,6 +4530,45 @@ fn paired_mutation_finalizer_signs_and_self_validates_the_exact_pending_artifact
 
     let durable_observations =
         private_oram_owner_prestage_read_observations_v2(&observed_read_transcripts).unwrap();
+    let durable_validation = PrivateOramAppendOwnerPrestageValidationContextV2 {
+        expected_collection_id: owner_validation.expected_collection_id,
+        expected_manifest_digest: owner_validation.expected_manifest_digest,
+        expected_owner_signing_key_id: owner_validation.expected_owner_signing_key_id,
+        expected_layout_generation: owner_validation.expected_layout_generation,
+        expected_layout_digest: owner_validation.expected_layout_digest,
+        expected_writer_lease_digest: owner_validation.expected_writer_lease_digest,
+        expected_writer_fence: owner_validation.expected_writer_fence,
+        expected_state_sequence: owner_validation.expected_state_sequence,
+        expected_old_state_digest: owner_validation.expected_old_state_digest,
+        expected_visible_point_record: owner_validation.expected_visible_point_record,
+        now_unix: owner_prepare
+            .mutation_bundle
+            .mutation
+            .new_state
+            .state
+            .signed_at_unix,
+        max_mutation_ttl_secs: owner_validation.max_mutation_ttl_secs,
+        public_key: owner_validation.public_key,
+    };
+    validate_private_oram_append_owner_prepare_from_durable_recovery_v2(
+        &manifest_bundle,
+        &owner_prepare,
+        &durable_observations,
+        durable_validation,
+    )
+    .unwrap();
+    assert!(
+        validate_private_oram_append_owner_prepare_from_durable_recovery_v2(
+            &manifest_bundle,
+            &owner_prepare,
+            &durable_observations,
+            PrivateOramAppendOwnerPrestageValidationContextV2 {
+                now_unix: owner_prepare.mutation_bundle.mutation.issued_at_unix,
+                ..durable_validation
+            },
+        )
+        .is_err()
+    );
     let reconstructed = reconstruct_private_oram_owner_prestage_read_transcripts_v2(
         &owner_prepare,
         &durable_observations,

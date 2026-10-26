@@ -27,6 +27,7 @@ use serde::Deserialize;
 use shard::files::PAYLOAD_INDEX_CONFIG_FILE;
 use shard::snapshots::snapshot_data::SnapshotData;
 use shard::snapshots::snapshot_manifest::{RecoveryType, SnapshotManifest};
+use tempfile::TempPath;
 use tokio::sync::OwnedRwLockReadGuard;
 
 use super::Collection;
@@ -44,6 +45,11 @@ use crate::private_hnsw_oram_store::{
     private_hnsw_oram_vector_name_is_safe_store_component,
     private_oram_path_component_is_client_owned_state_alias,
 };
+use crate::private_oram_owner_journal::{
+    PRIVATE_ORAM_OWNER_JOURNAL_DIR, PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+    PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1, PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+    PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2, PRIVATE_ORAM_PARENT_TERMINAL_ARCHIVE_FILE_V2,
+};
 use crate::private_result_oram_store::{PRIVATE_RESULT_ORAM_DIR, PrivateResultOramStore};
 use crate::shards::local_shard::LocalShard;
 use crate::shards::remote_shard::RemoteShard;
@@ -56,6 +62,9 @@ use crate::shards::shard_holder::{SHARD_KEY_MAPPING_FILE, ShardHolder, shard_not
 use crate::shards::{shard_initializing_flag_path, shard_path};
 
 const PRIVATE_ORAM_SNAPSHOT_MAX_EPOCH_BYTES: u64 = 16 * 1024;
+#[cfg(feature = "staging")]
+const PRIVATE_ORAM_EXTERNAL_RECOVERY_UNPACK_ERROR_KIND_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_EXTERNAL_RECOVERY_UNPACK_ERROR_KIND_FILE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateOramRecoveryShardTopology {
@@ -76,6 +85,48 @@ pub struct PrivateOramRecoveryCandidateInspection {
 enum SnapshotReplicaIdentityMode {
     Rewrite,
     Preserve,
+}
+
+pub struct PreparedCollectionSnapshot {
+    name: String,
+    archive: TempPath,
+}
+
+impl PreparedCollectionSnapshot {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn archive_path(&self) -> &Path {
+        &self.archive
+    }
+
+    pub async fn size_and_checksum(&self) -> CollectionResult<(u64, String)> {
+        let size = tokio::fs::metadata(self.archive_path()).await?.len();
+        let checksum = crate::common::sha_256::hash_file(self.archive_path()).await?;
+        Ok((size, checksum))
+    }
+}
+
+#[cfg(feature = "staging")]
+fn record_private_oram_external_recovery_unpack_error_kind(
+    replica_identity_mode: SnapshotReplicaIdentityMode,
+    error: &std::io::Error,
+) {
+    if !matches!(replica_identity_mode, SnapshotReplicaIdentityMode::Preserve)
+        || error.kind() != ErrorKind::StorageFull
+    {
+        return;
+    }
+    let Some(marker_path) =
+        std::env::var_os(PRIVATE_ORAM_EXTERNAL_RECOVERY_UNPACK_ERROR_KIND_FILE_ENV)
+    else {
+        return;
+    };
+    if marker_path.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(marker_path, b"storage_full\n");
 }
 
 #[derive(Deserialize)]
@@ -115,6 +166,26 @@ impl Collection {
         global_temp_dir: &Path,
         this_peer_id: PeerId,
     ) -> CollectionResult<SnapshotDescription> {
+        let prepared = self.prepare_snapshot(global_temp_dir, this_peer_id).await?;
+        let snapshot_path = self.snapshots_path.join(prepared.name());
+        let snapshot_manager = self.get_snapshots_storage_manager()?;
+        snapshot_manager
+            .store_file(prepared.archive_path(), snapshot_path.as_path())
+            .await
+            .map_err(|err| {
+                CollectionError::service_error(format!(
+                    "failed to store snapshot archive to {}: {err}",
+                    prepared.archive_path().display()
+                ))
+            })
+    }
+
+    /// Builds a collection snapshot archive without publishing it to snapshot storage.
+    pub async fn prepare_snapshot(
+        &self,
+        global_temp_dir: &Path,
+        this_peer_id: PeerId,
+    ) -> CollectionResult<PreparedCollectionSnapshot> {
         let collection_config = {
             let collection_config = self.collection_config.read().await;
             ensure_snapshot_crypto_migration_state_allows_snapshot(
@@ -143,9 +214,7 @@ impl Collection {
             chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S"),
         );
 
-        // Final location of snapshot
-        let snapshot_path = self.snapshots_path.join(&snapshot_name);
-        log::info!("Creating collection snapshot {snapshot_name} into {snapshot_path:?}");
+        log::info!("Preparing collection snapshot {snapshot_name}");
 
         // Dedicated temporary file for archiving this snapshot (deleted on drop)
         let snapshot_temp_arc_file = tempfile::Builder::new()
@@ -243,6 +312,22 @@ impl Collection {
             .map_err(CollectionError::from)??;
         }
 
+        if let Some(private_oram_parent_path) =
+            private_oram_snapshot_source_dir(&self.path, PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2)?
+        {
+            let tar = tar.clone();
+            tokio::task::spawn_blocking(move || {
+                blocking_append_private_oram_snapshot_dir(
+                    &tar,
+                    &private_oram_parent_path,
+                    Path::new(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2),
+                    PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+                )
+            })
+            .await
+            .map_err(CollectionError::from)??;
+        }
+
         if let Some(private_result_oram_path) =
             private_oram_snapshot_source_dir(&self.path, PRIVATE_RESULT_ORAM_DIR)?
         {
@@ -263,16 +348,10 @@ impl Collection {
             CollectionError::service_error(format!("failed to create snapshot archive: {err}"))
         })?;
 
-        let snapshot_manager = self.get_snapshots_storage_manager()?;
-        snapshot_manager
-            .store_file(snapshot_temp_arc_file.path(), snapshot_path.as_path())
-            .await
-            .map_err(|err| {
-                CollectionError::service_error(format!(
-                    "failed to store snapshot archive to {}: {err}",
-                    snapshot_temp_arc_file.path().display()
-                ))
-            })
+        Ok(PreparedCollectionSnapshot {
+            name: snapshot_name,
+            archive: snapshot_temp_arc_file.into_temp_path(),
+        })
     }
 
     /// Restore collection from snapshot
@@ -316,7 +395,15 @@ impl Collection {
     ) -> CollectionResult<()> {
         match snapshot_data {
             SnapshotData::Packed(snapshot_path) => {
-                tar_unpack_file(&snapshot_path, target_dir)?;
+                let unpack_result = tar_unpack_file(&snapshot_path, target_dir);
+                #[cfg(feature = "staging")]
+                if let Err(error) = &unpack_result {
+                    record_private_oram_external_recovery_unpack_error_kind(
+                        replica_identity_mode,
+                        error,
+                    );
+                }
+                unpack_result?;
                 snapshot_path.close()?;
             }
             SnapshotData::Unpacked(snapshot_dir) => {
@@ -344,6 +431,7 @@ impl Collection {
             target_dir,
         )
         .map_err(|err| sanitize_private_hnsw_snapshot_layout_error(target_dir, err))?;
+        Self::validate_private_oram_mutation_journal_snapshot_restore_layout(target_dir)?;
         let shard_ids_list = snapshot_shard_ids(&config, target_dir)?;
 
         for shard_id in shard_ids_list {
@@ -567,6 +655,14 @@ impl Collection {
         }
 
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn validate_private_oram_mutation_journal_snapshot_restore_layout(
+        collection_dir: &Path,
+    ) -> CollectionResult<()> {
+        private_oram_snapshot_source_dir(collection_dir, PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2)
+            .map(|_| ())
     }
 
     /// # Cancel safety
@@ -1096,6 +1192,15 @@ fn blocking_append_private_oram_snapshot_tree(
                 "{label} snapshot source contains an unsupported file type",
             )));
         }
+        if private_oram_snapshot_entry_is_unrecognized_retained_temp_state(
+            dir_name,
+            &archive_path,
+            &metadata.file_type(),
+        ) {
+            return Err(CollectionError::service_error(format!(
+                "{label} snapshot source contains incomplete private ORAM write state",
+            )));
+        }
         validate_private_oram_snapshot_archive_entry_layout(
             label,
             dir_name,
@@ -1109,7 +1214,9 @@ fn blocking_append_private_oram_snapshot_tree(
             &archive_path,
         )?;
         if metadata.file_type().is_dir() {
-            if private_oram_snapshot_entry_is_temp_dir(dir_name, depth, &file_name) {
+            if private_oram_snapshot_entry_is_temp_dir(dir_name, depth, &file_name)
+                && !private_oram_snapshot_temp_dir_retains_owner_state(dir_name, &archive_path)
+            {
                 if private_oram_snapshot_dir_has_entries(&entry.path()).map_err(|_| {
                     CollectionError::service_error(format!(
                         "{label} snapshot source cannot be inspected"
@@ -1146,6 +1253,7 @@ fn private_oram_label(dir_name: &str) -> &'static str {
     match dir_name {
         PRIVATE_HNSW_ORAM_DIR => "private HNSW ORAM",
         PRIVATE_RESULT_ORAM_DIR => "private result ORAM",
+        PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2 => "private ORAM mutation journal",
         _ => "private ORAM",
     }
 }
@@ -1183,6 +1291,15 @@ fn validate_private_oram_snapshot_source_tree(
             )));
         }
         let archive_path = archive_dir.join(entry.file_name());
+        if private_oram_snapshot_entry_is_unrecognized_retained_temp_state(
+            dir_name,
+            &archive_path,
+            &metadata.file_type(),
+        ) {
+            return Err(CollectionError::service_error(format!(
+                "{label} snapshot source contains incomplete private ORAM write state",
+            )));
+        }
         validate_private_oram_snapshot_archive_entry_layout(
             label,
             dir_name,
@@ -1197,6 +1314,7 @@ fn validate_private_oram_snapshot_source_tree(
         )?;
         if metadata.file_type().is_dir() {
             if private_oram_snapshot_entry_is_temp_dir(dir_name, depth, &entry.file_name())
+                && !private_oram_snapshot_temp_dir_retains_owner_state(dir_name, &archive_path)
                 && private_oram_snapshot_dir_has_entries(&entry.path()).map_err(|_| {
                     CollectionError::service_error(format!(
                         "{label} snapshot source cannot be inspected"
@@ -1253,6 +1371,9 @@ fn private_oram_snapshot_archive_entry_matches_layout(
             &components,
             file_type,
         )),
+        PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2 => Some(
+            private_oram_snapshot_parent_journal_entry_matches_layout(&components, file_type),
+        ),
         _ => Some(true),
     }
 }
@@ -1310,8 +1431,181 @@ fn private_oram_snapshot_hnsw_entry_matches_layout(
             file_type.is_file() && private_oram_snapshot_commit_file_is_canonical(file_name)
         }
         [_vector_name, "merkle", "nodes.dat"] => file_type.is_file(),
+        [_vector_name, "temp", owner_root] if private_oram_snapshot_owner_root_name(owner_root) => {
+            file_type.is_dir()
+        }
+        [
+            _vector_name,
+            "temp",
+            PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+            tail @ ..,
+        ] => private_oram_snapshot_prestage_owner_entry_matches_layout(tail, file_type),
+        [
+            _vector_name,
+            "temp",
+            PRIVATE_ORAM_OWNER_JOURNAL_DIR,
+            tail @ ..,
+        ] => private_oram_snapshot_canonical_owner_entry_matches_layout(tail, file_type),
         _ => false,
     }
+}
+
+fn private_oram_snapshot_owner_root_name(name: &str) -> bool {
+    matches!(
+        name,
+        PRIVATE_ORAM_OWNER_JOURNAL_DIR | PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2
+    )
+}
+
+fn private_oram_snapshot_digest_component_is_canonical(name: &str) -> bool {
+    BASE64URL_NOPAD
+        .decode(name.as_bytes())
+        .is_ok_and(|bytes| bytes.len() == 32 && BASE64URL_NOPAD.encode(&bytes) == name)
+}
+
+fn private_oram_snapshot_prestage_owner_entry_matches_layout(
+    components: &[&str],
+    file_type: &std::fs::FileType,
+) -> bool {
+    match components {
+        ["intents"]
+        | ["temp"]
+        | ["terminals"]
+        | ["retired"]
+        | ["quarantine"]
+        | ["reservation-fence"] => file_type.is_dir(),
+        ["superblock.json"] => file_type.is_file(),
+        [parent, intent]
+            if matches!(*parent, "intents" | "retired" | "quarantine")
+                && private_oram_snapshot_digest_component_is_canonical(intent) =>
+        {
+            file_type.is_dir()
+        }
+        [parent, intent, file_name]
+            if matches!(*parent, "intents" | "retired" | "quarantine")
+                && private_oram_snapshot_digest_component_is_canonical(intent) =>
+        {
+            file_type.is_file()
+                && matches!(
+                    *file_name,
+                    "package.json"
+                        | "receipt.json"
+                        | "intent.json"
+                        | "adoption-pending.json"
+                        | "adopted.json"
+                        | "descriptor.bin"
+                        | "final-buckets.bin"
+                        | "state.bin"
+                )
+        }
+        ["terminals", intent] if private_oram_snapshot_digest_component_is_canonical(intent) => {
+            file_type.is_dir()
+        }
+        ["terminals", intent, "record.json"]
+            if private_oram_snapshot_digest_component_is_canonical(intent) =>
+        {
+            file_type.is_file()
+        }
+        ["reservation-fence", file_name] => {
+            file_type.is_file()
+                && matches!(
+                    *file_name,
+                    "fence.json" | "resolution.json" | "abort-release.json"
+                )
+        }
+        _ => false,
+    }
+}
+
+fn private_oram_snapshot_canonical_owner_entry_matches_layout(
+    components: &[&str],
+    file_type: &std::fs::FileType,
+) -> bool {
+    match components {
+        [completed] => {
+            file_type.is_dir() && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        [completed, "temp"] | [completed, "terminal"] => {
+            file_type.is_dir() && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        [completed, file_name] => {
+            private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+                && file_type.is_file()
+                && matches!(
+                    *file_name,
+                    "descriptor.bin"
+                        | "final-buckets.bin"
+                        | "state.bin"
+                        | "owner-terminal-archive-v1.json"
+                )
+        }
+        [completed, "terminal", "record.bin"] => {
+            file_type.is_file()
+                && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        _ => false,
+    }
+}
+
+fn private_oram_snapshot_parent_journal_entry_matches_layout(
+    components: &[&str],
+    file_type: &std::fs::FileType,
+) -> bool {
+    match components {
+        [PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2] => file_type.is_file(),
+        ["temp"] => file_type.is_dir(),
+        [completed] => {
+            file_type.is_dir() && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        [completed, "temp"] => {
+            file_type.is_dir() && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        [completed, "state_records"] => {
+            file_type.is_dir() && private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+        }
+        [completed, file_name] => {
+            private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+                && file_type.is_file()
+                && matches!(
+                    *file_name,
+                    "descriptor.json"
+                        | "immutable_manifest.json"
+                        | "state.json"
+                        | "format.json"
+                        | "cleanup_complete_v2.json"
+                        | PRIVATE_ORAM_PARENT_TERMINAL_ARCHIVE_FILE_V2
+                        | PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1
+                )
+        }
+        [completed, "state_records", record] => {
+            private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+                && file_type.is_file()
+                && private_oram_snapshot_parent_state_record_is_canonical(record)
+        }
+        _ => false,
+    }
+}
+
+fn private_oram_snapshot_parent_completed_dir_is_canonical(name: &str) -> bool {
+    let Some(generation) = name.strip_prefix("completed-v2-") else {
+        return false;
+    };
+    generation.len() == 20
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && generation
+            .parse::<u64>()
+            .is_ok_and(|generation| generation > 0)
+}
+
+fn private_oram_snapshot_parent_state_record_is_canonical(name: &str) -> bool {
+    let Some(sequence) = name.strip_suffix(".json") else {
+        return false;
+    };
+    sequence.len() == 20
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence
+            .parse::<u64>()
+            .is_ok_and(|sequence| (1..=7).contains(&sequence))
 }
 
 fn validate_private_oram_snapshot_source_epoch_file(
@@ -1365,9 +1659,61 @@ fn private_oram_snapshot_entry_is_temp_dir(
     };
     match dir_name {
         PRIVATE_RESULT_ORAM_DIR => depth == 0 && name == "temp",
-        PRIVATE_HNSW_ORAM_DIR => depth == 1 && name == "temp",
+        PRIVATE_HNSW_ORAM_DIR => (depth == 1 || depth >= 3) && name == "temp",
+        PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2 => name == "temp",
         _ => false,
     }
+}
+
+fn private_oram_snapshot_temp_dir_retains_owner_state(dir_name: &str, archive_path: &Path) -> bool {
+    let Ok(relative) = archive_path.strip_prefix(Path::new(dir_name)) else {
+        return false;
+    };
+    private_oram_snapshot_archive_components(relative).is_some_and(|components| {
+        match (dir_name, components.as_slice()) {
+            (PRIVATE_HNSW_ORAM_DIR, [_vector_name, "temp"]) => true,
+            (
+                PRIVATE_HNSW_ORAM_DIR,
+                [
+                    _vector_name,
+                    "temp",
+                    PRIVATE_ORAM_OWNER_PRESTAGE_ROOT_DIR_V2,
+                    "temp",
+                ],
+            ) => true,
+            (PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2, ["temp"]) => true,
+            (
+                PRIVATE_HNSW_ORAM_DIR,
+                [
+                    _vector_name,
+                    "temp",
+                    PRIVATE_ORAM_OWNER_JOURNAL_DIR,
+                    completed,
+                    "temp",
+                ],
+            ) => private_oram_snapshot_parent_completed_dir_is_canonical(completed),
+            (PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2, [completed, "temp"]) => {
+                private_oram_snapshot_parent_completed_dir_is_canonical(completed)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn private_oram_snapshot_entry_is_unrecognized_retained_temp_state(
+    dir_name: &str,
+    archive_path: &Path,
+    file_type: &std::fs::FileType,
+) -> bool {
+    archive_path.parent().is_some_and(|parent| {
+        private_oram_snapshot_temp_dir_retains_owner_state(dir_name, parent)
+            && !private_oram_snapshot_archive_entry_matches_layout(
+                dir_name,
+                archive_path,
+                file_type,
+            )
+            .unwrap_or(false)
+    })
 }
 
 fn private_oram_snapshot_dir_has_entries(path: &Path) -> std::io::Result<bool> {
@@ -1426,6 +1772,7 @@ fn validate_private_result_oram_snapshot_store_matches_config(
     }
     validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
         &private_result_oram_path,
+        Path::new(PRIVATE_RESULT_ORAM_DIR),
         "private result ORAM",
         PRIVATE_RESULT_ORAM_DIR,
         0,
@@ -1951,6 +2298,7 @@ fn validate_private_hnsw_oram_snapshot_store_matches_config(
     }
     validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
         &private_hnsw_root,
+        Path::new(PRIVATE_HNSW_ORAM_DIR),
         "private HNSW ORAM",
         PRIVATE_HNSW_ORAM_DIR,
         0,
@@ -1998,6 +2346,7 @@ fn validate_private_hnsw_oram_snapshot_store_matches_config(
 
 fn validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
     root: &Path,
+    archive_dir: &Path,
     label: &str,
     dir_name: &str,
     depth: usize,
@@ -2022,8 +2371,25 @@ fn validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
                 "{label} snapshot store contains a symlink",
             )));
         }
+        let archive_path = archive_dir.join(entry.file_name());
+        if private_oram_snapshot_entry_is_unrecognized_retained_temp_state(
+            dir_name,
+            &archive_path,
+            &metadata.file_type(),
+        ) {
+            return Err(CollectionError::bad_request(format!(
+                "{label} snapshot store contains incomplete private ORAM write state",
+            )));
+        }
+        validate_private_oram_snapshot_archive_entry_layout(
+            label,
+            dir_name,
+            &archive_path,
+            &metadata.file_type(),
+        )?;
         if metadata.file_type().is_dir() {
             if private_oram_snapshot_entry_is_temp_dir(dir_name, depth, &entry.file_name())
+                && !private_oram_snapshot_temp_dir_retains_owner_state(dir_name, &archive_path)
                 && private_oram_snapshot_dir_has_entries(&entry.path()).map_err(|_| {
                     CollectionError::bad_request(format!(
                         "{label} snapshot store cannot be inspected"
@@ -2036,6 +2402,7 @@ fn validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
             }
             validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
                 &entry.path(),
+                &archive_path,
                 label,
                 dir_name,
                 depth + 1,
@@ -3190,10 +3557,62 @@ mod tests {
         }
     }
 
+    fn rebind_private_result_snapshot_bucket_epoch(
+        manifest: &PrivateResultOramManifest,
+        bucket: &mut PrivateResultOramBucket,
+        index_epoch: u64,
+    ) {
+        bucket.index_epoch = index_epoch;
+        bucket.bucket_commitment = private_result_oram_bucket_commitment(
+            PrivateResultOramBucketCommitmentContext {
+                collection_id: &manifest.collection_id,
+                key_id: &manifest.key_id,
+                rk_id: &manifest.rk_id,
+                rk_epoch: manifest.rk_epoch,
+                bucket_id: bucket.bucket_id,
+                index_epoch,
+            },
+            &bucket.ciphertext_sha256,
+        )
+        .unwrap();
+    }
+
+    fn private_result_mixed_epoch_snapshot_fixture(
+        collection_id: String,
+    ) -> (PrivateResultOramManifest, Vec<PrivateResultOramBucket>) {
+        let previous = private_result_manifest(collection_id);
+        let mut current = previous.clone();
+        current.index_epoch += 1;
+        let mut buckets = (0..current.bucket_count)
+            .map(|bucket_id| private_result_snapshot_bucket(&current, bucket_id))
+            .collect::<Vec<_>>();
+        buckets[0] = private_result_snapshot_bucket(&previous, 0);
+        current.root_hash = PrivateResultOramStore::merkle_root_for_commitments(
+            &buckets
+                .iter()
+                .map(|bucket| bucket.bucket_commitment.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        (current, buckets)
+    }
+
     fn write_private_result_snapshot_fixture(
         collection_dir: &Path,
         manifest: &PrivateResultOramManifest,
     ) {
+        let buckets = (0..manifest.bucket_count)
+            .map(|bucket_id| private_result_snapshot_bucket(manifest, bucket_id))
+            .collect::<Vec<_>>();
+        write_private_result_snapshot_fixture_with_buckets(collection_dir, manifest, &buckets);
+    }
+
+    fn write_private_result_snapshot_fixture_with_buckets(
+        collection_dir: &Path,
+        manifest: &PrivateResultOramManifest,
+        buckets: &[PrivateResultOramBucket],
+    ) {
+        assert_eq!(buckets.len(), manifest.bucket_count as usize);
         let store = PrivateResultOramStore::new(collection_dir);
         let signature = PrivateResultOramSignature {
             alg: "ed25519".to_string(),
@@ -3210,18 +3629,29 @@ mod tests {
             )
             .unwrap();
 
-        let commitments = private_result_snapshot_leaf_commitments(manifest);
         for bucket_id in 0..manifest.bucket_count {
-            let bucket = private_result_snapshot_bucket(manifest, bucket_id);
+            let current_bucket = private_result_snapshot_bucket(manifest, bucket_id);
             store
                 .write_bucket(
-                    &bucket,
+                    &current_bucket,
                     manifest.index_epoch,
                     manifest.bucket_count,
                     private_result_restore_max_bucket_ciphertext_bytes(manifest).unwrap(),
                 )
                 .unwrap();
         }
+        for bucket in buckets {
+            assert!(bucket.bucket_id < manifest.bucket_count);
+            std::fs::write(
+                private_result_snapshot_bucket_path(collection_dir, bucket.bucket_id),
+                serde_json::to_vec(bucket).unwrap(),
+            )
+            .unwrap();
+        }
+        let commitments = buckets
+            .iter()
+            .map(|bucket| bucket.bucket_commitment.clone())
+            .collect();
         store
             .write_merkle_tree_from_commitments(
                 manifest.index_epoch,
@@ -4540,6 +4970,48 @@ mod tests {
     }
 
     #[test]
+    fn private_oram_snapshot_archive_preserves_empty_parent_state_directories() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-oram-snapshot-parent-empty-directories")
+            .tempdir()
+            .unwrap();
+        let parent_root = temp_dir.path().join(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2);
+        let completed = parent_root.join("completed-v2-00000000000000000001");
+        fs::create_dir_all(parent_root.join("temp")).unwrap();
+        fs::create_dir_all(completed.join("temp")).unwrap();
+        fs::create_dir_all(completed.join("state_records")).unwrap();
+        fs::write(
+            parent_root.join(PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2),
+            b"",
+        )
+        .unwrap();
+
+        let archive_path = temp_dir.path().join("snapshot.tar");
+        let tar = BuilderExt::new_seekable_owned(std::fs::File::create(&archive_path).unwrap());
+        blocking_append_private_oram_snapshot_dir(
+            &tar,
+            &parent_root,
+            Path::new(PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2),
+            PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2,
+        )
+        .unwrap();
+        tar.blocking_finish().unwrap();
+
+        let mut archive = tar::Archive::new(std::fs::File::open(&archive_path).unwrap());
+        let archived_paths = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect::<Vec<_>>();
+        assert!(archived_paths.contains(&PathBuf::from(format!(
+            "{PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2}/temp"
+        ))));
+        assert!(archived_paths.contains(&PathBuf::from(format!(
+            "{PRIVATE_ORAM_PARENT_JOURNAL_DIR_V2}/completed-v2-00000000000000000001/temp"
+        ))));
+    }
+
+    #[test]
     fn private_oram_snapshot_source_dir_rejects_non_empty_temp_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
             .prefix("private-oram-snapshot-source-non-empty-temp")
@@ -4589,6 +5061,56 @@ mod tests {
         assert!(!rendered.contains(PRIVATE_RESULT_ORAM_DIR));
         assert!(!rendered.contains("stale-result-write"));
         assert!(!rendered.contains("sentinel"));
+    }
+
+    #[test]
+    fn private_oram_snapshot_source_dir_allows_canonical_owner_archive_in_temp() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-oram-snapshot-source-owner-archive")
+            .tempdir()
+            .unwrap();
+        let completed = temp_dir
+            .path()
+            .join(PRIVATE_HNSW_ORAM_DIR)
+            .join("text")
+            .join("temp")
+            .join(PRIVATE_ORAM_OWNER_JOURNAL_DIR)
+            .join("completed-v2-00000000000000000001");
+        fs::create_dir_all(completed.join("temp")).unwrap();
+        fs::create_dir_all(completed.join("terminal")).unwrap();
+        for file_name in [
+            "descriptor.bin",
+            "final-buckets.bin",
+            "state.bin",
+            "owner-terminal-archive-v1.json",
+        ] {
+            fs::write(
+                completed.join(file_name),
+                b"canonical owner archive fixture",
+            )
+            .unwrap();
+        }
+        fs::write(
+            completed.join("terminal").join("record.bin"),
+            b"canonical owner terminal fixture",
+        )
+        .unwrap();
+
+        let source = private_oram_snapshot_source_dir(temp_dir.path(), PRIVATE_HNSW_ORAM_DIR)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, temp_dir.path().join(PRIVATE_HNSW_ORAM_DIR));
+
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let tar = BuilderExt::new_seekable_owned(File::create(archive.path()).unwrap());
+        blocking_append_private_oram_snapshot_dir(
+            &tar,
+            &source,
+            Path::new(PRIVATE_HNSW_ORAM_DIR),
+            PRIVATE_HNSW_ORAM_DIR,
+        )
+        .unwrap();
+        tar.blocking_finish().unwrap();
     }
 
     #[test]
@@ -5661,6 +6183,125 @@ mod tests {
             temp_dir.path(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn private_result_oram_restore_preflight_accepts_signed_mixed_epoch_buckets() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-result-restore-mixed-epoch")
+            .tempdir()
+            .unwrap();
+        let uuid = Uuid::from_u128(7);
+        let config = private_result_config(uuid);
+        let (manifest, buckets) = private_result_mixed_epoch_snapshot_fixture(uuid.to_string());
+        assert!(buckets[0].index_epoch < manifest.index_epoch);
+        write_private_result_snapshot_fixture_with_buckets(temp_dir.path(), &manifest, &buckets);
+
+        Collection::validate_private_result_oram_snapshot_restore_layout(
+            "docs",
+            &config,
+            temp_dir.path(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn private_result_oram_restore_preflight_rejects_future_epoch_bucket() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-result-restore-future-bucket")
+            .tempdir()
+            .unwrap();
+        let uuid = Uuid::from_u128(7);
+        let config = private_result_config(uuid);
+        let (mut manifest, mut buckets) =
+            private_result_mixed_epoch_snapshot_fixture(uuid.to_string());
+        let future_epoch = manifest.index_epoch + 1;
+        rebind_private_result_snapshot_bucket_epoch(&manifest, &mut buckets[1], future_epoch);
+        manifest.root_hash = PrivateResultOramStore::merkle_root_for_commitments(
+            &buckets
+                .iter()
+                .map(|bucket| bucket.bucket_commitment.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        write_private_result_snapshot_fixture_with_buckets(temp_dir.path(), &manifest, &buckets);
+
+        let err = Collection::validate_private_result_oram_snapshot_restore_layout(
+            "docs",
+            &config,
+            temp_dir.path(),
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("newer than requested epoch"));
+        assert!(!rendered.contains(&manifest.root_hash), "{rendered}");
+        assert_private_result_restore_error_redacts_common(&rendered);
+    }
+
+    #[test]
+    fn private_result_oram_restore_preflight_rejects_rebound_stale_bucket_epoch() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-result-restore-rebound-stale-bucket")
+            .tempdir()
+            .unwrap();
+        let uuid = Uuid::from_u128(7);
+        let config = private_result_config(uuid);
+        let (manifest, mut buckets) = private_result_mixed_epoch_snapshot_fixture(uuid.to_string());
+        write_private_result_snapshot_fixture_with_buckets(temp_dir.path(), &manifest, &buckets);
+        let stale_epoch = buckets[0].index_epoch - 1;
+        rebind_private_result_snapshot_bucket_epoch(&manifest, &mut buckets[0], stale_epoch);
+        std::fs::write(
+            private_result_snapshot_bucket_path(temp_dir.path(), 0),
+            serde_json::to_vec(&buckets[0]).unwrap(),
+        )
+        .unwrap();
+
+        let err = Collection::validate_private_result_oram_snapshot_restore_layout(
+            "docs",
+            &config,
+            temp_dir.path(),
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("bucket commitments"));
+        assert!(!rendered.contains(&manifest.root_hash), "{rendered}");
+        assert!(
+            !rendered.contains(&buckets[0].bucket_commitment),
+            "{rendered}"
+        );
+        assert_private_result_restore_error_redacts_common(&rendered);
+    }
+
+    #[test]
+    fn private_result_oram_restore_preflight_rejects_mixed_epoch_merkle_leaf_tamper() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("private-result-restore-mixed-merkle-tamper")
+            .tempdir()
+            .unwrap();
+        let uuid = Uuid::from_u128(7);
+        let config = private_result_config(uuid);
+        let (manifest, buckets) = private_result_mixed_epoch_snapshot_fixture(uuid.to_string());
+        write_private_result_snapshot_fixture_with_buckets(temp_dir.path(), &manifest, &buckets);
+        let merkle_path = temp_dir
+            .path()
+            .join(PRIVATE_RESULT_ORAM_DIR)
+            .join("merkle")
+            .join("nodes.dat");
+        let mut tree: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&merkle_path).unwrap()).unwrap();
+        tree["leaf_hashes"][0] = serde_json::Value::String(BASE64URL_NOPAD.encode(&[88; 32]));
+        std::fs::write(&merkle_path, serde_json::to_vec(&tree).unwrap()).unwrap();
+
+        let err = Collection::validate_private_result_oram_snapshot_restore_layout(
+            "docs",
+            &config,
+            temp_dir.path(),
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("Merkle tree root_hash mismatch"));
+        assert!(!rendered.contains(&manifest.root_hash), "{rendered}");
+        assert_private_result_restore_error_redacts_common(&rendered);
     }
 
     #[test]

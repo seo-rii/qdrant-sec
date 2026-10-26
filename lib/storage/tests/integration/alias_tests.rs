@@ -31,6 +31,7 @@ fn test_alias_operation() {
         storage_path: storage_dir.path().to_path_buf(),
         snapshots_path: storage_dir.path().join("snapshots"),
         snapshots_config: Default::default(),
+        private_oram_external_recovery: Default::default(),
         temp_path: None,
         on_disk_payload: false,
         optimizers: OptimizersConfig {

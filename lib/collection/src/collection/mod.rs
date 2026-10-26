@@ -33,6 +33,7 @@ use common::storage_version::StorageVersion;
 use segment::types::{SeqNumberType, ShardKey};
 use semver::Version;
 use shard::operations::optimization::{OptimizationsRequestOptions, OptimizationsResponse};
+pub use snapshots::PreparedCollectionSnapshot;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 

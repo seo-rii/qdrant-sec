@@ -3,15 +3,19 @@ use std::fmt::{self, Debug, Formatter};
 use data_encoding::BASE64URL_NOPAD;
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_SIGNATURE_DOMAIN: &str =
-    "qdrant-sec/private-oram-external-recovery-checkpoint-signature/v1";
+    "qdrant-sec/private-oram-external-recovery-checkpoint-signature/v2";
 
-pub const PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_VERSION: u16 = 1;
+pub const PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_VERSION: u16 = 2;
+pub const PRIVATE_ORAM_RECOVERY_INDEX_STATE_DIGEST_DOMAIN: &str =
+    "qdrant-sec/private-oram-index-state-digest/v1";
 const PRIVATE_ORAM_RECOVERY_SIGNATURE_ALGORITHM: &str = "ed25519";
 const PRIVATE_ORAM_RECOVERY_MAX_OWNER_PEERS: usize = 10_000;
 const PRIVATE_ORAM_RECOVERY_MAX_SHARDS: usize = 1_000_000;
+const PRIVATE_ORAM_RECOVERY_MAX_INDEX_STATES: usize = 1_000_000;
 const BASE64URL_NOPAD_32_BYTE_LEN: usize = 43;
 const BASE64URL_NOPAD_64_BYTE_LEN: usize = 86;
 
@@ -33,6 +37,8 @@ pub enum PrivateOramRecoveryError {
     MalformedSignature,
     #[error("private ORAM recovery checkpoint signature verification failed")]
     InvalidCheckpointSignature,
+    #[error("private ORAM recovery index state is invalid")]
+    InvalidIndexState,
 }
 
 impl Debug for PrivateOramRecoveryError {
@@ -55,6 +61,9 @@ pub struct PrivateOramExternalRecoveryCheckpoint {
     pub owner_peer_ids: Vec<u64>,
     pub layout_digest: String,
     pub index_state_digest: String,
+    /// Base64url SHA-256 commitment to the consensus-qualified owner incarnation and exact
+    /// acknowledged parent/child archive chain included in this snapshot.
+    pub owner_snapshot_authority_digest: String,
     pub snapshot_size_bytes: u64,
     /// Lowercase hexadecimal SHA-256 used by the existing Qdrant snapshot contract.
     pub snapshot_sha256: String,
@@ -76,6 +85,7 @@ impl Debug for PrivateOramExternalRecoveryCheckpoint {
             .field("owner_peer_count", &"[redacted]")
             .field("layout_digest", &"[redacted]")
             .field("index_state_digest", &"[redacted]")
+            .field("owner_snapshot_authority_digest", &"[redacted]")
             .field("snapshot_size_bytes", &"[redacted]")
             .field("snapshot_sha256", &"[redacted]")
             .field("client_recovery_state_digest", &"[redacted]")
@@ -110,6 +120,22 @@ pub struct PrivateOramExternalRecoveryCheckpointBundle {
     pub signature: PrivateOramRecoverySignature,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateOramRecoveryIndexKind {
+    Hnsw,
+    ResultPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateOramRecoveryIndexStateRef<'a> {
+    pub collection_id: &'a str,
+    pub index_kind: PrivateOramRecoveryIndexKind,
+    pub index_name: &'a str,
+    pub index_epoch: u64,
+    pub root_hash: &'a str,
+    pub writeback_digest: Option<&'a str>,
+}
+
 impl Debug for PrivateOramExternalRecoveryCheckpointBundle {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrivateOramExternalRecoveryCheckpointBundle")
@@ -129,6 +155,7 @@ pub struct PrivateOramRecoveryValidationContext<'a> {
     pub expected_owner_peer_ids: &'a [u64],
     pub expected_layout_digest: &'a str,
     pub expected_index_state_digest: &'a str,
+    pub expected_owner_snapshot_authority_digest: &'a str,
     pub expected_snapshot_size_bytes: u64,
     pub expected_snapshot_sha256: &'a str,
     pub expected_client_recovery_state_digest: &'a str,
@@ -147,6 +174,7 @@ impl Debug for PrivateOramRecoveryValidationContext<'_> {
             .field("expected_owner_peer_count", &"[redacted]")
             .field("expected_layout_digest", &"[redacted]")
             .field("expected_index_state_digest", &"[redacted]")
+            .field("expected_owner_snapshot_authority_digest", &"[redacted]")
             .field("expected_snapshot_size_bytes", &"[redacted]")
             .field("expected_snapshot_sha256", &"[redacted]")
             .field("expected_client_recovery_state_digest", &"[redacted]")
@@ -196,6 +224,10 @@ pub fn validate_private_oram_external_recovery_checkpoint_shape(
     }
     decode_base64url_32(&checkpoint.layout_digest, "layout_digest")?;
     decode_base64url_32(&checkpoint.index_state_digest, "index_state_digest")?;
+    decode_base64url_32(
+        &checkpoint.owner_snapshot_authority_digest,
+        "owner_snapshot_authority_digest",
+    )?;
     if checkpoint.snapshot_size_bytes == 0 {
         return Err(PrivateOramRecoveryError::InvalidCheckpointField(
             "snapshot_size_bytes",
@@ -226,6 +258,70 @@ pub fn validate_private_oram_recovery_signature_shape(
     validate_resource_id(&signature.key_id, "signature.key_id")?;
     decode_base64url_64(&signature.sig)?;
     Ok(())
+}
+
+pub fn canonical_private_oram_recovery_index_state_digest(
+    collection_id: &str,
+    states: &[PrivateOramRecoveryIndexStateRef<'_>],
+) -> Result<String, PrivateOramRecoveryError> {
+    if collection_id.is_empty()
+        || collection_id.len() > 1024
+        || states.is_empty()
+        || states.len() > PRIVATE_ORAM_RECOVERY_MAX_INDEX_STATES
+    {
+        return Err(PrivateOramRecoveryError::InvalidIndexState);
+    }
+
+    let mut states = states.to_vec();
+    states.sort_by(|left, right| {
+        private_oram_recovery_index_kind_tag(left.index_kind)
+            .cmp(&private_oram_recovery_index_kind_tag(right.index_kind))
+            .then_with(|| left.index_name.as_bytes().cmp(right.index_name.as_bytes()))
+    });
+    if states.windows(2).any(|states| {
+        states[0].index_kind == states[1].index_kind && states[0].index_name == states[1].index_name
+    }) {
+        return Err(PrivateOramRecoveryError::InvalidIndexState);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(PRIVATE_ORAM_RECOVERY_INDEX_STATE_DIGEST_DOMAIN.as_bytes());
+    update_digest_length_prefixed(&mut hasher, collection_id.as_bytes());
+    hasher.update((states.len() as u64).to_be_bytes());
+    for state in states {
+        let valid_key = state.collection_id == collection_id
+            && match state.index_kind {
+                PrivateOramRecoveryIndexKind::Hnsw => {
+                    !state.index_name.is_empty() && state.index_name.len() <= 128
+                }
+                PrivateOramRecoveryIndexKind::ResultPayload => state.index_name.is_empty(),
+            };
+        if !valid_key {
+            return Err(PrivateOramRecoveryError::InvalidIndexState);
+        }
+        let root_hash = decode_base64url_32(state.root_hash, "root_hash")
+            .map_err(|_| PrivateOramRecoveryError::InvalidIndexState)?;
+        let writeback_digest = state
+            .writeback_digest
+            .map(|digest| {
+                decode_base64url_32(digest, "writeback_digest")
+                    .map_err(|_| PrivateOramRecoveryError::InvalidIndexState)
+            })
+            .transpose()?;
+
+        hasher.update([private_oram_recovery_index_kind_tag(state.index_kind)]);
+        update_digest_length_prefixed(&mut hasher, state.index_name.as_bytes());
+        hasher.update(state.index_epoch.to_be_bytes());
+        hasher.update(root_hash);
+        match writeback_digest {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest);
+            }
+            None => hasher.update([0]),
+        }
+    }
+    Ok(BASE64URL_NOPAD.encode(&hasher.finalize()))
 }
 
 pub fn try_private_oram_external_recovery_checkpoint_signature_message(
@@ -261,6 +357,7 @@ pub fn try_private_oram_external_recovery_checkpoint_signature_message(
     }
     try_push_str(&mut message, &checkpoint.layout_digest)?;
     try_push_str(&mut message, &checkpoint.index_state_digest)?;
+    try_push_str(&mut message, &checkpoint.owner_snapshot_authority_digest)?;
     push_u64(&mut message, checkpoint.snapshot_size_bytes);
     try_push_str(&mut message, &checkpoint.snapshot_sha256)?;
     try_push_str(&mut message, &checkpoint.client_recovery_state_digest)?;
@@ -338,6 +435,13 @@ pub fn validate_private_oram_external_recovery_checkpoint(
             "index_state_digest",
         ));
     }
+    if checkpoint.owner_snapshot_authority_digest
+        != context.expected_owner_snapshot_authority_digest
+    {
+        return Err(PrivateOramRecoveryError::CheckpointContextMismatch(
+            "owner_snapshot_authority_digest",
+        ));
+    }
     if checkpoint.snapshot_size_bytes != context.expected_snapshot_size_bytes {
         return Err(PrivateOramRecoveryError::CheckpointContextMismatch(
             "snapshot_size_bytes",
@@ -385,6 +489,18 @@ fn validate_resource_id(value: &str, field: &'static str) -> Result<(), PrivateO
         return Err(PrivateOramRecoveryError::InvalidCheckpointField(field));
     }
     Ok(())
+}
+
+fn private_oram_recovery_index_kind_tag(index_kind: PrivateOramRecoveryIndexKind) -> u8 {
+    match index_kind {
+        PrivateOramRecoveryIndexKind::Hnsw => 1,
+        PrivateOramRecoveryIndexKind::ResultPayload => 2,
+    }
+}
+
+fn update_digest_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn validate_strictly_increasing_u32(
@@ -503,7 +619,7 @@ mod tests {
 
     fn fixture_checkpoint() -> PrivateOramExternalRecoveryCheckpoint {
         PrivateOramExternalRecoveryCheckpoint {
-            version: 1,
+            version: PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_VERSION,
             collection_id: "collection-uuid-1".to_string(),
             backup_generation: 31,
             source_peer_id: 17,
@@ -512,6 +628,7 @@ mod tests {
             owner_peer_ids: vec![11, 17, 29],
             layout_digest: BASE64URL_NOPAD.encode(&[41; 32]),
             index_state_digest: BASE64URL_NOPAD.encode(&[42; 32]),
+            owner_snapshot_authority_digest: BASE64URL_NOPAD.encode(&[43; 32]),
             snapshot_size_bytes: 1_048_576,
             snapshot_sha256: "2b".repeat(32),
             client_recovery_state_digest: BASE64URL_NOPAD.encode(&[44; 32]),
@@ -533,6 +650,7 @@ mod tests {
             expected_owner_peer_ids: &checkpoint.owner_peer_ids,
             expected_layout_digest: &checkpoint.layout_digest,
             expected_index_state_digest: &checkpoint.index_state_digest,
+            expected_owner_snapshot_authority_digest: &checkpoint.owner_snapshot_authority_digest,
             expected_snapshot_size_bytes: checkpoint.snapshot_size_bytes,
             expected_snapshot_sha256: &checkpoint.snapshot_sha256,
             expected_client_recovery_state_digest: &checkpoint.client_recovery_state_digest,
@@ -542,13 +660,50 @@ mod tests {
     }
 
     #[test]
+    fn recovery_index_state_digest_matches_consensus_known_answer() {
+        let collection_id = "collection-uuid-1";
+        let hnsw_root = BASE64URL_NOPAD.encode(&[42; 32]);
+        let hnsw_writeback = BASE64URL_NOPAD.encode(&[12; 32]);
+        let result_root = BASE64URL_NOPAD.encode(&[43; 32]);
+        let hnsw = PrivateOramRecoveryIndexStateRef {
+            collection_id,
+            index_kind: PrivateOramRecoveryIndexKind::Hnsw,
+            index_name: "text",
+            index_epoch: 42,
+            root_hash: &hnsw_root,
+            writeback_digest: Some(&hnsw_writeback),
+        };
+        let result = PrivateOramRecoveryIndexStateRef {
+            collection_id,
+            index_kind: PrivateOramRecoveryIndexKind::ResultPayload,
+            index_name: "",
+            index_epoch: 43,
+            root_hash: &result_root,
+            writeback_digest: None,
+        };
+        let digest =
+            canonical_private_oram_recovery_index_state_digest(collection_id, &[result, hnsw])
+                .unwrap();
+        assert_eq!(digest, "n7nIXIYcknwRMw-RNISCQyIc51XTAfh2mKJDV3-qvFQ");
+        assert_eq!(
+            canonical_private_oram_recovery_index_state_digest(collection_id, &[hnsw, result],)
+                .unwrap(),
+            digest,
+        );
+        assert!(
+            canonical_private_oram_recovery_index_state_digest(collection_id, &[hnsw, hnsw],)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn recovery_checkpoint_signature_known_answer_is_stable() {
         let checkpoint = fixture_checkpoint();
         let message =
             try_private_oram_external_recovery_checkpoint_signature_message(&checkpoint).unwrap();
         assert_eq!(
             BASE64URL_NOPAD.encode(Sha256::digest(&message).as_ref()),
-            "hxUQN8i56xcpwMnx47J2sw4J_yzxydt8GILYr_wF_IU"
+            "BwxfkBQvVTuSIC-l2Y8icu2nTisoMH-FNj9GhMO4aCU"
         );
 
         let signature =
@@ -556,7 +711,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             signature.sig,
-            "_gbHSa_lGRZlSCU96G5ZJMdsyZWJNVF0HVEU0VB-q9Wv5TktItp3mx3a8xiYBz6tCOsIlLZcxGzNZF26lF8pBg"
+            "QdWwkafScV2Ox6jn_8DJpxuBYFuT07iGPXsVs5KD0VqidxZzxF1cNo5S9h6tiZ68nM0a1fj0Gd3GQIOPGL-5Bg"
         );
     }
 
@@ -659,6 +814,16 @@ mod tests {
                 "client_recovery_state_digest"
             ))
         ));
+
+        let mut checkpoint = fixture_checkpoint();
+        checkpoint.owner_snapshot_authority_digest =
+            "owner-snapshot-authority-digest-sentinel".to_string();
+        assert!(matches!(
+            sign_private_oram_external_recovery_checkpoint(&deterministic_key_pair(), &checkpoint),
+            Err(PrivateOramRecoveryError::InvalidCheckpointField(
+                "owner_snapshot_authority_digest"
+            ))
+        ));
     }
 
     #[test]
@@ -679,6 +844,21 @@ mod tests {
             ),
             Err(PrivateOramRecoveryError::CheckpointContextMismatch(
                 "layout_generation"
+            ))
+        ));
+
+        let stale_owner_snapshot_authority_digest = BASE64URL_NOPAD.encode(&[99; 32]);
+        let mut context =
+            fixture_validation_context(&bundle.checkpoint, key_pair.public_key().as_ref());
+        context.expected_owner_snapshot_authority_digest = &stale_owner_snapshot_authority_digest;
+        assert!(matches!(
+            validate_private_oram_external_recovery_checkpoint(
+                &bundle.checkpoint,
+                Some(&bundle.signature),
+                context,
+            ),
+            Err(PrivateOramRecoveryError::CheckpointContextMismatch(
+                "owner_snapshot_authority_digest"
             ))
         ));
 
@@ -761,6 +941,7 @@ mod tests {
             checkpoint.collection_id.as_str(),
             checkpoint.layout_digest.as_str(),
             checkpoint.index_state_digest.as_str(),
+            checkpoint.owner_snapshot_authority_digest.as_str(),
             checkpoint.snapshot_sha256.as_str(),
             checkpoint.client_recovery_state_digest.as_str(),
             checkpoint.owner_signing_key_id.as_str(),

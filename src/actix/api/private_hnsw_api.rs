@@ -546,6 +546,7 @@ pub fn config_private_hnsw_api(cfg: &mut web::ServiceConfig) {
 #[cfg(test)]
 mod private_hnsw_rest_tests {
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use actix_web::http::StatusCode;
     use actix_web::{App, test as actix_test, web};
@@ -3721,7 +3722,7 @@ mod private_hnsw_rest_tests {
             let search_run = fixture.run_single_search_collect_writeback();
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 "docs",
             )

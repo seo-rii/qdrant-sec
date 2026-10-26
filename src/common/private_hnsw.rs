@@ -699,6 +699,78 @@ impl PrivateHnswSessionRegistry {
         Ok(())
     }
 
+    fn begin_collection_lifecycle_operation_for_paired_session(
+        &mut self,
+        collection_id: &str,
+        vector_name: &str,
+        session_id: &str,
+        now_unix: u64,
+    ) -> StorageResult<()> {
+        self.expire(now_unix);
+        if self
+            .active_snapshot_by_collection
+            .contains_key(collection_id)
+        {
+            return Err(StorageError::bad_request(
+                "private HNSW ORAM collection lifecycle operation requires no active collection snapshot",
+            ));
+        }
+        if self.active_lifecycle_by_collection.contains(collection_id) {
+            return Err(StorageError::bad_request(
+                "private HNSW ORAM collection lifecycle operation requires no active collection lifecycle operation",
+            ));
+        }
+        if self.has_active_upload_collection(collection_id) {
+            return Err(StorageError::bad_request(
+                "private HNSW ORAM collection lifecycle operation requires no active private ORAM upload",
+            ));
+        }
+
+        let index_key = private_hnsw_index_key(collection_id, vector_name);
+        let exact_session = self.sessions.get(session_id).is_some_and(|session| {
+            session.owner == PrivateHnswSessionOwner::PairedMutation
+                && session.collection_id == collection_id
+                && session.vector_name == vector_name
+                && !session.commit_in_progress
+        });
+        if !exact_session
+            || !self
+                .active_writer_by_index
+                .get(&index_key)
+                .is_some_and(|active| active == session_id)
+        {
+            return Err(StorageError::bad_request(
+                "private HNSW ORAM collection lifecycle operation requires the exact paired mutation session",
+            ));
+        }
+        if self.sessions.iter().any(|(active_id, session)| {
+            active_id != session_id && session.collection_id == collection_id
+        }) || self.active_writer_by_index.iter().any(
+            |((active_collection_id, active_vector_name), active_id)| {
+                active_collection_id == collection_id
+                    && (active_vector_name != vector_name || active_id != session_id)
+            },
+        ) {
+            return Err(StorageError::bad_request(
+                "private HNSW ORAM collection lifecycle operation requires no other active private ORAM session",
+            ));
+        }
+
+        self.sessions.remove(session_id).ok_or_else(|| {
+            StorageError::service_error(
+                "private HNSW ORAM paired lifecycle handoff lost its exact session",
+            )
+        })?;
+        if self.active_writer_by_index.remove(&index_key).as_deref() != Some(session_id) {
+            return Err(StorageError::service_error(
+                "private HNSW ORAM paired lifecycle handoff lost its exact writer lock",
+            ));
+        }
+        self.active_lifecycle_by_collection
+            .insert(collection_id.to_string());
+        Ok(())
+    }
+
     fn release_collection_snapshot(&mut self, collection_id: &str) {
         let Some(count) = self.active_snapshot_by_collection.get_mut(collection_id) else {
             return;
@@ -1348,6 +1420,34 @@ pub(crate) fn begin_private_hnsw_collection_lifecycle(
         .lock()
         .map_err(|_| StorageError::service_error("private HNSW ORAM session registry poisoned"))?;
     registry.begin_collection_lifecycle_operation(&collection_crypto_id, now_unix)?;
+    Ok(Some(PrivateHnswCollectionSnapshotGuard {
+        collection_id: collection_crypto_id,
+        kind: PrivateHnswCollectionGuardKind::Lifecycle,
+    }))
+}
+
+pub(crate) fn begin_private_hnsw_collection_lifecycle_for_paired_mutation(
+    collection_name: &str,
+    config: &CollectionConfigInternal,
+    vector_name: &str,
+    session_id: &str,
+) -> StorageResult<Option<PrivateHnswCollectionSnapshotGuard>> {
+    if !collection_uses_private_hnsw_oram(config) {
+        return Ok(None);
+    }
+
+    validate_private_hnsw_session_id_shape(session_id)?;
+    let collection_crypto_id = config.stable_crypto_id(collection_name)?;
+    let now_unix = current_unix_secs()?;
+    let mut registry = session_registry()
+        .lock()
+        .map_err(|_| StorageError::service_error("private HNSW ORAM session registry poisoned"))?;
+    registry.begin_collection_lifecycle_operation_for_paired_session(
+        &collection_crypto_id,
+        vector_name,
+        session_id,
+        now_unix,
+    )?;
     Ok(Some(PrivateHnswCollectionSnapshotGuard {
         collection_id: collection_crypto_id,
         kind: PrivateHnswCollectionGuardKind::Lifecycle,
@@ -7394,6 +7494,84 @@ mod private_hnsw_tests {
                 .is_ok()
         );
         registry.release_collection_lifecycle_operation("other-collection");
+    }
+
+    #[test]
+    fn paired_session_lifecycle_handoff_is_exact_and_blocks_new_sessions() {
+        let now = 10;
+        let mut registry = PrivateHnswSessionRegistry::default();
+        registry
+            .open(fixture_session("standalone-session", 20), now)
+            .unwrap();
+        let error = registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                "collection-uuid-1",
+                "text",
+                "standalone-session",
+                now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exact paired mutation session"));
+        assert!(registry.has_active_index("collection-uuid-1", "text", now));
+        assert!(registry.close("collection-uuid-1", "text", "standalone-session", now,));
+
+        let mut paired = fixture_session("paired-session", 20);
+        paired.owner = PrivateHnswSessionOwner::PairedMutation;
+        registry.open(paired, now).unwrap();
+        let error = registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                "collection-uuid-1",
+                "text",
+                "wrong-session",
+                now,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exact paired mutation session"));
+        assert!(registry.has_active_index("collection-uuid-1", "text", now));
+
+        let mut other = fixture_session("other-paired-session", 20);
+        other.vector_name = "image".to_string();
+        other.owner = PrivateHnswSessionOwner::PairedMutation;
+        registry.open(other, now).unwrap();
+        let error = registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                "collection-uuid-1",
+                "text",
+                "paired-session",
+                now,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no other active private ORAM session")
+        );
+        registry
+            .release_paired("collection-uuid-1", "image", "other-paired-session", now)
+            .unwrap();
+
+        registry
+            .begin_collection_lifecycle_operation_for_paired_session(
+                "collection-uuid-1",
+                "text",
+                "paired-session",
+                now,
+            )
+            .unwrap();
+        assert!(!registry.has_active_collection("collection-uuid-1", now));
+        let error = registry
+            .open(fixture_session("new-session", 20), now)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session open requires no active collection lifecycle operation")
+        );
+
+        registry.release_collection_lifecycle_operation("collection-uuid-1");
+        registry
+            .open(fixture_session("new-session", 20), now)
+            .unwrap();
     }
 
     #[test]

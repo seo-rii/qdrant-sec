@@ -10,7 +10,7 @@ use shard::PeerId;
 use storage::types::ConsensusThreadStatus;
 
 use super::telemetry_ops::hardware::HardwareTelemetry;
-use crate::common::telemetry::TelemetryData;
+use crate::common::telemetry::{PrivateOramExternalRecoveryTelemetry, TelemetryData};
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppFeaturesTelemetry};
 use crate::common::telemetry_ops::cluster_telemetry::{ClusterStatusTelemetry, ClusterTelemetry};
 use crate::common::telemetry_ops::collections_telemetry::{
@@ -61,6 +61,7 @@ const REST_ENDPOINT_WHITELIST: &[&str] = &[
     "/collections/{collection_name}/private-oram/recovery/abort",
     "/collections/{collection_name}/private-oram/recovery/begin",
     "/collections/{collection_name}/private-oram/recovery/commit",
+    "/collections/{collection_name}/private-oram/recovery/export-context",
     "/collections/{collection_name}/private-oram/recovery/status",
     "/collections/{collection_name}/private-oram/recovery/upload",
     "/collections/{collection_name}/private-oram/recovery/verify",
@@ -157,6 +158,13 @@ fn canonical_rest_endpoint_label(endpoint: &str) -> Option<&str> {
         ["collections", _, "private-oram", "recovery", "begin"] => {
             Some("/collections/{collection_name}/private-oram/recovery/begin")
         }
+        [
+            "collections",
+            _,
+            "private-oram",
+            "recovery",
+            "export-context",
+        ] => Some("/collections/{collection_name}/private-oram/recovery/export-context"),
         ["collections", _, "private-oram", "recovery", "commit"] => {
             Some("/collections/{collection_name}/private-oram/recovery/commit")
         }
@@ -281,12 +289,70 @@ impl MetricsProvider for TelemetryData {
         if let Some(mem) = &self.memory {
             mem.add_metrics(metrics, prefix);
         }
+        if let Some(private_oram_external_recovery) = &self.private_oram_external_recovery {
+            private_oram_external_recovery.add_metrics(metrics, prefix);
+        }
 
         #[cfg(target_os = "linux")]
         match procfs_metrics::ProcFsMetrics::collect() {
             Ok(procfs_provider) => procfs_provider.add_metrics(metrics, prefix),
             Err(err) => log::warn!("Error reading procfs infos: {err:?}"),
         };
+    }
+}
+
+impl MetricsProvider for PrivateOramExternalRecoveryTelemetry {
+    fn add_metrics(&self, metrics: &mut MetricsData, prefix: Option<&str>) {
+        for (name, help, value) in [
+            (
+                "private_oram_external_recovery_reserved_bytes",
+                "bytes reserved for staged private ORAM external recovery operations",
+                self.reserved_bytes,
+            ),
+            (
+                "private_oram_external_recovery_staging_reservations",
+                "number of private ORAM external recovery staging reservations",
+                self.staging_reservations,
+            ),
+            (
+                "private_oram_external_recovery_worker_limit",
+                "configured private ORAM external recovery heavy worker limit",
+                self.worker_limit,
+            ),
+            (
+                "private_oram_external_recovery_workers_in_use",
+                "private ORAM external recovery heavy workers currently in use",
+                self.workers_in_use,
+            ),
+        ] {
+            metrics.push_metric(metric_family(
+                name,
+                help,
+                MetricType::GAUGE,
+                vec![gauge(value as f64, &[])],
+                prefix,
+            ));
+        }
+        for (name, help, value) in [
+            (
+                "private_oram_external_recovery_preflight_scanned_logical_bytes_total",
+                "logical archive bytes accepted by private ORAM external recovery preflight",
+                self.preflight_scanned_logical_bytes,
+            ),
+            (
+                "private_oram_external_recovery_preflight_scanned_entries_total",
+                "archive entries accepted by private ORAM external recovery preflight",
+                self.preflight_scanned_entries,
+            ),
+        ] {
+            metrics.push_metric(metric_family(
+                name,
+                help,
+                MetricType::COUNTER,
+                vec![counter(value as f64, &[])],
+                prefix,
+            ));
+        }
     }
 }
 
@@ -1522,6 +1588,7 @@ mod tests {
             "/collections/{collection_name}/private-oram/recovery/abort",
             "/collections/{collection_name}/private-oram/recovery/begin",
             "/collections/{collection_name}/private-oram/recovery/commit",
+            "/collections/{collection_name}/private-oram/recovery/export-context",
             "/collections/{collection_name}/private-oram/recovery/status",
             "/collections/{collection_name}/private-oram/recovery/upload",
             "/collections/{collection_name}/private-oram/recovery/verify",
@@ -1564,10 +1631,53 @@ mod tests {
     }
 
     #[test]
+    fn test_private_oram_external_recovery_resource_metrics_are_unlabelled() {
+        use super::{MetricsData, MetricsProvider, PrivateOramExternalRecoveryTelemetry};
+
+        let telemetry = PrivateOramExternalRecoveryTelemetry {
+            reserved_bytes: 11,
+            staging_reservations: 2,
+            worker_limit: 3,
+            workers_in_use: 1,
+            preflight_scanned_logical_bytes: 17,
+            preflight_scanned_entries: 5,
+        };
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, Some("qdrant_"));
+        let output = metrics.format_metrics();
+
+        for expected in [
+            "qdrant_private_oram_external_recovery_reserved_bytes 11",
+            "qdrant_private_oram_external_recovery_staging_reservations 2",
+            "qdrant_private_oram_external_recovery_worker_limit 3",
+            "qdrant_private_oram_external_recovery_workers_in_use 1",
+            "qdrant_private_oram_external_recovery_preflight_scanned_logical_bytes_total 17",
+            "qdrant_private_oram_external_recovery_preflight_scanned_entries_total 5",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing metric `{expected}`:\n{output}"
+            );
+        }
+        assert!(!output.contains('{'));
+        assert!(!output.contains("collection=\""));
+        assert!(!output.contains("operation_id=\""));
+        assert!(!output.contains("root_hash=\""));
+    }
+
+    #[test]
     fn test_private_oram_recovery_metrics_normalizes_only_fixed_route_shapes() {
         use super::canonical_rest_endpoint_label;
 
-        for action in ["begin", "upload", "status", "verify", "commit", "abort"] {
+        for action in [
+            "begin",
+            "export-context",
+            "upload",
+            "status",
+            "verify",
+            "commit",
+            "abort",
+        ] {
             let raw =
                 format!("/collections/docs/private-oram/recovery/{action}?operation_id=sentinel");
             let canonical =

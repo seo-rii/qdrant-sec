@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use collection::collection::{Collection, PreparedCollectionSnapshot};
 use collection::common::snapshots_manager::SnapshotStorageManager;
 use collection::operations::snapshot_ops::SnapshotDescription;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
@@ -14,6 +16,15 @@ use crate::content_manager::errors::StorageError;
 use crate::rbac::CollectionPass;
 
 impl TableOfContent {
+    /// Pins the collection registry and alias namespace while a full snapshot plan is prepared.
+    pub async fn acquire_snapshot_collection_lifecycle_guard(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.collection_lifecycle_lock)
+            .lock_owned()
+            .await
+    }
+
     pub fn get_snapshots_storage_manager(&self) -> Result<SnapshotStorageManager, StorageError> {
         SnapshotStorageManager::new(&self.storage_config.snapshots_config).map_err(|err| {
             StorageError::service_error(format!(
@@ -54,20 +65,40 @@ impl TableOfContent {
         &self,
         collection_pass: &CollectionPass<'_>,
     ) -> Result<SnapshotDescription, StorageError> {
+        let collection = self.get_collection(collection_pass).await?;
+        let prepared = self.prepare_snapshot(&collection).await?;
+        self.publish_snapshot(&collection, prepared).await
+    }
+
+    pub async fn prepare_snapshot(
+        &self,
+        collection: &Collection,
+    ) -> Result<PreparedCollectionSnapshot, StorageError> {
         // Increment snapshot telemetry/mertic counter and account for the whole scope.
         // (This must be a named variable so it doesn't get dropped prematurely!)
-        let _running_snapshots_guard = self.count_snapshot_creation(collection_pass.name());
+        let _running_snapshots_guard = self.count_snapshot_creation(collection.name());
 
         // create all the directories of the derived collection snapshot path of
         // the collection.
-        self.create_snapshots_path(collection_pass.name()).await?;
+        self.create_snapshots_path(collection.name()).await?;
 
-        let collection = self.get_collection(collection_pass).await?;
         // We want to use temp dir inside the temp_path (storage if not specified), because it is possible, that
         // snapshot directory is mounted as network share and multiple writes to it could be slow
         let temp_dir = self.optional_temp_or_storage_temp_path()?;
         Ok(collection
-            .create_snapshot(&temp_dir, self.this_peer_id)
+            .prepare_snapshot(&temp_dir, self.this_peer_id)
+            .await?)
+    }
+
+    pub async fn publish_snapshot(
+        &self,
+        collection: &Collection,
+        prepared: PreparedCollectionSnapshot,
+    ) -> Result<SnapshotDescription, StorageError> {
+        let snapshot_path = collection.snapshots_path().join(prepared.name());
+        let snapshot_manager = self.get_snapshots_storage_manager()?;
+        Ok(snapshot_manager
+            .store_file(prepared.archive_path(), &snapshot_path)
             .await?)
     }
 

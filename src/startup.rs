@@ -76,16 +76,22 @@ mod tests {
 
     #[test]
     fn panic_message_and_backtrace_redact_crypto_material() {
+        let result_payload = "qsec-v2-private-result-payload-3f7a9c";
+        let client_recovery_payload = "qsec-v2-client-recovery-state-payload-8d4c1a";
         let (message, backtrace) = redact_panic_message_and_backtrace(
-            r#"panic while handling {"$qdrant_client_aead":{"ciphertext":"payload-sentinel"}} readPath=panic-read-path-sentinel"#,
-            "frame with X-Amz-Security-Token: aws-token-sentinel readPathLabel=panic-read-path-label-sentinel",
+            &format!(
+                r#"panic while handling payload_plaintext={{"body":"{result_payload}"}} readPath=panic-read-path-sentinel"#
+            ),
+            &format!(
+                "frame with client_recovery_state={client_recovery_payload} readPathLabel=panic-read-path-label-sentinel"
+            ),
         );
 
         assert!(message.contains("crypto material omitted"));
         assert!(backtrace.contains("crypto material omitted"));
-        assert!(!message.contains("payload-sentinel"));
+        assert!(!message.contains(result_payload));
         assert!(!message.contains("panic-read-path-sentinel"));
-        assert!(!backtrace.contains("aws-token-sentinel"));
+        assert!(!backtrace.contains(client_recovery_payload));
         assert!(!backtrace.contains("panic-read-path-label-sentinel"));
     }
 }

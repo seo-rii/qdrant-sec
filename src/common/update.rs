@@ -3543,6 +3543,7 @@ mod tests {
             storage_path: storage_path.to_path_buf(),
             snapshots_path: storage_path.join("snapshots"),
             snapshots_config: Default::default(),
+            private_oram_external_recovery: Default::default(),
             temp_path: None,
             on_disk_payload: false,
             optimizers: OptimizersConfig {
@@ -9062,6 +9063,7 @@ esac
             storage_path: storage_dir.path().to_path_buf(),
             snapshots_path: storage_dir.path().join("snapshots"),
             snapshots_config: Default::default(),
+            private_oram_external_recovery: Default::default(),
             temp_path: None,
             on_disk_payload: false,
             optimizers: OptimizersConfig {
@@ -12016,6 +12018,7 @@ esac
             storage_path: storage_dir.path().to_path_buf(),
             snapshots_path: storage_dir.path().join("snapshots"),
             snapshots_config: Default::default(),
+            private_oram_external_recovery: Default::default(),
             temp_path: Some(temp_dir.path().to_path_buf()),
             on_disk_payload: false,
             optimizers: OptimizersConfig {
@@ -15119,6 +15122,7 @@ esac
             storage_path: storage_dir.path().to_path_buf(),
             snapshots_path: storage_dir.path().join("snapshots"),
             snapshots_config: Default::default(),
+            private_oram_external_recovery: Default::default(),
             temp_path: Some(temp_dir.path().to_path_buf()),
             on_disk_payload: false,
             optimizers: OptimizersConfig {
@@ -15497,6 +15501,7 @@ esac
             storage_path: storage_dir.path().to_path_buf(),
             snapshots_path: storage_dir.path().join("snapshots"),
             snapshots_config: Default::default(),
+            private_oram_external_recovery: Default::default(),
             temp_path: Some(temp_dir.path().to_path_buf()),
             on_disk_payload: false,
             optimizers: OptimizersConfig {

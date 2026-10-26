@@ -3152,7 +3152,7 @@ mod private_result_oram_grpc_tests {
             );
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 COLLECTION_NAME,
             )

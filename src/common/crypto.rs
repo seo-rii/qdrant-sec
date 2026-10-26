@@ -10325,7 +10325,7 @@ mod tests {
         );
         assert_eq!(
             private_oram_mutation_v3_binary_capability_digest(),
-            "dAtfKtcZBHNaXhM-amdoNULrgFbKmnO_EWz8LcJy3l4",
+            "L4bvm-MmPi0OJ8VB3qyYuBiDYuZXFW51gAcmXdu2agY",
         );
     }
 

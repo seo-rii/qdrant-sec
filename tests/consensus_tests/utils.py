@@ -148,7 +148,17 @@ def init_pytest_log_folder() -> str:
 
 
 # Starts a peer and returns its api_uri
-def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False, uris_in_env=False, p2p_tls=False) -> str:
+def start_peer(
+    peer_dir: Path,
+    log_file: str,
+    bootstrap_uri: str,
+    port=None,
+    extra_env=None,
+    reinit=False,
+    uris_in_env=False,
+    p2p_tls=False,
+    capture_stderr=False,
+) -> str:
     if extra_env is None:
         extra_env = {}
     p2p_port = get_port() if port is None else port + 0
@@ -182,13 +192,28 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
     # Wrap with systemd-run to throttle CPU to investigate issues
     # wrapped_cmd = ["systemd-run", "--user", "--scope", "-p", "CPUQuota=20%", "--"] + args
     # proc = Popen(wrapped_cmd, env=env, cwd=peer_dir, stdout=log_file)
-    proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
+    proc = Popen(
+        args,
+        env=env,
+        cwd=peer_dir,
+        stdout=log_file,
+        stderr=log_file if capture_stderr else None,
+    )
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port)
 
 
 # Starts a peer and returns its api_uri and p2p_uri
-def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False, uris_in_env=False, p2p_tls=False) -> Tuple[str, str]:
+def start_first_peer(
+    peer_dir: Path,
+    log_file: str,
+    port=None,
+    extra_env=None,
+    reinit=False,
+    uris_in_env=False,
+    p2p_tls=False,
+    capture_stderr=False,
+) -> Tuple[str, str]:
     if extra_env is None:
         extra_env = {}
 
@@ -222,7 +247,13 @@ def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, r
     # Wrap with systemd-run to throttle CPU to investigate issues
     # wrapped_cmd = ["systemd-run", "--user", "--scope", "-p", "CPUQuota=20%", "--"] + args
     # proc = Popen(wrapped_cmd, env=env, cwd=peer_dir, stdout=log_file)
-    proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
+    proc = Popen(
+        args,
+        env=env,
+        cwd=peer_dir,
+        stdout=log_file,
+        stderr=log_file if capture_stderr else None,
+    )
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port), bootstrap_uri
 

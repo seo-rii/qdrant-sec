@@ -49,7 +49,9 @@ use uuid::Uuid;
 
 use super::auth::Auth;
 use super::private_hnsw::begin_private_hnsw_collection_snapshot;
+use super::private_oram_mutation_session::acquire_private_oram_mutation_snapshot_guard_v2;
 use super::private_result_oram::begin_private_result_oram_collection_snapshot;
+use super::snapshots::private_oram_snapshot_pause_after_prepare;
 use crate::settings::Settings;
 #[cfg(feature = "staging")]
 use crate::tonic::api::qdrant_internal_api::apply_private_oram_preinstall_restart_pause;
@@ -229,7 +231,7 @@ pub async fn do_list_snapshots(
 }
 
 pub async fn do_create_snapshot(
-    toc: Arc<TableOfContent>,
+    dispatcher: Arc<Dispatcher>,
     auth: &Auth,
     collection_name: &str,
 ) -> Result<SnapshotDescription, StorageError> {
@@ -241,17 +243,38 @@ pub async fn do_create_snapshot(
         )?
         .into_static();
 
+    let pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &pass).clone();
+    let collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
     let collection = toc.get_collection(&collection_pass).await?;
     let config = collection.config_snapshot().await;
+    let private_oram_mutation_snapshot_guard = acquire_private_oram_mutation_snapshot_guard_v2(
+        &dispatcher,
+        Arc::clone(&collection),
+        &config,
+    )
+    .await?;
     let private_hnsw_snapshot_guard =
         begin_private_hnsw_collection_snapshot(collection.name(), &config)?;
     let private_result_snapshot_guard =
         begin_private_result_oram_collection_snapshot(collection.name(), &config)?;
 
+    let post_dispatcher = Arc::clone(&dispatcher);
     let result = tokio::spawn(async move {
+        let _collection_lifecycle_guard = collection_lifecycle_guard;
+        let private_oram_mutation_snapshot_guard = private_oram_mutation_snapshot_guard;
         let _private_hnsw_snapshot_guard = private_hnsw_snapshot_guard;
         let _private_result_snapshot_guard = private_result_snapshot_guard;
-        toc.create_snapshot(&collection_pass).await
+        let prepared = toc.prepare_snapshot(&collection).await?;
+        private_oram_snapshot_pause_after_prepare("collection").await;
+        if let Some(guard) = &private_oram_mutation_snapshot_guard {
+            post_dispatcher
+                .linearizable_private_oram_snapshot_barrier(None)
+                .await?;
+            guard.validate_held(&post_dispatcher).await?;
+        }
+        let snapshot = toc.publish_snapshot(&collection, prepared).await?;
+        Ok::<SnapshotDescription, StorageError>(snapshot)
     })
     .await??;
 

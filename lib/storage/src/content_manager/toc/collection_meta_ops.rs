@@ -20,7 +20,8 @@ use crate::common::utils::try_unwrap_with_timeout_async;
 use crate::content_manager::collection_meta_ops::*;
 use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus_ops::{
-    ConsensusOperations, PrivateOramCollectionLayoutTransition, PrivateOramReshardingOperation,
+    ConsensusOperations, PrivateOramCollectionLayoutTransition, PrivateOramMutationKey,
+    PrivateOramReshardingOperation,
 };
 use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
@@ -38,6 +39,26 @@ enum ReshardingApplyAuthority {
 enum ShardKeyApplyAuthority {
     Ordinary,
     PrivateOramConsensus,
+}
+
+fn private_oram_pending_acknowledgement_matches_collection(
+    collection_id: &str,
+    pending_acknowledgements: &[(PrivateOramMutationKey, PeerId, u64)],
+) -> bool {
+    pending_acknowledgements
+        .iter()
+        .any(|(key, _, _)| key.collection_id == collection_id)
+}
+
+fn private_oram_archive_ack_fenced_collection_name(
+    operation: &CollectionMetaOperations,
+) -> Option<&str> {
+    match operation {
+        CollectionMetaOperations::DeleteCollection(operation) => Some(&operation.0),
+        CollectionMetaOperations::CreatePayloadIndex(operation) => Some(&operation.collection_name),
+        CollectionMetaOperations::DropPayloadIndex(operation) => Some(&operation.collection_name),
+        _ => None,
+    }
 }
 
 impl TableOfContent {
@@ -58,6 +79,19 @@ impl TableOfContent {
     ) -> Result<bool, StorageError> {
         self.require_private_oram_external_recovery_meta_allowed(&operation)
             .await?;
+        if let Some(collection_name) = private_oram_archive_ack_fenced_collection_name(&operation) {
+            match self.get_collection_unfenced(collection_name).await {
+                Ok((_, collection)) => {
+                    let collection_config = collection.config_snapshot().await;
+                    self.require_private_oram_archive_acknowledgement_before_config_change(
+                        collection_name,
+                        &collection_config,
+                    )?;
+                }
+                Err(StorageError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
         match operation {
             CollectionMetaOperations::CreateCollection(mut operation) => {
                 log::info!("Creating collection {}", operation.collection_name);
@@ -284,6 +318,20 @@ impl TableOfContent {
             .get_collection_unchecked(&operation.collection_name)
             .await?;
         let collection_config = collection.config_snapshot().await;
+        let changes_collection_config = vectors.is_some()
+            || hnsw_config.is_some()
+            || params.is_some()
+            || optimizers_config.is_some()
+            || quantization_config.is_some()
+            || sparse_vectors.is_some()
+            || strict_mode.is_some()
+            || metadata.is_some();
+        if changes_collection_config {
+            self.require_private_oram_archive_acknowledgement_before_config_change(
+                &operation.collection_name,
+                &collection_config,
+            )?;
+        }
         validate_private_oram_replica_removal_authorization(
             &operation.collection_name,
             &collection_config.params,
@@ -347,12 +395,41 @@ impl TableOfContent {
         let collection = self
             .get_collection_unchecked(&operation.collection_name)
             .await?;
+        let collection_config = collection.config_snapshot().await;
+        self.require_private_oram_archive_acknowledgement_before_config_change(
+            &operation.collection_name,
+            &collection_config,
+        )?;
 
         collection
             .apply_crypto_migration_plan(&operation.plan)
             .await?;
 
         Ok(true)
+    }
+
+    fn require_private_oram_archive_acknowledgement_before_config_change(
+        &self,
+        collection_name: &str,
+        collection_config: &collection::config::CollectionConfigInternal,
+    ) -> Result<(), StorageError> {
+        let Some(dispatcher) = self.toc_dispatcher.lock().clone() else {
+            return Ok(());
+        };
+        let collection_id = collection_config.stable_crypto_id(collection_name)?;
+        let pending_acknowledgements = dispatcher
+            .consensus_state()
+            .private_oram_mutation_pending_acknowledgement_keys()?;
+        if private_oram_pending_acknowledgement_matches_collection(
+            &collection_id,
+            &pending_acknowledgements,
+        ) {
+            return Err(StorageError::Locked {
+                description: "collection configuration is locked until the private ORAM local archive acknowledgement is replicated"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub(super) async fn delete_collection(
@@ -1483,11 +1560,14 @@ mod tests {
     use collection::shards::transfer::{
         ShardTransfer, ShardTransferKey, ShardTransferMethod, ShardTransferRestart,
     };
+    use segment::types::{PayloadFieldSchema, PayloadSchemaType};
     use uuid::Uuid;
 
     use super::{
         PRIVATE_HNSW_ORAM_BINDING, PRIVATE_RESULT_ORAM_BINDING, ReshardingApplyAuthority,
         ShardKeyApplyAuthority, collection_params_require_crypto_runtime_transfer_parity,
+        private_oram_archive_ack_fenced_collection_name,
+        private_oram_pending_acknowledgement_matches_collection,
         reject_private_oram_resharding_replica_state_until_supported,
         reject_private_oram_resharding_until_supported,
         reject_private_oram_shard_transfer_until_supported,
@@ -1499,8 +1579,69 @@ mod tests {
         validate_private_oram_shard_key_change_authorization,
     };
     use crate::content_manager::collection_meta_ops::{
+        CollectionMetaOperations, CreatePayloadIndex, DeleteCollectionOperation, DropPayloadIndex,
         ReshardingOperation, SetShardReplicaState, ShardTransferOperations,
     };
+    use crate::content_manager::consensus_ops::PrivateOramMutationKey;
+
+    #[test]
+    fn private_oram_pending_acknowledgement_is_collection_scoped() {
+        let pending_acknowledgements = vec![(
+            PrivateOramMutationKey {
+                collection_id: "collection-a".to_string(),
+            },
+            101,
+            7,
+        )];
+
+        assert!(private_oram_pending_acknowledgement_matches_collection(
+            "collection-a",
+            &pending_acknowledgements,
+        ));
+        assert!(!private_oram_pending_acknowledgement_matches_collection(
+            "collection-b",
+            &pending_acknowledgements,
+        ));
+    }
+
+    #[test]
+    fn private_oram_archive_ack_fence_targets_only_destructive_and_payload_schema_ops() {
+        let fenced_operations = [
+            CollectionMetaOperations::DeleteCollection(DeleteCollectionOperation(
+                "docs".to_string(),
+            )),
+            CollectionMetaOperations::CreatePayloadIndex(CreatePayloadIndex {
+                collection_name: "docs".to_string(),
+                field_name: "pending-create".parse().unwrap(),
+                field_schema: PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword),
+            }),
+            CollectionMetaOperations::DropPayloadIndex(DropPayloadIndex {
+                collection_name: "docs".to_string(),
+                field_name: "pending-drop".parse().unwrap(),
+            }),
+        ];
+        for operation in &fenced_operations {
+            assert_eq!(
+                private_oram_archive_ack_fenced_collection_name(operation),
+                Some("docs"),
+            );
+        }
+
+        let topology_operation = CollectionMetaOperations::Resharding(
+            "docs".to_string(),
+            ReshardingOperation::Abort(ReshardKey {
+                uuid: Uuid::from_u128(17),
+                direction: ReshardingDirection::Up,
+                peer_id: 101,
+                shard_id: 0,
+                shard_key: None,
+            }),
+        );
+        assert_eq!(
+            private_oram_archive_ack_fenced_collection_name(&topology_operation),
+            None,
+        );
+    }
 
     fn assert_crypto_fingerprints_redacted(rendered: &str) {
         for sentinel in ["fingerprint-a", "fingerprint-b"] {

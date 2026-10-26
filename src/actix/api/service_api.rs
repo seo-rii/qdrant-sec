@@ -1287,6 +1287,7 @@ mod tests {
             requests: None,
             memory: None,
             hardware: None,
+            private_oram_external_recovery: None,
         }
     }
 
