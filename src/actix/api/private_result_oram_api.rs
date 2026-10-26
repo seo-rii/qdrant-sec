@@ -1795,9 +1795,13 @@ mod private_result_oram_rest_tests {
             )
             .await
             .unwrap();
-            crate::common::collections::do_create_snapshot(toc.clone(), &auth, COLLECTION_NAME)
-                .await
-                .unwrap();
+            crate::common::collections::do_create_snapshot(
+                Arc::new(dispatcher.clone()),
+                &auth,
+                COLLECTION_NAME,
+            )
+            .await
+            .unwrap();
         });
 
         let mut files = Vec::new();

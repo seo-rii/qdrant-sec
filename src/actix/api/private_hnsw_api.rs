@@ -1399,9 +1399,13 @@ mod private_hnsw_rest_tests {
             )
             .await
             .unwrap();
-            crate::common::collections::do_create_snapshot(toc.clone(), &auth, "docs")
-                .await
-                .unwrap();
+            crate::common::collections::do_create_snapshot(
+                Arc::new(dispatcher.clone()),
+                &auth,
+                "docs",
+            )
+            .await
+            .unwrap();
         });
 
         let files = files_under(temp.path());
