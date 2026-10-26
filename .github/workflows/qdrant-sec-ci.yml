@@ -239,10 +239,11 @@ jobs:
       - name: Register Rust problem matchers
         run: echo "::add-matcher::.github/rust-problem-matchers.json"
 
-      # One binary serves every test: crash points are inert unless their env var names one.
+      # Compile staging-only pause and I/O fault hooks as well as the ORAM crash points.
+      # The hooks are inert unless a test selects one through its environment.
       - name: Build qdrant with private ORAM crash points and the fixture examples
         run: |
-          cargo build --locked --bin qdrant --features private-oram-crash-points
+          cargo build --locked --bin qdrant --features staging,private-oram-crash-points
           cargo build --locked -p qdrant-sec --examples
 
       - name: Run private ORAM multi-process cluster tests
