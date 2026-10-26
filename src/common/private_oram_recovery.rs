@@ -90,7 +90,9 @@ use crate::common::private_result_oram::{
     resolve_private_result_oram_external_recovery_owner_public_key,
     validate_recovered_private_result_oram_snapshot_signatures,
 };
-use crate::common::snapshots::private_oram_snapshot_pause_after_prepare;
+use crate::common::snapshots::{
+    private_oram_snapshot_pause_after_prepare, validate_snapshot_collection_identity,
+};
 use crate::settings::Settings;
 
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_LEASE_SECS: u64 = 3_600;
@@ -588,10 +590,11 @@ pub async fn do_export_private_oram_external_recovery_checkpoint_context(
         .into_static();
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(auth, &pass).clone();
-    let _collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
+    let collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
     let collection = toc.get_collection(&collection_pass).await?;
     toc.require_private_oram_snapshot_recovery_complete(&collection)?;
     let config = collection.config_snapshot().await;
+    drop(collection_lifecycle_guard);
     let private_oram_mutation_snapshot = acquire_private_oram_mutation_snapshot_guard_v2(
         dispatcher,
         Arc::clone(&collection),
@@ -665,12 +668,20 @@ pub async fn do_export_private_oram_external_recovery_checkpoint_context(
     validate_private_oram_external_recovery_checkpoint_shape(&provisional_checkpoint)
         .map_err(|_| invalid_external_recovery_request())?;
 
+    {
+        let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+        validate_snapshot_collection_identity(&toc, &collection_pass, &collection, &config).await?;
+    }
     let prepared_snapshot = toc.prepare_snapshot(&collection).await?;
     private_oram_snapshot_pause_after_prepare("external recovery export").await;
-    if let Some(mutation_snapshot_guard) = private_oram_mutation_snapshot.as_ref() {
+    if private_oram_mutation_snapshot.is_some() {
         dispatcher
             .linearizable_private_oram_snapshot_barrier(None)
             .await?;
+    }
+    let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+    validate_snapshot_collection_identity(&toc, &collection_pass, &collection, &config).await?;
+    if let Some(mutation_snapshot_guard) = private_oram_mutation_snapshot.as_ref() {
         mutation_snapshot_guard.validate_held(dispatcher).await?;
     }
     let post_context = resolve_private_oram_external_recovery_context(

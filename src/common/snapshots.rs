@@ -20,7 +20,7 @@ use storage::content_manager::snapshots;
 use storage::content_manager::snapshots::download_result::DownloadResult;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::AccessRequirements;
+use storage::rbac::{AccessRequirements, CollectionMultipass, CollectionPass};
 use tokio::sync::OwnedRwLockWriteGuard;
 
 use super::auth::Auth;
@@ -188,6 +188,85 @@ pub(crate) async fn begin_private_oram_collection_recovery(
     begin_private_oram_collection_lifecycle_guard(dispatcher, auth, collection_name).await
 }
 
+fn snapshot_namespace_changed() -> StorageError {
+    StorageError::PreconditionFailed {
+        description: "snapshot collection namespace or configuration changed during export"
+            .to_string(),
+    }
+}
+
+/// Call while holding the TOC collection lifecycle lock. Config equality alone does not
+/// reject a delete/recreate with the same name, UUID and settings; the Arc must also match.
+pub(crate) async fn validate_snapshot_collection_identity(
+    toc: &TableOfContent,
+    collection_pass: &CollectionPass<'_>,
+    collection: &Arc<Collection>,
+    config: &CollectionConfigInternal,
+) -> Result<(), StorageError> {
+    let current = toc
+        .get_collection(collection_pass)
+        .await
+        .map_err(|_| snapshot_namespace_changed())?;
+    if !Arc::ptr_eq(&current, collection) || current.config_snapshot().await != *config {
+        return Err(snapshot_namespace_changed());
+    }
+    Ok(())
+}
+
+struct FullSnapshotNamespace {
+    collections: Vec<(Arc<Collection>, CollectionConfigInternal)>,
+    aliases: std::collections::HashMap<String, String>,
+}
+
+impl FullSnapshotNamespace {
+    /// The caller pins the registry/alias namespace with the TOC lifecycle lock.
+    async fn capture(
+        toc: &TableOfContent,
+        collections_pass: &CollectionMultipass,
+    ) -> Result<Self, StorageError> {
+        let collection_passes = toc.multipass_into_collections(collections_pass).await;
+        let mut collections = Vec::with_capacity(collection_passes.len());
+        let mut aliases = std::collections::HashMap::new();
+        for collection_pass in &collection_passes {
+            let collection = toc.get_collection(collection_pass).await?;
+            let config = collection.config_snapshot().await;
+            collections.push((collection, config));
+            for alias in toc
+                .all_collection_aliases(collection_pass.name(), collections_pass)
+                .await
+            {
+                aliases.insert(alias, collection_pass.name().to_string());
+            }
+        }
+        collections.sort_by(|(left, _), (right, _)| left.name().cmp(right.name()));
+        Ok(Self {
+            collections,
+            aliases,
+        })
+    }
+
+    async fn validate_held(
+        &self,
+        toc: &TableOfContent,
+        collections_pass: &CollectionMultipass,
+    ) -> Result<(), StorageError> {
+        let current = Self::capture(toc, collections_pass)
+            .await
+            .map_err(|_| snapshot_namespace_changed())?;
+        if self.aliases != current.aliases
+            || self.collections.len() != current.collections.len()
+            || self.collections.iter().zip(&current.collections).any(
+                |((collection, config), (current_collection, current_config))| {
+                    !Arc::ptr_eq(collection, current_collection) || config != current_config
+                },
+            )
+        {
+            return Err(snapshot_namespace_changed());
+        }
+        Ok(())
+    }
+}
+
 pub async fn do_create_full_snapshot(
     dispatcher: &Dispatcher,
     auth: Auth,
@@ -196,19 +275,12 @@ pub async fn do_create_full_snapshot(
         auth.check_global_access(AccessRequirements::new().manage(), "create_full_snapshot")?;
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(&auth, &pass).clone();
-    let _collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
-
-    let collection_passes = toc.multipass_into_collections(&collections_pass).await;
-    let mut collections = Vec::new();
-    for collection_pass in &collection_passes {
-        let collection = toc.get_collection(&collection_pass).await?;
-        let config = collection.config_snapshot().await;
-        collections.push((collection, config));
-    }
-    collections.sort_by(|(left, _), (right, _)| left.name().cmp(right.name()));
+    let collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
+    let namespace = FullSnapshotNamespace::capture(&toc, &collections_pass).await?;
+    drop(collection_lifecycle_guard);
 
     let mut private_oram_mutation_snapshot_guards = Vec::new();
-    for (collection, config) in &collections {
+    for (collection, config) in &namespace.collections {
         if let Some(snapshot_guard) = acquire_private_oram_mutation_snapshot_guard_v2(
             dispatcher,
             Arc::clone(collection),
@@ -221,7 +293,7 @@ pub async fn do_create_full_snapshot(
     }
     let mut private_hnsw_snapshot_guards = Vec::new();
     let mut private_result_snapshot_guards = Vec::new();
-    for (collection, config) in &collections {
+    for (collection, config) in &namespace.collections {
         if let Some(snapshot_guard) =
             begin_private_hnsw_collection_snapshot(collection.name(), &config)?
         {
@@ -234,21 +306,17 @@ pub async fn do_create_full_snapshot(
         }
     }
 
-    let mut alias_mapping = std::collections::HashMap::new();
-    for collection_pass in &collection_passes {
-        for alias in toc
-            .all_collection_aliases(collection_pass.name(), &collections_pass)
-            .await
-        {
-            alias_mapping.insert(alias, collection_pass.name().to_string());
-        }
+    {
+        let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+        namespace.validate_held(&toc, &collections_pass).await?;
     }
     let plan = snapshots::FullSnapshotPlan::new(
-        collections
+        namespace
+            .collections
             .iter()
             .map(|(collection, _)| Arc::clone(collection))
             .collect(),
-        alias_mapping,
+        namespace.aliases.clone(),
     )?;
     let prepared = snapshots::prepare_full_snapshot(&toc, plan).await?;
     private_oram_snapshot_pause_after_prepare("full").await;
@@ -257,6 +325,8 @@ pub async fn do_create_full_snapshot(
             .linearizable_private_oram_snapshot_barrier(None)
             .await?;
     }
+    let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+    namespace.validate_held(&toc, &collections_pass).await?;
     for guard in &private_oram_mutation_snapshot_guards {
         guard.validate_held(dispatcher).await?;
     }
@@ -752,17 +822,316 @@ mod tests {
         VECTOR_OPENFHE_CKKS_PROVIDER,
     };
     use segment::types::{Distance, HnswConfig};
+    use storage::content_manager::collection_meta_ops::{
+        ChangeAliasesOperation, CollectionMetaOperations, CreateAlias, DeleteAlias,
+    };
     use storage::rbac::{Access, Auth};
     use uuid::Uuid;
 
     use super::*;
-    use crate::common::private_hnsw::do_upload_private_hnsw_manifest;
+    use crate::common::collections::do_create_snapshot;
+    use crate::common::private_hnsw::{
+        do_upload_private_hnsw_buckets, do_upload_private_hnsw_manifest,
+    };
     use crate::common::private_hnsw_wire_fixture::{
         COLLECTION_NAME, PrivateHnswRouteWireFixture, PrivateResultOramRouteFixture, VECTOR_NAME,
-        create_private_hnsw_collection, create_private_hnsw_collection_with_private_result_oram,
-        route_e2e_guard, test_dispatcher,
+        create_plain_collection, create_private_hnsw_collection,
+        create_private_hnsw_collection_with_private_result_oram, route_e2e_guard, test_dispatcher,
     };
     use crate::common::private_result_oram::do_upload_private_result_oram_manifest;
+
+    async fn prepare_private_snapshot_collection(dispatcher: &Dispatcher, auth: &Auth) {
+        let fixture = PrivateHnswRouteWireFixture::build_uploaded();
+        let settings = fixture.route_settings();
+        create_private_hnsw_collection(dispatcher).await;
+        let pass = new_unchecked_verification_pass();
+        let toc = dispatcher.toc(auth, &pass);
+        do_upload_private_hnsw_manifest(
+            toc,
+            auth,
+            &settings,
+            COLLECTION_NAME,
+            VECTOR_NAME,
+            fixture.manifest,
+            fixture.manifest_signature,
+        )
+        .await
+        .unwrap();
+        do_upload_private_hnsw_buckets(
+            toc,
+            auth,
+            &settings,
+            COLLECTION_NAME,
+            VECTOR_NAME,
+            fixture.encrypted_build.index_epoch,
+            fixture.encrypted_build.root_hash,
+            fixture.encrypted_build.buckets,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_snapshot_preparation(toc: &TableOfContent) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while toc
+                .snapshot_telemetry_collector(COLLECTION_NAME)
+                .running_snapshots
+                .get(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("protected snapshot preparation must start");
+    }
+
+    #[test]
+    fn private_snapshot_namespace_lock_is_released_during_owner_execution_wait() {
+        let _guard = route_e2e_guard();
+        let (_temp, dispatcher) = test_dispatcher();
+        let dispatcher = Arc::new(dispatcher);
+        actix_web::rt::System::new().block_on(async {
+            create_private_hnsw_collection(&dispatcher).await;
+            let auth = Auth::new_internal(Access::full("snapshot owner wait test"));
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            let collection_pass = auth
+                .check_collection_access(COLLECTION_NAME, AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+            let key = storage::content_manager::consensus_ops::PrivateOramMutationKey {
+                collection_id: collection
+                    .config_snapshot()
+                    .await
+                    .stable_crypto_id(collection.name())
+                    .unwrap(),
+            };
+            let execution = crate::common::private_oram_mutation_session::acquire_private_oram_mutation_execution_v2(&key)
+                .await
+                .unwrap();
+
+            // Poll the real request until the held owner guard suspends it. The old code
+            // retained the namespace mutex inside this pending future.
+            let mut snapshot = Box::pin(do_create_snapshot(
+                Arc::clone(&dispatcher),
+                &auth,
+                COLLECTION_NAME,
+            ));
+            assert!(futures::poll!(&mut snapshot).is_pending());
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                create_plain_collection(&dispatcher, "owner-wait-unrelated").await;
+            })
+            .await
+            .expect("metadata must apply while a protected snapshot waits for its owner");
+            drop(snapshot);
+            drop(execution);
+        });
+    }
+
+    #[test]
+    fn private_collection_snapshot_allows_unrelated_metadata_during_preparation() {
+        let _guard = route_e2e_guard();
+        let (_temp, dispatcher) = test_dispatcher();
+        let dispatcher = Arc::new(dispatcher);
+        actix_web::rt::System::new().block_on(async {
+            let auth = Auth::new_internal(Access::full("private snapshot namespace test"));
+            prepare_private_snapshot_collection(&dispatcher, &auth).await;
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            let collection_pass = auth
+                .check_collection_access(COLLECTION_NAME, AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+            let shards = collection.shards_holder().write_owned().await;
+            let snapshot_dispatcher = Arc::clone(&dispatcher);
+            let snapshot_auth = auth.clone();
+            let snapshot = tokio::spawn(async move {
+                do_create_snapshot(snapshot_dispatcher, &snapshot_auth, COLLECTION_NAME).await
+            });
+            wait_for_snapshot_preparation(toc).await;
+            assert!(!snapshot.is_finished());
+            let creation = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                create_plain_collection(&dispatcher, "collection-snapshot-unrelated").await;
+            })
+            .await;
+            drop(shards);
+            snapshot.await.unwrap().unwrap();
+            creation.expect("unrelated metadata must apply before the protected snapshot finishes");
+
+            let baseline = collection.list_snapshots().await.unwrap();
+            let shards = collection.shards_holder().write_owned().await;
+            let snapshot_dispatcher = Arc::clone(&dispatcher);
+            let snapshot_auth = auth.clone();
+            let snapshot = tokio::spawn(async move {
+                do_create_snapshot(snapshot_dispatcher, &snapshot_auth, COLLECTION_NAME).await
+            });
+            wait_for_snapshot_preparation(toc).await;
+            collection
+                .update_metadata(
+                    serde_json::from_value(serde_json::json!({"updated": true})).unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(shards);
+            assert!(matches!(
+                snapshot.await.unwrap(),
+                Err(StorageError::PreconditionFailed { .. })
+            ));
+            assert_eq!(
+                serde_json::to_value(collection.list_snapshots().await.unwrap()).unwrap(),
+                serde_json::to_value(baseline).unwrap(),
+                "a staged snapshot with changed configuration must not be published"
+            );
+        });
+    }
+
+    #[test]
+    fn private_full_snapshot_rejects_namespace_change_after_preparation() {
+        let _guard = route_e2e_guard();
+        let (_temp, dispatcher) = test_dispatcher();
+        let dispatcher = Arc::new(dispatcher);
+        actix_web::rt::System::new().block_on(async {
+            let auth = Auth::new_internal(Access::full("full snapshot namespace test"));
+            prepare_private_snapshot_collection(&dispatcher, &auth).await;
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            let collection_pass = auth
+                .check_collection_access(COLLECTION_NAME, AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+            let shards = collection.shards_holder().write_owned().await;
+            let snapshot_dispatcher = Arc::clone(&dispatcher);
+            let snapshot_auth = auth.clone();
+            let snapshot = tokio::spawn(async move {
+                do_create_full_snapshot(&snapshot_dispatcher, snapshot_auth).await
+            });
+            wait_for_snapshot_preparation(toc).await;
+            assert!(!snapshot.is_finished());
+            let creation = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                create_plain_collection(&dispatcher, "full-snapshot-unrelated").await;
+            })
+            .await;
+            drop(shards);
+            let result = snapshot.await.unwrap();
+            creation.expect("full snapshot must let metadata ahead of its barrier apply");
+            assert!(matches!(
+                result,
+                Err(StorageError::PreconditionFailed { .. })
+            ));
+            assert!(
+                snapshots::do_list_full_snapshots(toc, auth)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn private_snapshot_identity_validation_rejects_alias_retarget_and_config_change() {
+        let (_temp, dispatcher) = test_dispatcher();
+        actix_web::rt::System::new().block_on(async {
+            let auth = Auth::new_internal(Access::full("snapshot identity test"));
+            create_plain_collection(&dispatcher, "snapshot-original").await;
+            create_plain_collection(&dispatcher, "snapshot-replacement").await;
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass);
+            let collection_pass = auth
+                .check_collection_access("snapshot-original", AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+            let config = collection.config_snapshot().await;
+
+            // Both collections intentionally use the same UUID and settings. Retargeting
+            // this name to an equal-config Arc must still invalidate the captured identity.
+            let replacement_pass = auth
+                .check_collection_access("snapshot-replacement", AccessRequirements::new(), "test")
+                .unwrap();
+            assert_eq!(
+                config,
+                toc.get_collection(&replacement_pass)
+                    .await
+                    .unwrap()
+                    .config_snapshot()
+                    .await
+            );
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::ChangeAliases(ChangeAliasesOperation {
+                        actions: vec![
+                            CreateAlias {
+                                collection_name: "snapshot-original".to_string(),
+                                alias_name: "snapshot-captured-alias".to_string(),
+                            }
+                            .into(),
+                        ],
+                    }),
+                    auth.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let alias_pass = auth
+                .check_collection_access(
+                    "snapshot-captured-alias",
+                    AccessRequirements::new(),
+                    "test",
+                )
+                .unwrap();
+            let namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+            validate_snapshot_collection_identity(toc, &alias_pass, &collection, &config)
+                .await
+                .unwrap();
+            let collections_pass = auth
+                .check_global_access(AccessRequirements::new().manage(), "test")
+                .unwrap();
+            let full_namespace = FullSnapshotNamespace::capture(toc, &collections_pass)
+                .await
+                .unwrap();
+            drop(namespace);
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::ChangeAliases(ChangeAliasesOperation {
+                        actions: vec![
+                            DeleteAlias {
+                                alias_name: "snapshot-captured-alias".to_string(),
+                            }
+                            .into(),
+                            CreateAlias {
+                                collection_name: "snapshot-replacement".to_string(),
+                                alias_name: "snapshot-captured-alias".to_string(),
+                            }
+                            .into(),
+                        ],
+                    }),
+                    auth.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+            assert!(matches!(
+                full_namespace.validate_held(toc, &collections_pass).await,
+                Err(StorageError::PreconditionFailed { .. })
+            ));
+            assert!(matches!(
+                validate_snapshot_collection_identity(toc, &alias_pass, &collection, &config).await,
+                Err(StorageError::PreconditionFailed { .. })
+            ));
+            collection
+                .update_metadata(
+                    serde_json::from_value(serde_json::json!({"updated": true})).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                validate_snapshot_collection_identity(toc, &collection_pass, &collection, &config)
+                    .await,
+                Err(StorageError::PreconditionFailed { .. })
+            ));
+        });
+    }
 
     fn config_with_params(params: CollectionParams) -> CollectionConfigInternal {
         CollectionConfigInternal {
