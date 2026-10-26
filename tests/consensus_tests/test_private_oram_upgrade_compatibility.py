@@ -615,29 +615,88 @@ def test_previous_binary_downgrade_fails_closed_without_mutating_wire_9_state(
     private_oram._write_private_oram_mutation_v2_runtime_config(
         peer_dir, bootstrap_fixture, PEER_IDS[0]
     )
-    identity = _bootstrap_identity(qdrant_binaries.current, peer_dir, port_base)
-    assert identity["binary_capability_digest"] != LEGACY_V3_BINARY_CAPABILITY_DIGEST
-    activation = _activation_fixture(
-        (PEER_IDS[0],), [port_base], [identity], identity["binary_capability_digest"]
+    previous_identity = _bootstrap_identity(qdrant_binaries.previous, peer_dir, port_base)
+    assert (
+        previous_identity["binary_capability_digest"] == LEGACY_V3_BINARY_CAPABILITY_DIGEST
+    )
+    genesis = _activation_fixture(
+        (PEER_IDS[0],), [port_base], [previous_identity], LEGACY_V3_BINARY_CAPABILITY_DIGEST
     )
     private_oram._write_private_oram_mutation_v2_runtime_config(
-        peer_dir, bootstrap_fixture, PEER_IDS[0], activation
+        peer_dir, bootstrap_fixture, PEER_IDS[0], genesis
     )
     peer = _start_peer(
         running_peers,
-        qdrant_binaries.current,
+        qdrant_binaries.previous,
         peer_dir,
         port_base,
-        "wire9-current.log",
+        "previous-active-floor.log",
     )
     leader = wait_peer_added(peer.api_url)
     assert leader == PEER_IDS[0]
-    enrollment = _prepare_valid_enrollment([peer.api_url], peer.api_url, leader)
+    assert_http_ok(_activate(peer.api_url))
+    assert _activation_status(peer.api_url)["reservation_v3_write_floor_active"] is True
+    _stop_peer(running_peers, peer)
+    previous_state = _raft_state(peer_dir)
+    previous_floor = previous_state["private_oram_mutation_format_floor"]
+    assert previous_floor["minimum_reader_protocol"] < WIRE_9
+    assert previous_floor["minimum_writer_protocol"] < WIRE_9
+    assert (
+        previous_floor["required_binary_capability_digest"]
+        == LEGACY_V3_BINARY_CAPABILITY_DIGEST
+    )
+
+    identity = _bootstrap_identity(qdrant_binaries.current, peer_dir, port_base)
+    assert identity["public_key"] == previous_identity["public_key"]
+    assert identity["binary_capability_digest"] != LEGACY_V3_BINARY_CAPABILITY_DIGEST
+    successor = _successor_activation_fixture(genesis, identity["binary_capability_digest"])
+    successor_manifest = json.loads(successor["bundle_canonical_json"])["manifest"]
+    successor_digest = _b64url(
+        hashlib.sha256(_authority_manifest_message(successor_manifest)).digest()
+    )
+    private_oram._write_private_oram_mutation_v2_runtime_config(
+        peer_dir, bootstrap_fixture, PEER_IDS[0], successor
+    )
+
+    # Persist the signed successor, then restart before all-peer prepare/enable.
+    # Neither boot may advance the old floor or activate writes for the new binary.
+    rotated_authority = None
+    for restart in range(2):
+        peer = _start_peer(
+            running_peers,
+            qdrant_binaries.current,
+            peer_dir,
+            port_base,
+            f"wire9-before-prepare-{restart}.log",
+        )
+        leader = wait_peer_added(peer.api_url)
+        assert leader == PEER_IDS[0]
+        _wait_for_activation_state_quiescent([peer_dir])
+        state = _raft_state(peer_dir)
+        assert state["private_oram_mutation_format_floor"] == previous_floor
+        authority = state["private_oram_activation_authority"]
+        assert authority["manifest_digest"] == successor_digest
+        assert int(authority["bundle"]["manifest"]["registry_generation"]) == 2
+        upgrade_proof = authority["capability_upgrade"]
+        assert (
+            upgrade_proof["predecessor"]
+            == previous_state["private_oram_activation_authority"]["bundle"]
+        )
+        assert upgrade_proof["format_floor_digest"] == previous_floor["floor_digest"]
+        if rotated_authority is None:
+            rotated_authority = authority
+        else:
+            assert authority == rotated_authority
+        assert _activation_status(peer.api_url)["reservation_v3_write_floor_active"] is False
+        if restart == 0:
+            _stop_peer(running_peers, peer)
+
     activated = _activate(peer.api_url)
     assert_http_ok(activated)
     status = _activation_status(peer.api_url)
     assert status["status"] == "active"
     assert status["reservation_v3_write_floor_active"] is True
+    enrollment = _prepare_valid_enrollment([peer.api_url], peer.api_url, leader)
     enrolled = requests.post(
         f"{peer.api_url}/collections/{private_oram.COLLECTION}/private-oram/v2/mutation/enroll",
         json=enrollment["enroll_body"],
