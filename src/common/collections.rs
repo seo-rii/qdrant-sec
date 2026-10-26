@@ -258,6 +258,18 @@ pub async fn do_create_snapshot(
         begin_private_hnsw_collection_snapshot(collection.name(), &config)?;
     let private_result_snapshot_guard =
         begin_private_result_oram_collection_snapshot(collection.name(), &config)?;
+    // Resolve the collection and acquire its private snapshot guards while the namespace is
+    // pinned. Ordinary snapshots can then use the captured Arc without blocking unrelated
+    // collection creation or deletion throughout snapshot I/O.
+    let collection_lifecycle_guard = if private_oram_mutation_snapshot_guard.is_some()
+        || private_hnsw_snapshot_guard.is_some()
+        || private_result_snapshot_guard.is_some()
+    {
+        Some(collection_lifecycle_guard)
+    } else {
+        drop(collection_lifecycle_guard);
+        None
+    };
 
     let post_dispatcher = Arc::clone(&dispatcher);
     let result = tokio::spawn(async move {
@@ -2095,8 +2107,72 @@ mod tests {
     };
     use data_encoding::BASE64URL_NOPAD;
     use qdrant_sec::{CKKS_PROFILE_OPENFHE_128_N16384_D4_SCALE50, VECTOR_OPENFHE_CKKS_PROVIDER};
+    use storage::content_manager::collection_meta_ops::DeleteCollectionOperation;
+    use storage::rbac::Access;
 
     use super::*;
+    use crate::common::private_hnsw_wire_fixture::{create_plain_collection, test_dispatcher};
+
+    #[test]
+    fn ordinary_collection_snapshot_does_not_block_unrelated_collection_deletion() {
+        let (_temp, dispatcher) = test_dispatcher();
+        let dispatcher = Arc::new(dispatcher);
+
+        actix_web::rt::System::new().block_on(async {
+            let source_name = "snapshot-source";
+            let unrelated_name = "snapshot-unrelated";
+            create_plain_collection(&dispatcher, source_name).await;
+            create_plain_collection(&dispatcher, unrelated_name).await;
+            let auth = Auth::new_internal(Access::full("snapshot lifecycle concurrency test"));
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass).clone();
+            let collection_pass = auth
+                .check_collection_access(source_name, AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+
+            // Keep preparation pending so deletion cannot pass just because the snapshot
+            // happened to finish before the lifecycle operation started.
+            let shard_guard = collection.shards_holder().write_owned().await;
+            let snapshot_dispatcher = Arc::clone(&dispatcher);
+            let snapshot_auth = auth.clone();
+            let snapshot = tokio::spawn(async move {
+                do_create_snapshot(snapshot_dispatcher, &snapshot_auth, source_name).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while toc
+                    .snapshot_telemetry_collector(source_name)
+                    .running_snapshots
+                    .get(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("snapshot preparation must start");
+            assert!(!snapshot.is_finished());
+
+            let deletion = tokio::time::timeout(
+                Duration::from_secs(2),
+                dispatcher.submit_collection_meta_op(
+                    CollectionMetaOperations::DeleteCollection(DeleteCollectionOperation(
+                        unrelated_name.to_string(),
+                    )),
+                    auth,
+                    None,
+                ),
+            )
+            .await;
+            drop(shard_guard);
+            snapshot.await.unwrap().unwrap();
+            assert!(
+                deletion
+                    .expect("an ordinary snapshot must not hold the global lifecycle lock")
+                    .expect("unrelated collection deletion must succeed")
+            );
+        });
+    }
 
     fn assert_no_cluster_fingerprint_leak(rendered: &str, sentinels: &[&str]) {
         for sentinel in sentinels {
