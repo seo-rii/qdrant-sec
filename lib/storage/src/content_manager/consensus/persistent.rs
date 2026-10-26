@@ -8637,20 +8637,20 @@ mod tests {
         let (authority_key, trust_anchor, genesis) =
             private_oram_activation_authority_fixture_v1_for_test();
         let temp = tempfile::tempdir().unwrap();
-        let mut first = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
-            temp.path(),
-            true,
-            false,
-            Some(7),
-            &trust_anchor,
-            &genesis,
-        )
-        .unwrap();
+        let mut first = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        // This synthetic floor helper has no pending activation proof. Finish its epochs before
+        // installing authority, which makes every incomplete floor require that real proof.
         install_private_oram_mutation_test_capability_floor_with_protocol(
             &mut first,
             PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION - 1,
             &genesis.manifest.required_binary_capability_digest,
         );
+        let expected = first
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        first
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
         let old_floor = first.private_oram_mutation_format_floor.clone().unwrap();
         let old_authority = first.private_oram_activation_authority.clone().unwrap();
         drop(first);
@@ -8776,20 +8776,18 @@ mod tests {
         let (authority_key, trust_anchor, genesis) =
             private_oram_activation_authority_fixture_v1_for_test();
         let temp = tempfile::tempdir().unwrap();
-        let mut state = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
-            temp.path(),
-            true,
-            false,
-            Some(7),
-            &trust_anchor,
-            &genesis,
-        )
-        .unwrap();
+        let mut state = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
         install_private_oram_mutation_test_capability_floor_with_protocol(
             &mut state,
             PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
             &genesis.manifest.required_binary_capability_digest,
         );
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        state
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
         let installed = state.private_oram_activation_authority.clone().unwrap();
         let mut manifest = genesis.manifest.clone();
         manifest.registry_generation += 1;
