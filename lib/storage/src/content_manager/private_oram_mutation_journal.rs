@@ -7279,11 +7279,19 @@ mod tests {
     }
 
     fn paired_store_fixture(temp: &TempDir) -> (PrivateOramOwnerStorePairTestFixtureV1, Fixture) {
+        paired_store_fixture_with_writer_fence(temp, 1)
+    }
+
+    fn paired_store_fixture_with_writer_fence(
+        temp: &TempDir,
+        writer_fence: u64,
+    ) -> (PrivateOramOwnerStorePairTestFixtureV1, Fixture) {
         let collection_path = temp.path().join("collection");
         fs::create_dir(&collection_path).unwrap();
-        let pair = PrivateOramOwnerStorePairTestFixtureV1::new(
+        let pair = PrivateOramOwnerStorePairTestFixtureV1::new_with_writer_fence(
             &collection_path,
             PAIRED_STORE_NON_SECRET_TEST_OWNER_SEED,
+            writer_fence,
         );
         let mutation_bundle = pair.mutation_bundle().clone();
         let mutation = &mutation_bundle.mutation;
@@ -8787,20 +8795,10 @@ mod tests {
 
         // The next mutation of the same collection mints a capsule for the next lease
         // generation; the store must accept it instead of treating the collection as one-shot.
-        let (next_pair, next_base) = paired_store_fixture(&next_owner_temp);
-        let mut next_lease = next_base.preparing_lease.clone();
-        next_lease.generation += 1;
-        next_lease.writer_fence += 1;
-        let next_fixture = Fixture {
-            public_key: next_base.public_key.clone(),
-            immutable_manifest: next_base.immutable_manifest.clone(),
-            mutation_bundle: next_base.mutation_bundle.clone(),
-            preparing_lease: next_lease,
-            committed_lease: next_base.committed_lease.clone(),
-            old_consensus: next_base.old_consensus.clone(),
-            new_consensus: next_base.new_consensus.clone(),
-            staged_frame_bytes: next_base.staged_frame_bytes.clone(),
-        };
+        let (next_pair, next_fixture) = paired_store_fixture_with_writer_fence(
+            &next_owner_temp,
+            fixture.preparing_lease.writer_fence + 1,
+        );
         let next_journal = journal(&next_parent_temp, &next_fixture);
         let next_package = point_stage_owner_capsule_package_v2(
             &next_journal,

@@ -90,6 +90,14 @@ pub struct PrivateOramOwnerStorePairTestFixtureV1 {
 
 impl PrivateOramOwnerStorePairTestFixtureV1 {
     pub fn new(collection_path: &Path, non_secret_test_owner_seed: [u8; 32]) -> Self {
+        Self::new_with_writer_fence(collection_path, non_secret_test_owner_seed, 1)
+    }
+
+    pub fn new_with_writer_fence(
+        collection_path: &Path,
+        non_secret_test_owner_seed: [u8; 32],
+        writer_fence: u64,
+    ) -> Self {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&non_secret_test_owner_seed).unwrap();
         let hnsw_store = PrivateHnswOramStore::new(collection_path, TEST_HNSW_INDEX).unwrap();
         let result_store = PrivateResultOramStore::new(collection_path);
@@ -357,6 +365,7 @@ impl PrivateOramOwnerStorePairTestFixtureV1 {
                 &mutation_id,
                 &old_state_digest,
                 &writer_lease_digest,
+                writer_fence,
             )
         })
         .collect::<Vec<_>>();
@@ -426,7 +435,7 @@ impl PrivateOramOwnerStorePairTestFixtureV1 {
                 manifest_digest: manifest_digest.clone(),
                 layout_generation: 1,
                 writer_lease_digest,
-                writer_fence: 1,
+                writer_fence,
                 issued_at_unix: 1_770_000_120,
                 expires_at_unix: 1_770_000_180,
                 old_state,
@@ -794,6 +803,7 @@ fn read_transcript(
     mutation_id: &str,
     old_state_digest: &str,
     writer_lease_digest: &str,
+    writer_fence: u64,
 ) -> PrivateOramObservedReadTranscriptV1 {
     let labels = [0_u64, 1, 0, 1]
         .into_iter()
@@ -818,7 +828,7 @@ fn read_transcript(
         mutation_id,
         old_state_digest,
         writer_lease_digest,
-        writer_fence: 1,
+        writer_fence,
         paths_per_window: 2,
         tree_height: 1,
         kind,
