@@ -593,8 +593,16 @@ def _run_expected_downgrade_failure(
             pytest.fail("previous Qdrant binary started on wire-9 protected data", pytrace=False)
     diagnostic = log_path.read_text(errors="replace")
     assert return_code != 0, diagnostic
-    assert "private ORAM" in diagnostic
-    assert any(term in diagnostic.lower() for term in ("floor", "capability", "protocol"))
+    assert "Loading raft state from" in diagnostic, diagnostic
+    assert (
+        "private ORAM activation authority requires a different binary capability"
+        not in diagnostic
+    ), diagnostic
+    stored_schema_rejected = "unknown field `capability_upgrade`" in diagnostic
+    stored_floor_rejected = "private ORAM" in diagnostic and any(
+        term in diagnostic.lower() for term in ("floor", "protocol")
+    )
+    assert stored_schema_rejected or stored_floor_rejected, diagnostic
     return diagnostic
 
 
@@ -711,6 +719,11 @@ def test_previous_binary_downgrade_fails_closed_without_mutating_wire_9_state(
     assert floor["minimum_writer_protocol"] == WIRE_9
     assert floor["required_binary_capability_digest"] == identity["binary_capability_digest"]
     assert state["private_oram_mutation_states"]
+
+    # Let the previous binary reach persisted state using its original compatible settings.
+    private_oram._write_private_oram_mutation_v2_runtime_config(
+        peer_dir, bootstrap_fixture, PEER_IDS[0], genesis
+    )
     before = _protected_files(peer_dir)
     assert any("private_oram_mutation_floor_v2" in path for path in before)
 
