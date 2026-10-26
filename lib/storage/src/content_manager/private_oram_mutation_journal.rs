@@ -8792,6 +8792,9 @@ mod tests {
         owner_store
             .install(&package, &activation, pair.resources())
             .unwrap();
+        owner_store
+            .install(&package, &activation, pair.resources())
+            .unwrap();
 
         // The next mutation of the same collection mints a capsule for the next lease
         // generation; the store must accept it instead of treating the collection as one-shot.
@@ -8812,20 +8815,32 @@ mod tests {
             next_package.lease_generation(),
             package.lease_generation() + 1
         );
-        owner_store
+        // The independent paired fixtures each own their prepared journal and store image.
+        // Reopen the retained capsule directory beside the next valid local image, rather
+        // than passing resources from a different collection directory to the first store.
+        let capsule_root = next_owner_temp
+            .path()
+            .join("collection/private_oram_owner_recovery_capsules_v2");
+        fs::rename(
+            owner_temp
+                .path()
+                .join("collection/private_oram_owner_recovery_capsules_v2"),
+            &capsule_root,
+        )
+        .unwrap();
+        let next_owner_store = owner_capsule_store_v2(
+            &next_owner_temp.path().join("collection"),
+            &next_fixture,
+            11,
+        );
+        next_owner_store
             .install(&next_package, &activation, next_pair.resources())
             .unwrap();
         // Both generations remain exactly replayable and load only through their explicit
         // generation, so a later install cannot replace earlier recovery material.
-        owner_store
+        next_owner_store
             .install(&next_package, &activation, next_pair.resources())
             .unwrap();
-        owner_store
-            .install(&package, &activation, pair.resources())
-            .unwrap();
-        let capsule_root = owner_temp
-            .path()
-            .join("collection/private_oram_owner_recovery_capsules_v2");
         for (installed, expected_fixture) in [(&package, &fixture), (&next_package, &next_fixture)]
         {
             assert!(
@@ -8833,7 +8848,7 @@ mod tests {
                     .join(format!("capsule-v2-{:020}.json", installed.generation()))
                     .is_file()
             );
-            let material = owner_store
+            let material = next_owner_store
                 .load_recovery_material_v2(installed.generation(), &activation)
                 .unwrap();
             assert_eq!(
