@@ -20,6 +20,38 @@ are immutable, no-replace, and directory-fsynced; the archive destination must r
 the same inode pinned before rename. These guarantees authorize lease clear and acknowledgement only;
 they do not authorize physical capsule/archive deletion.
 
+The wire-9 capability `owner-archive-history=1` preserves acknowledgement evidence when
+the bounded consensus GC-obligation list evicts its oldest entries. Each enrolled owner
+has a versioned SHA-256 prefix commitment containing the archive count, last generation,
+and the ordered generation/owner/parent-terminal/pending-tombstone/clear-receipt bindings.
+The aggregate digest commits the complete prefix metadata. The retained obligations form
+the exact suffix; admission never infers the missing prefix from owner-local files.
+
+Challenge preparation projects that retention before enforcing reservation capacity,
+reserving one obligation slot and the existing cleanup-byte allowance for admission.
+The same committed transition preserves the removed prefix and accepted suffix atomically;
+the byte budgets include the proof metadata. If the aggregate-wide budget still needs
+space, the remaining detailed prefix is compacted and every capacity limit is rechecked.
+Rejection leaves the original aggregate intact, and retrying a committed challenge does
+not compact it again.
+
+Before admitting another generation, the owner recomputes its committed prefix and checks
+every retained suffix entry, canonical parent grant, and retired adopted intent. Snapshot
+guards check the same full generation set, and the recovery authority digest binds the
+prefix commitment. Removing an old archive together with its retired intent therefore
+remains a rollback failure. Historical aggregates remain readable; an already-pruned legacy
+prefix without this evidence requires recovery and cannot be authorized by a suffix alone.
+
+Archive scans use the consensus-qualified total count plus a fixed allowance for transient
+records, rather than treating 4,096 lifetime acknowledgements as a terminal capacity limit.
+Physical archives are still retained and verification still takes time proportional to
+their history. This commitment does not provide physical deletion authority.
+
+New commitments require an applied wire-9 reader and writer floor. The existing two-step
+reader/writer barrier also upgrades an active wire-8 floor after all peers prove the current
+capability and the operator installs its signed activation authority. Replay of wire-8
+entries uses their original applied floor and keeps their historical aggregate digests.
+
 Session admission and cleanup use one registry linearization boundary. An outstanding
 open reservation or installed session prevents cleanup, while an installed cleanup claim
 prevents a late session install. The final cleanup tombstone is published only after the

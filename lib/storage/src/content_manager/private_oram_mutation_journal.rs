@@ -8257,6 +8257,13 @@ mod tests {
     }
 
     fn admitted_cleanup_authority(fixture: &Fixture) -> PrivateOramMutationAuthorityStateV2 {
+        admitted_cleanup_authority_with_owner_enrollment(fixture, false)
+    }
+
+    fn admitted_cleanup_authority_with_owner_enrollment(
+        fixture: &Fixture,
+        enroll_owner: bool,
+    ) -> PrivateOramMutationAuthorityStateV2 {
         let authority_key = private_oram_mutation_authority_key_v2(
             &fixture.preparing_lease.collection_id,
             digest(245),
@@ -8284,6 +8291,52 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        if enroll_owner {
+            use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
+                apply_private_oram_mutation_authority_owner_enrollment_activated_v2,
+                apply_private_oram_mutation_authority_owner_enrollment_prepared_v2,
+                private_oram_mutation_owner_enrollment_fixture_for_test,
+            };
+            let owner_key = Ed25519KeyPair::from_seed_unchecked(&[12; 32]).unwrap();
+            assert_eq!(fixture.preparing_lease.owner_peer_id, 11);
+            let (prepared, commitment) = private_oram_mutation_owner_enrollment_fixture_for_test(
+                &authority,
+                &fixture.preparing_lease.collection_id,
+                7,
+                11,
+                &owner_key,
+                20,
+            )
+            .unwrap();
+            let prepare_context = private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::OwnerEnrollmentPrepared,
+                prepared.prepared_record_digest.clone(),
+                1,
+                2,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_owner_enrollment_prepared_v2(
+                &authority,
+                prepared,
+                prepare_context,
+            )
+            .unwrap();
+            let activate_context = private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::OwnerEnrollmentActivated,
+                commitment.commitment_digest.clone(),
+                1,
+                3,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_owner_enrollment_activated_v2(
+                &authority,
+                commitment,
+                activate_context,
+            )
+            .unwrap();
+        }
         let manifest_seed = private_oram_mutation_admission_recovery_manifest_for_test(
             &fixture.preparing_lease,
             authority.aggregate().unwrap().aggregate_digest(),
@@ -8386,7 +8439,29 @@ mod tests {
         PrivateOramMutationParentWatermarkExpectationV2,
         PrivateOramMutationRecoveryCapsulesReadyExpectationV2,
     ) {
-        let mut authority = admitted_cleanup_authority(fixture);
+        cleanup_authority_at_terminal_parent_with_owner_enrollment(
+            journal,
+            fixture,
+            decision_kind,
+            activation_authority,
+            owner_evidence,
+            false,
+        )
+    }
+
+    fn cleanup_authority_at_terminal_parent_with_owner_enrollment(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        decision_kind: PrivateOramMutationDecisionKindV2,
+        activation_authority: crate::content_manager::consensus::private_oram_activation_authority::PrivateOramActivationAuthorityLocatorV1,
+        owner_evidence: PrivateOramOwnerRecoveryCapsuleInstallEvidenceV2,
+        enroll_owner: bool,
+    ) -> (
+        PrivateOramMutationAuthorityStateV2,
+        PrivateOramMutationParentWatermarkExpectationV2,
+        PrivateOramMutationRecoveryCapsulesReadyExpectationV2,
+    ) {
+        let mut authority = admitted_cleanup_authority_with_owner_enrollment(fixture, enroll_owner);
         let terminal = v2_parent_watermark_expectation(
             journal,
             fixture,
@@ -12469,15 +12544,16 @@ mod tests {
             .unwrap();
         let evidence = signed_owner_install_evidence_v2(&fixture.preparing_lease, receipt);
         let (mut authority, terminal, recovery_capsules_ready) =
-            cleanup_authority_at_terminal_parent(
+            cleanup_authority_at_terminal_parent_with_owner_enrollment(
                 &journal,
                 &fixture,
                 PrivateOramMutationDecisionKindV2::ExactNew,
                 activation,
                 evidence,
+                true,
             );
         let aggregate = authority.aggregate().unwrap();
-        assert_eq!(aggregate.transition_ordinal(), 12);
+        assert_eq!(aggregate.transition_ordinal(), 14);
         assert_eq!(
             aggregate.recovery_capsules_certificate().unwrap().ready(),
             recovery_capsules_ready.ready()
@@ -12499,7 +12575,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 12);
+        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 14);
         assert!(
             apply_private_oram_mutation_authority_parent_progress_v2(
                 &authority,
@@ -12544,7 +12620,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 12);
+        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 14);
 
         authority = apply_private_oram_mutation_authority_lease_transition_v2(
             &authority,
@@ -13171,6 +13247,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        crate::content_manager::consensus::private_oram_mutation_cleanup::authority::assert_gc_compaction_retains_owner_history_for_test(&authority, &next_lease);
     }
 
     #[test]

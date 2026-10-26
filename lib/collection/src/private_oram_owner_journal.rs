@@ -221,6 +221,10 @@ const OWNER_COMMITTED_ARCHIVE_GRANT_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-owner-committed-archive-grant/v1";
 const OWNER_SNAPSHOT_AUTHORITY_DIGEST_DOMAIN_V2: &[u8] =
     b"qdrant-sec/private-oram-owner-snapshot-authority-digest/v2";
+const OWNER_COMPACTED_ARCHIVE_HISTORY_DOMAIN_V1: &[u8] =
+    b"qdrant-sec/private-oram-owner-compacted-archive-history/v1";
+const OWNER_COMPACTED_ARCHIVE_HISTORY_COMMITMENT_DOMAIN_V1: &[u8] =
+    b"qdrant-sec/private-oram-owner-compacted-archive-history-commitment/v1";
 const OWNER_TERMINAL_ARCHIVE_DOMAIN: &[u8] = b"qdrant-sec/private-oram-owner-terminal-archive/v1";
 const OWNER_TERMINAL_ARCHIVE_VERSION: u16 = 1;
 const OWNER_COMMITTED_ARCHIVE_GRANT_VERSION: u16 = 2;
@@ -1181,17 +1185,18 @@ impl PrivateOramOwnerSnapshotGuardV2 {
             parent._lock.validate_at_path()?;
         }
 
-        self.store
-            .require_ready_for_new_generation_v2(&self.expectation)?;
+        let acknowledged_generations = self
+            .store
+            .validated_acknowledged_generations_v2(&self.expectation)?;
         validate_private_oram_owner_snapshot_exact_v2(
             &self.store,
             &self.lifecycle_root.directory,
             self.canonical_root.as_ref().map(|guard| &guard.directory),
-            &self.expectation,
+            &acknowledged_generations,
         )?;
         validate_private_oram_parent_snapshot_exact_v2(
             self.parent_journal.as_ref(),
-            &self.expectation,
+            &acknowledged_generations,
         )?;
 
         self.owner_temp.validate_held()?;
@@ -1212,7 +1217,7 @@ fn validate_private_oram_owner_snapshot_exact_v2(
     store: &PrivateOramOwnerPrestageStoreV2,
     lifecycle_root: &File,
     canonical_root: Option<&File>,
-    expectation: &PrivateOramOwnerNewGenerationReadinessExpectationV2,
+    expected_generations: &BTreeSet<u64>,
 ) -> Result<(), PrivateOramOwnerJournalError> {
     validate_open_directory_at_path(lifecycle_root, &store.root)?;
     validate_private_oram_owner_prestage_root_entries(lifecycle_root)?;
@@ -1236,11 +1241,6 @@ fn validate_private_oram_owner_snapshot_exact_v2(
         validate_open_directory_at_path(&directory, &path)?;
     }
 
-    let expected_generations = expectation
-        .acknowledged_archives
-        .iter()
-        .map(|archive| archive.generation)
-        .collect::<BTreeSet<_>>();
     match canonical_root {
         Some(canonical_root) => {
             let canonical_path = store
@@ -1250,7 +1250,8 @@ fn validate_private_oram_owner_snapshot_exact_v2(
             let mut actual_generations = BTreeSet::new();
             for name in directory_entry_names_open_bounded(
                 canonical_root,
-                PRESTAGE_MAX_TERMINAL_RECORDS
+                expected_generations
+                    .len()
                     .checked_add(1)
                     .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)?,
                 PrivateOramOwnerJournalError::TerminalCapacityExceeded,
@@ -1262,7 +1263,7 @@ fn validate_private_oram_owner_snapshot_exact_v2(
                     return Err(PrivateOramOwnerJournalError::Corrupt);
                 }
             }
-            if actual_generations != expected_generations {
+            if &actual_generations != expected_generations {
                 return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
             }
         }
@@ -1274,12 +1275,11 @@ fn validate_private_oram_owner_snapshot_exact_v2(
 
 fn validate_private_oram_parent_snapshot_exact_v2(
     parent: Option<&PrivateOramPinnedParentSnapshotV2>,
-    expectation: &PrivateOramOwnerNewGenerationReadinessExpectationV2,
+    expected_generations: &BTreeSet<u64>,
 ) -> Result<(), PrivateOramOwnerJournalError> {
-    let expected_completed = expectation
-        .acknowledged_archives
+    let expected_completed = expected_generations
         .iter()
-        .map(|archive| completed_generation_name(archive.generation))
+        .map(|generation| completed_generation_name(*generation))
         .collect::<Result<BTreeSet<_>, _>>()?;
     let Some(parent) = parent else {
         return if expected_completed.is_empty() {
@@ -1299,7 +1299,8 @@ fn validate_private_oram_parent_snapshot_exact_v2(
     expected_root.insert(OsStr::new("temp").to_owned());
     let actual_root = directory_entry_names_open_bounded(
         &parent.root,
-        PRESTAGE_MAX_TERMINAL_RECORDS
+        expected_completed
+            .len()
             .checked_add(2)
             .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)?,
         PrivateOramOwnerJournalError::TerminalCapacityExceeded,
@@ -1755,6 +1756,128 @@ impl PrivateOramOwnerAcknowledgedArchiveExpectationV2 {
     pub fn pending_tombstone_digest(&self) -> &str {
         &self.pending_tombstone_digest
     }
+
+    fn encode_binding(&self, bytes: &mut Vec<u8>) -> Result<(), PrivateOramOwnerJournalError> {
+        bytes.extend_from_slice(&self.generation.to_be_bytes());
+        bytes.extend_from_slice(&self.owner_peer_id.to_be_bytes());
+        push_digest(
+            bytes,
+            &self.parent_terminal_record_digest,
+            "parent_terminal_record_digest",
+        )?;
+        push_digest(
+            bytes,
+            &self.pending_tombstone_digest,
+            "pending_tombstone_digest",
+        )?;
+        push_digest(bytes, &self.clear_receipt_digest, "clear_receipt_digest")
+    }
+}
+
+/// Constant-size consensus commitment to the exact acknowledged archive prefix whose detailed
+/// GC obligations have been compacted. This is evidence retention, never deletion authority.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateOramOwnerCompactedArchiveHistoryV1 {
+    version: u16,
+    owner_peer_id: u64,
+    archive_count: u64,
+    through_generation: u64,
+    history_digest: String,
+}
+
+impl Debug for PrivateOramOwnerCompactedArchiveHistoryV1 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateOramOwnerCompactedArchiveHistoryV1")
+            .field("version", &self.version)
+            .field("archive_count", &self.archive_count)
+            .field("owner_peer_id", &"[redacted]")
+            .field("through_generation", &"[redacted]")
+            .field("history_digest", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PrivateOramOwnerCompactedArchiveHistoryV1 {
+    pub fn append(
+        previous: Option<&Self>,
+        archive: &PrivateOramOwnerAcknowledgedArchiveExpectationV2,
+    ) -> Result<Self, PrivateOramOwnerJournalError> {
+        let mut bytes = Vec::new();
+        push_domain(&mut bytes, OWNER_COMPACTED_ARCHIVE_HISTORY_DOMAIN_V1)?;
+        let archive_count = match previous {
+            Some(previous) => {
+                previous.validate()?;
+                if previous.owner_peer_id != archive.owner_peer_id
+                    || previous.through_generation >= archive.generation
+                {
+                    return Err(PrivateOramOwnerJournalError::InvalidTransition);
+                }
+                bytes.push(1);
+                push_digest(
+                    &mut bytes,
+                    &previous.commitment_digest()?,
+                    "previous_history",
+                )?;
+                previous
+                    .archive_count
+                    .checked_add(1)
+                    .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)?
+            }
+            None => {
+                bytes.push(0);
+                1
+            }
+        };
+        archive.encode_binding(&mut bytes)?;
+        let history = Self {
+            version: 1,
+            owner_peer_id: archive.owner_peer_id,
+            archive_count,
+            through_generation: archive.generation,
+            history_digest: digest_string(&bytes),
+        };
+        history.validate()?;
+        Ok(history)
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateOramOwnerJournalError> {
+        if self.version != 1
+            || self.owner_peer_id == 0
+            || self.archive_count == 0
+            || self.through_generation < self.archive_count
+        {
+            return Err(PrivateOramOwnerJournalError::InvalidTransition);
+        }
+        validate_digest(&self.history_digest, "history_digest")
+    }
+
+    /// Binds all serialized metadata as well as the chain root into the outer authority digest.
+    pub fn commitment_digest(&self) -> Result<String, PrivateOramOwnerJournalError> {
+        self.validate()?;
+        let mut bytes = Vec::new();
+        push_domain(
+            &mut bytes,
+            OWNER_COMPACTED_ARCHIVE_HISTORY_COMMITMENT_DOMAIN_V1,
+        )?;
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.owner_peer_id.to_be_bytes());
+        bytes.extend_from_slice(&self.archive_count.to_be_bytes());
+        bytes.extend_from_slice(&self.through_generation.to_be_bytes());
+        push_digest(&mut bytes, &self.history_digest, "history_digest")?;
+        Ok(digest_string(&bytes))
+    }
+
+    pub const fn owner_peer_id(&self) -> u64 {
+        self.owner_peer_id
+    }
+    pub const fn archive_count(&self) -> u64 {
+        self.archive_count
+    }
+    pub const fn through_generation(&self) -> u64 {
+        self.through_generation
+    }
 }
 
 /// Consensus-qualified, side-effect-free owner readiness expectation for a new generation.
@@ -1765,6 +1888,7 @@ pub struct PrivateOramOwnerNewGenerationReadinessExpectationV2 {
     owner_store_incarnation_digest: String,
     consensus_aggregate_digest: String,
     acknowledged_archives: Vec<PrivateOramOwnerAcknowledgedArchiveExpectationV2>,
+    compacted_archive_history: Option<PrivateOramOwnerCompactedArchiveHistoryV1>,
 }
 
 impl Debug for PrivateOramOwnerNewGenerationReadinessExpectationV2 {
@@ -1777,6 +1901,7 @@ impl Debug for PrivateOramOwnerNewGenerationReadinessExpectationV2 {
             .field("collection_id", &"[redacted]")
             .field("owner_store_incarnation", &"[redacted]")
             .field("consensus_aggregate", &"[redacted]")
+            .field("compacted_archive_history", &self.compacted_archive_history)
             .finish()
     }
 }
@@ -1789,6 +1914,23 @@ impl PrivateOramOwnerNewGenerationReadinessExpectationV2 {
         consensus_aggregate_digest: String,
         acknowledged_archives: Vec<PrivateOramOwnerAcknowledgedArchiveExpectationV2>,
     ) -> Result<Self, PrivateOramOwnerJournalError> {
+        Self::try_new_with_compacted_history(
+            collection_id,
+            owner_store_incarnation_digest,
+            consensus_aggregate_digest,
+            acknowledged_archives,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn try_new_with_compacted_history(
+        collection_id: String,
+        owner_store_incarnation_digest: String,
+        consensus_aggregate_digest: String,
+        acknowledged_archives: Vec<PrivateOramOwnerAcknowledgedArchiveExpectationV2>,
+        compacted_archive_history: Option<PrivateOramOwnerCompactedArchiveHistoryV1>,
+    ) -> Result<Self, PrivateOramOwnerJournalError> {
         validate_resource_id(&collection_id, "collection_id")?;
         validate_digest(
             &owner_store_incarnation_digest,
@@ -1798,19 +1940,31 @@ impl PrivateOramOwnerNewGenerationReadinessExpectationV2 {
         if acknowledged_archives.len() > PRESTAGE_MAX_TERMINAL_RECORDS {
             return Err(PrivateOramOwnerJournalError::TerminalCapacityExceeded);
         }
-        let mut previous_generation = None;
+        if let Some(history) = &compacted_archive_history {
+            history.validate()?;
+        }
+        let mut previous_generation = compacted_archive_history
+            .as_ref()
+            .map(|history| history.through_generation);
         for archive in &acknowledged_archives {
-            if previous_generation.is_some_and(|previous| previous >= archive.generation) {
+            if previous_generation.is_some_and(|previous| previous >= archive.generation)
+                || compacted_archive_history
+                    .as_ref()
+                    .is_some_and(|history| history.owner_peer_id != archive.owner_peer_id)
+            {
                 return Err(PrivateOramOwnerJournalError::InvalidTransition);
             }
             previous_generation = Some(archive.generation);
         }
-        Ok(Self {
+        let expectation = Self {
             collection_id,
             owner_store_incarnation_digest,
             consensus_aggregate_digest,
             acknowledged_archives,
-        })
+            compacted_archive_history,
+        };
+        expectation.acknowledged_archive_count()?;
+        Ok(expectation)
     }
 
     pub fn consensus_aggregate_digest(&self) -> &str {
@@ -1819,6 +1973,17 @@ impl PrivateOramOwnerNewGenerationReadinessExpectationV2 {
 
     pub fn acknowledged_archives(&self) -> &[PrivateOramOwnerAcknowledgedArchiveExpectationV2] {
         &self.acknowledged_archives
+    }
+
+    fn acknowledged_archive_count(&self) -> Result<usize, PrivateOramOwnerJournalError> {
+        let compacted = self
+            .compacted_archive_history
+            .as_ref()
+            .map_or(0, |history| history.archive_count);
+        usize::try_from(compacted)
+            .ok()
+            .and_then(|count| count.checked_add(self.acknowledged_archives.len()))
+            .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)
     }
 
     /// Canonically commits a recovery checkpoint to this exact consensus-qualified owner chain.
@@ -1843,22 +2008,18 @@ impl PrivateOramOwnerNewGenerationReadinessExpectationV2 {
             "acknowledged_archives",
         )?;
         for archive in &self.acknowledged_archives {
-            bytes.extend_from_slice(&archive.generation.to_be_bytes());
-            bytes.extend_from_slice(&archive.owner_peer_id.to_be_bytes());
-            push_digest(
+            archive.encode_binding(&mut bytes)?;
+        }
+        // Preserve the historical encoding when no prefix has been compacted.
+        if let Some(history) = &self.compacted_archive_history {
+            push_domain(
                 &mut bytes,
-                &archive.parent_terminal_record_digest,
-                "parent_terminal_record_digest",
+                OWNER_COMPACTED_ARCHIVE_HISTORY_COMMITMENT_DOMAIN_V1,
             )?;
             push_digest(
                 &mut bytes,
-                &archive.pending_tombstone_digest,
-                "pending_tombstone_digest",
-            )?;
-            push_digest(
-                &mut bytes,
-                &archive.clear_receipt_digest,
-                "clear_receipt_digest",
+                &history.commitment_digest()?,
+                "compacted_archive_history",
             )?;
         }
         Ok(digest_string(&bytes))
@@ -3264,6 +3425,14 @@ impl PrivateOramOwnerPrestageStoreV2 {
         &self,
         expectation: &PrivateOramOwnerNewGenerationReadinessExpectationV2,
     ) -> Result<(), PrivateOramOwnerJournalError> {
+        self.validated_acknowledged_generations_v2(expectation)
+            .map(|_| ())
+    }
+
+    fn validated_acknowledged_generations_v2(
+        &self,
+        expectation: &PrivateOramOwnerNewGenerationReadinessExpectationV2,
+    ) -> Result<BTreeSet<u64>, PrivateOramOwnerJournalError> {
         if !path_entry_exists(&self.root)? {
             return Err(PrivateOramOwnerJournalError::NotEnrolled);
         }
@@ -3308,32 +3477,30 @@ impl PrivateOramOwnerPrestageStoreV2 {
             return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
         }
 
+        // Durable acknowledged history grows beyond the transient intent limit. Bound scans by
+        // the consensus-committed count plus the fixed allowance for other lifecycle records.
+        let archive_count = expectation.acknowledged_archive_count()?;
+        let history_scan_limit = archive_count
+            .checked_add(PRESTAGE_MAX_TERMINAL_RECORDS)
+            .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)?;
         let (_, retired) = self.open_prestage_child_locked(&root, PRESTAGE_RETIRED_DIR)?;
-        let retired_intents = directory_entry_names_open_bounded(
+        let retired_names = directory_entry_names_open_bounded(
             &retired,
-            PRESTAGE_MAX_TERMINAL_RECORDS,
+            history_scan_limit,
             PrivateOramOwnerJournalError::TerminalCapacityExceeded,
-        )?
-        .into_iter()
-        .map(|intent_name| {
-            let intent_key = intent_name
-                .to_str()
-                .ok_or(PrivateOramOwnerJournalError::Corrupt)?;
-            self.load_intent_locked(&root, &retired, PRESTAGE_RETIRED_DIR, intent_key)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        )?;
 
         let owner_journal = PrivateOramOwnerJournal::new(&self.primary_hnsw_store_root);
         let canonical_path =
             open_directory_entry_path(&owner_temp, OsStr::new(PRIVATE_ORAM_OWNER_JOURNAL_DIR))?;
+        let mut acknowledged_generations = BTreeSet::new();
         if path_entry_exists(&canonical_path)? {
             let canonical_root = open_private_directory(&canonical_path)?;
             let canonical_lock = lock_private_journal_root_shared(&canonical_root)?;
             let canonical_names = directory_entry_names_open_bounded(
                 &canonical_root,
-                PRESTAGE_MAX_TERMINAL_RECORDS
-                    .checked_mul(2)
-                    .and_then(|limit| limit.checked_add(1))
+                history_scan_limit
+                    .checked_add(1)
                     .ok_or(PrivateOramOwnerJournalError::TerminalCapacityExceeded)?,
                 PrivateOramOwnerJournalError::TerminalCapacityExceeded,
             )?;
@@ -3370,25 +3537,47 @@ impl PrivateOramOwnerPrestageStoreV2 {
                 }
             }
 
-            if archived_by_generation.len() != expectation.acknowledged_archives.len() {
+            if archived_by_generation.len() != archive_count {
                 return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
             }
-            for expected in &expectation.acknowledged_archives {
-                let Some(archive) = archived_by_generation.get(&expected.generation) else {
-                    return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
-                };
+            let mut compacted_history = None;
+            for (generation, archive) in &archived_by_generation {
+                let binding = PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                    *generation,
+                    archive.owner_peer_id,
+                    archive.parent_terminal_record_digest.clone(),
+                    archive.pending_tombstone_digest.clone(),
+                    archive.clear_receipt_digest.clone(),
+                )?;
+                if expectation
+                    .compacted_archive_history
+                    .as_ref()
+                    .is_some_and(|history| *generation <= history.through_generation)
+                {
+                    compacted_history = Some(
+                        PrivateOramOwnerCompactedArchiveHistoryV1::append(
+                            compacted_history.as_ref(),
+                            &binding,
+                        )
+                        .map_err(|_| PrivateOramOwnerJournalError::ExternalRecoveryRequired)?,
+                    );
+                } else {
+                    let expected = expectation
+                        .acknowledged_archives
+                        .binary_search_by_key(generation, |expected| expected.generation)
+                        .ok()
+                        .map(|index| &expectation.acknowledged_archives[index]);
+                    if expected != Some(&binding) {
+                        return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
+                    }
+                }
                 let parent = LoadedCanonicalParentArchiveGrantV1::load(
                     &self.primary_hnsw_store_root,
-                    expected.generation,
+                    *generation,
                 )
                 .map_err(|_| PrivateOramOwnerJournalError::ExternalRecoveryRequired)?;
                 let grant = parent.grant();
-                if archive.generation != expected.generation
-                    || archive.owner_peer_id != expected.owner_peer_id
-                    || archive.parent_terminal_record_digest
-                        != expected.parent_terminal_record_digest
-                    || archive.pending_tombstone_digest != expected.pending_tombstone_digest
-                    || archive.clear_receipt_digest != expected.clear_receipt_digest
+                if archive.generation != *generation
                     || grant.collection_id != archive.collection_id
                     || grant.generation != archive.generation
                     || grant.owner_peer_id != archive.owner_peer_id
@@ -3408,12 +3597,22 @@ impl PrivateOramOwnerPrestageStoreV2 {
                     return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
                 }
             }
+            if compacted_history != expectation.compacted_archive_history {
+                return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
+            }
 
             let mut retired_archived_receipts = BTreeSet::new();
-            for loaded in &retired_intents {
+            // Load one retired package at a time; the durable history count must not cause
+            // every encrypted package to be retained in memory together.
+            for intent_name in &retired_names {
+                let intent_key = intent_name
+                    .to_str()
+                    .ok_or(PrivateOramOwnerJournalError::Corrupt)?;
+                let loaded =
+                    self.load_intent_locked(&root, &retired, PRESTAGE_RETIRED_DIR, intent_key)?;
                 if loaded.state() == PrivateOramOwnerLocalIntentStateV2::Adopted {
                     if !owner_journal
-                        .committed_archive_fences_intent_under_lock_v1(&canonical_lock, loaded)?
+                        .committed_archive_fences_intent_under_lock_v1(&canonical_lock, &loaded)?
                         || !retired_archived_receipts
                             .insert(loaded.receipt.receipt_digest().to_string())
                     {
@@ -3428,18 +3627,27 @@ impl PrivateOramOwnerPrestageStoreV2 {
             if archived_receipts != retired_archived_receipts {
                 return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
             }
+            acknowledged_generations.extend(archived_by_generation.keys().copied());
             validate_open_directory_at_path(&canonical_root, owner_journal.root_path())?;
-        } else if !expectation.acknowledged_archives.is_empty()
-            || retired_intents
-                .iter()
-                .any(|loaded| loaded.state() == PrivateOramOwnerLocalIntentStateV2::Adopted)
-        {
-            return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
+        } else {
+            if archive_count != 0 {
+                return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
+            }
+            for intent_name in &retired_names {
+                let intent_key = intent_name
+                    .to_str()
+                    .ok_or(PrivateOramOwnerJournalError::Corrupt)?;
+                let loaded =
+                    self.load_intent_locked(&root, &retired, PRESTAGE_RETIRED_DIR, intent_key)?;
+                if loaded.state() == PrivateOramOwnerLocalIntentStateV2::Adopted {
+                    return Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired);
+                }
+            }
         }
 
         lifecycle_lock.validate_held()?;
         validate_open_directory_at_path(&root, &self.root)?;
-        Ok(())
+        Ok(acknowledged_generations)
     }
 
     #[cfg(test)]
@@ -12189,6 +12397,79 @@ mod tests {
 
     fn digest(fill: u8) -> String {
         BASE64URL_NOPAD.encode(&[fill; DIGEST_BYTES])
+    }
+
+    #[test]
+    fn compacted_archive_history_checks_identity_order_and_large_counts() {
+        let archive = |generation, owner| {
+            PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+                generation,
+                owner,
+                digest(1),
+                digest(2),
+                digest(3),
+            )
+            .unwrap()
+        };
+        let first =
+            PrivateOramOwnerCompactedArchiveHistoryV1::append(None, &archive(1, 11)).unwrap();
+        assert!(
+            PrivateOramOwnerCompactedArchiveHistoryV1::append(Some(&first), &archive(1, 11))
+                .is_err()
+        );
+        assert!(
+            PrivateOramOwnerCompactedArchiveHistoryV1::append(Some(&first), &archive(2, 13))
+                .is_err()
+        );
+        // Coordinator/owner changes can leave gaps in one owner's generation sequence.
+        let resumed_owner =
+            PrivateOramOwnerCompactedArchiveHistoryV1::append(Some(&first), &archive(3, 11))
+                .unwrap();
+        let intervening_owner =
+            PrivateOramOwnerCompactedArchiveHistoryV1::append(None, &archive(2, 13)).unwrap();
+        assert_eq!(resumed_owner.archive_count(), 2);
+        assert_eq!(resumed_owner.through_generation(), 3);
+        assert_eq!(intervening_owner.archive_count(), 1);
+        assert_eq!(intervening_owner.through_generation(), 2);
+        let mut history = Some(first);
+        // This history is consensus-qualified and must not inherit the unrelated 4096 limit
+        // for transient intents. Construction performs checked arithmetic without allocating
+        // storage for the claimed number of durable archives.
+        for generation in 2..=PRESTAGE_MAX_TERMINAL_RECORDS as u64 + 1 {
+            history = Some(
+                PrivateOramOwnerCompactedArchiveHistoryV1::append(
+                    history.as_ref(),
+                    &archive(generation, 11),
+                )
+                .unwrap(),
+            );
+        }
+        let expectation =
+            PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new_with_compacted_history(
+                "collection-a".to_string(),
+                digest(4),
+                digest(5),
+                Vec::new(),
+                history.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            expectation.acknowledged_archive_count().unwrap(),
+            PRESTAGE_MAX_TERMINAL_RECORDS + 1
+        );
+        let mut overflow = history.unwrap();
+        overflow.archive_count = u64::MAX;
+        overflow.through_generation = u64::MAX;
+        assert!(
+            PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new_with_compacted_history(
+                "collection-a".to_string(),
+                digest(4),
+                digest(5),
+                vec![archive(u64::MAX, 11)],
+                Some(overflow),
+            )
+            .is_err()
+        );
     }
 
     fn canonical_index_states(

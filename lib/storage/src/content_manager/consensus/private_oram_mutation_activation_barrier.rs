@@ -1003,6 +1003,90 @@ mod tests {
     }
 
     #[test]
+    fn historical_wire8_floor_replays_then_upgrades_to_wire9() {
+        let apply = |fixture: &PrivateOramMutationActivationBarrierFixtureV2,
+                     current: Option<&PrivateOramMutationFormatFloorV2>| {
+            let prepared = validate_private_oram_mutation_activation_barrier_v2(
+                &fixture.prepare_operation,
+                &fixture.authority,
+                current,
+                None,
+                &fixture.conf_state,
+                &fixture.peer_addresses,
+                PrivateOramMutationActivationApplyFactsV2 {
+                    entry_term: fixture.current_term,
+                    entry_index: fixture.base_index + 1,
+                    prior_applied_index: fixture.base_index,
+                    barrier_base_entry_term: fixture.base_entry_term,
+                },
+            )
+            .unwrap();
+            // Restored pending reader floors must use the signed historical target protocol,
+            // rather than silently being reinterpreted as the running binary's newer version.
+            let pending: PrivateOramMutationActivationPendingV2 = serde_json::from_slice(
+                &serde_json::to_vec(prepared.next_pending().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let floor: PrivateOramMutationFormatFloorV2 =
+                serde_json::from_slice(&serde_json::to_vec(prepared.next_format_floor()).unwrap())
+                    .unwrap();
+            validate_private_oram_mutation_activation_pending_v2(
+                Some(&pending),
+                Some(&floor),
+                fixture.base_index + 1,
+                true,
+            )
+            .unwrap();
+            if let Some(current) = current {
+                assert_eq!(
+                    floor.minimum_writer_protocol(),
+                    current.minimum_writer_protocol()
+                );
+            }
+            validate_private_oram_mutation_activation_barrier_v2(
+                &fixture.enable_operation,
+                &fixture.authority,
+                Some(&floor),
+                Some(&pending),
+                &fixture.conf_state,
+                &fixture.peer_addresses,
+                PrivateOramMutationActivationApplyFactsV2 {
+                    entry_term: fixture.current_term + 1,
+                    entry_index: fixture.base_index + 2,
+                    prior_applied_index: fixture.base_index + 1,
+                    barrier_base_entry_term: fixture.base_entry_term,
+                },
+            )
+            .unwrap()
+            .next_format_floor()
+            .clone()
+        };
+        let initial = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+        let wire6 = apply(&initial, None);
+        let upgrade8 = private_oram_mutation_activation_barrier_fixture_for_test(
+            8,
+            initial.base_index + 2,
+            initial.current_term + 1,
+            initial.current_term + 1,
+            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads,
+            PrivateOramMutationActivationBarrierPhaseV2::EnableReservationV3Writes,
+        );
+        let wire8 = apply(&upgrade8, Some(&wire6));
+        assert_eq!(wire8.format_epoch(), 4);
+        assert_eq!(wire8.minimum_reader_protocol(), 8);
+        assert_eq!(wire8.minimum_writer_protocol(), 8);
+        let upgrade9 = private_oram_mutation_v3_floor_upgrade_fixture_for_test(
+            upgrade8.base_index + 2,
+            upgrade8.current_term + 1,
+            upgrade8.current_term + 1,
+        );
+        let wire9 = apply(&upgrade9, Some(&wire8));
+        assert_eq!(wire9.format_epoch(), 6);
+        assert_eq!(wire9.minimum_reader_protocol(), 9);
+        assert_eq!(wire9.minimum_writer_protocol(), 9);
+    }
+
+    #[test]
     fn barrier_rejects_topology_uri_and_term_drift() {
         let fixture = private_oram_mutation_activation_barrier_fixture_v2_for_test();
         let facts = PrivateOramMutationActivationApplyFactsV2 {

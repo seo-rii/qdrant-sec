@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use collection::private_oram_owner_journal::{
-    PrivateOramOwnerAcknowledgedArchiveExpectationV2,
+    PrivateOramOwnerAcknowledgedArchiveExpectationV2, PrivateOramOwnerCompactedArchiveHistoryV1,
     PrivateOramOwnerNewGenerationReadinessExpectationV2,
 };
 use data_encoding::BASE64URL_NOPAD;
@@ -37,6 +37,9 @@ use super::append_reservation_v3::{
     decode_private_oram_mutation_prepared_reservation_challenge_v3,
     encode_private_oram_mutation_append_reservation_v3,
     encode_private_oram_mutation_prepared_reservation_challenge_v3,
+};
+use super::format::{
+    PrivateOramMutationFormatFloorV2, validate_private_oram_mutation_format_floor_v2,
 };
 use super::owner_checkpoint::{
     PrivateOramOwnerCheckpointTableV1, PrivateOramOwnerNegativeSettlementV1,
@@ -164,6 +167,8 @@ const AGGREGATE_DIGEST_DOMAIN_V2: &[u8] =
 const AGGREGATE_CORE_DIGEST_DOMAIN_V2: &[u8] =
     b"qdrant-sec/private-oram-mutation-consensus-aggregate-core/v2";
 const OWNER_CHECKPOINT_COMPONENT_TAG_V1: &[u8] = b"owner-checkpoint-table/v1";
+const OWNER_ARCHIVE_HISTORY_COMPONENT_TAG_V1: &[u8] = b"owner-archive-history/v1";
+pub(crate) const OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1: u16 = 9;
 const RESERVATION_CHALLENGE_COMPONENT_TAG_V1: &[u8] = b"reservation-challenge-state/v1";
 const PENDING_RESERVATION_CHALLENGE_DIGEST_DOMAIN_V1: &[u8] =
     b"qdrant-sec/private-oram-mutation-pending-reservation-challenge/v1";
@@ -887,6 +892,8 @@ pub(crate) struct PrivateOramMutationConsensusAggregateV2 {
     transition_ordinal: u64,
     last_material_transition: PrivateOramMaterialTransitionReceiptV2,
     outstanding_gc_obligations: Vec<PrivateOramAcknowledgedGcObligationV2>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    compacted_owner_archive_histories: Vec<PrivateOramOwnerCompactedArchiveHistoryV1>,
     rejected_admissions: Vec<PrivateOramMutationRejectedAdmissionV2>,
     active_append_attempt: Option<PrivateOramMutationActiveAppendAttemptV2>,
     append_outcomes: Vec<PrivateOramMutationAppendOutcomeV2>,
@@ -926,6 +933,10 @@ impl Debug for PrivateOramMutationConsensusAggregateV2 {
                 &self.outstanding_gc_obligations.len(),
             )
             .field("rejected_admission_count", &self.rejected_admissions.len())
+            .field(
+                "compacted_owner_archive_histories",
+                &self.compacted_owner_archive_histories,
+            )
             .field("active_append_attempt", &self.active_append_attempt)
             .field("append_outcome_count", &self.append_outcomes.len())
             .field("owner_checkpoint_table", &self.owner_checkpoint_table)
@@ -1244,7 +1255,31 @@ pub(crate) struct PrivateOramMutationAggregateApplyContextV2 {
     request_digest: String,
     expected_aggregate_digest: String,
     next_outer_binding_digest: String,
+    retain_compacted_owner_archive_history: bool,
     _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl PrivateOramMutationAggregateApplyContextV2 {
+    /// The applied writer floor, not the running binary version, chooses replay semantics.
+    pub(crate) fn with_owner_archive_history_floor(
+        mut self,
+        floor: &PrivateOramMutationFormatFloorV2,
+    ) -> Result<Self, PrivateOramMutationJournalError> {
+        validate_private_oram_mutation_format_floor_v2(floor)?;
+        if !matches!(
+            self.operation_kind,
+            PrivateOramMutationMaterialOperationV2::Admission
+                | PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared
+        ) || !floor.activation_enabled()
+            || floor.minimum_reader_protocol() < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+            || floor.minimum_writer_protocol() < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+            || !locator_is_strictly_after(&self.locator, floor.floor_applied_locator())
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        self.retain_compacted_owner_archive_history = true;
+        Ok(self)
+    }
 }
 
 impl Debug for PrivateOramMutationActivationContextV2 {
@@ -1381,6 +1416,10 @@ impl PrivateOramMutationConsensusAggregateV2 {
         &self.outstanding_gc_obligations
     }
 
+    pub(crate) fn has_compacted_owner_archive_history(&self) -> bool {
+        !self.compacted_owner_archive_histories.is_empty()
+    }
+
     pub(crate) fn owner_new_generation_readiness_expectation(
         &self,
         collection_id: &str,
@@ -1388,6 +1427,7 @@ impl PrivateOramMutationConsensusAggregateV2 {
     ) -> Result<PrivateOramOwnerNewGenerationReadinessExpectationV2, PrivateOramMutationJournalError>
     {
         validate_aggregate_v2(self)?;
+        require_complete_acknowledged_archive_history_v1(self)?;
         if owner_peer_id == 0
             || private_oram_collection_id_digest_v2(collection_id)?
                 != self.activation.authority_key.collection_key_digest
@@ -1406,11 +1446,15 @@ impl PrivateOramMutationConsensusAggregateV2 {
             return Err(PrivateOramMutationJournalError::Corrupt);
         }
         let expected = self.acknowledged_owner_archive_expectations(owner_peer_id)?;
-        PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new(
+        PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new_with_compacted_history(
             collection_id.to_string(),
             checkpoint.owner_store_incarnation_digest().to_string(),
             self.aggregate_digest.clone(),
             expected,
+            self.compacted_owner_archive_histories
+                .iter()
+                .find(|history| history.owner_peer_id() == owner_peer_id)
+                .cloned(),
         )
         .map_err(|_| PrivateOramMutationJournalError::Corrupt)
     }
@@ -1431,23 +1475,13 @@ impl PrivateOramMutationConsensusAggregateV2 {
             if !matches!(
                 cleared.resolution,
                 PrivateOramMutationClearResolutionV2::Acknowledged(_)
-            ) || cleared.owner_peer_id != owner_peer_id
-            {
+            ) {
                 return Err(PrivateOramMutationJournalError::InvalidTransition);
             }
-            let mut pending = cleared.clone();
-            pending.resolution = PrivateOramMutationClearResolutionV2::Pending;
-            pending.resolution_digest = clear_resolution_digest_v2(&pending)?;
-            pending.tombstone_digest = cleared_state_digest_v2(&pending)?;
-            validate_cleared_state_v2(&pending)?;
-            let archive = PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
-                cleared.generation,
-                cleared.owner_peer_id,
-                cleared.terminal_record_digest.clone(),
-                pending.tombstone_digest,
-                cleared.clear_receipt_digest.clone(),
-            )
-            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+            if cleared.owner_peer_id != owner_peer_id {
+                return Ok(());
+            }
+            let archive = acknowledged_owner_archive_expectation_v2(cleared)?;
             if let Some(existing) = expected.insert(cleared.generation, archive.clone())
                 && existing != archive
             {
@@ -1935,6 +1969,7 @@ pub(crate) fn activate_private_oram_mutation_authority_v2(
         None,
         &[],
         None,
+        &[],
     )?;
     let last_material_transition = new_material_transition_receipt_v2(
         1,
@@ -1957,6 +1992,7 @@ pub(crate) fn activate_private_oram_mutation_authority_v2(
         transition_ordinal: 1,
         last_material_transition,
         outstanding_gc_obligations: Vec::new(),
+        compacted_owner_archive_histories: Vec::new(),
         rejected_admissions: Vec::new(),
         active_append_attempt: None,
         append_outcomes: Vec::new(),
@@ -2097,6 +2133,22 @@ pub(crate) fn apply_private_oram_mutation_authority_prepare_append_reservation_c
     challenge_canonical_json: String,
     context: PrivateOramMutationAggregateApplyContextV2,
 ) -> Result<PrivateOramMutationAuthorityStateV2, PrivateOramMutationJournalError> {
+    apply_prepare_append_reservation_challenge_with_gc_limits_v3(
+        current,
+        challenge_canonical_json,
+        context,
+        MAX_OUTSTANDING_GC_OBLIGATIONS,
+        MAX_OUTSTANDING_GC_OBLIGATION_BYTES,
+    )
+}
+
+fn apply_prepare_append_reservation_challenge_with_gc_limits_v3(
+    current: &PrivateOramMutationAuthorityStateV2,
+    challenge_canonical_json: String,
+    context: PrivateOramMutationAggregateApplyContextV2,
+    maximum_gc_count: usize,
+    maximum_gc_bytes: usize,
+) -> Result<PrivateOramMutationAuthorityStateV2, PrivateOramMutationJournalError> {
     let aggregate = require_aggregate_v2(current)?;
     let challenge =
         decode_private_oram_mutation_prepared_reservation_challenge_v3(&challenge_canonical_json)?;
@@ -2168,11 +2220,24 @@ pub(crate) fn apply_private_oram_mutation_authority_prepare_append_reservation_c
         challenge.checkpoint_context(),
         &aggregate.owner_checkpoint_table,
     )?;
-    validate_prepared_reservation_challenge_capacity_v3(
-        aggregate,
-        &challenge_canonical_json,
-        base_reservation,
-    )?;
+    let outstanding_gc_obligations = if context.retain_compacted_owner_archive_history {
+        project_gc_retention_for_reservation_v3(
+            aggregate,
+            &challenge_canonical_json,
+            base_reservation,
+            maximum_gc_count,
+            maximum_gc_bytes,
+        )?
+    } else {
+        // The applied floor selects this branch, preserving wire-8 replay and its digests.
+        validate_prepared_reservation_challenge_capacity_v3(
+            aggregate,
+            &challenge_canonical_json,
+            base_reservation,
+            maximum_gc_bytes,
+        )?;
+        aggregate.outstanding_gc_obligations.clone()
+    };
     let pending = pending_reservation_challenge_v1(
         challenge,
         challenge_canonical_json,
@@ -2190,7 +2255,7 @@ pub(crate) fn apply_private_oram_mutation_authority_prepare_append_reservation_c
         aggregate.lease_slot.clone(),
         aggregate.recovery_capsules_certificate.clone(),
         aggregate.terminal_decision_certificate.clone(),
-        aggregate.outstanding_gc_obligations.clone(),
+        outstanding_gc_obligations,
         aggregate.rejected_admissions.clone(),
         None,
         aggregate.append_outcomes.clone(),
@@ -3958,6 +4023,12 @@ fn advance_aggregate_with_challenge_history_v2(
         .transition_ordinal
         .checked_add(1)
         .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+    let compacted_owner_archive_histories = advance_compacted_owner_archive_histories_v1(
+        current,
+        &outstanding_gc_obligations,
+        context.operation_kind,
+        context.retain_compacted_owner_archive_history,
+    )?;
     let authority_core_digest = aggregate_core_digest_from_parts_v2(
         aggregate_version,
         &current.activation,
@@ -3974,6 +4045,7 @@ fn advance_aggregate_with_challenge_history_v2(
         pending_reservation_challenge.as_ref(),
         &reservation_challenge_outcomes,
         reservation_challenge_outcome_accumulator.as_ref(),
+        &compacted_owner_archive_histories,
     )?;
     let last_material_transition = new_material_transition_receipt_v2(
         transition_ordinal,
@@ -3996,6 +4068,7 @@ fn advance_aggregate_with_challenge_history_v2(
         transition_ordinal,
         last_material_transition,
         outstanding_gc_obligations,
+        compacted_owner_archive_histories,
         rejected_admissions,
         active_append_attempt,
         append_outcomes,
@@ -4017,6 +4090,23 @@ fn retain_acknowledged_gc_obligation_v2(
     aggregate: &PrivateOramMutationConsensusAggregateV2,
     obligations: &mut Vec<PrivateOramAcknowledgedGcObligationV2>,
 ) -> Result<(), PrivateOramMutationJournalError> {
+    retain_acknowledged_gc_obligation_with_limits_v2(
+        aggregate,
+        obligations,
+        MAX_OUTSTANDING_GC_OBLIGATIONS,
+        MAX_OUTSTANDING_GC_OBLIGATION_BYTES,
+    )
+}
+
+fn retain_acknowledged_gc_obligation_with_limits_v2(
+    aggregate: &PrivateOramMutationConsensusAggregateV2,
+    obligations: &mut Vec<PrivateOramAcknowledgedGcObligationV2>,
+    maximum_count: usize,
+    maximum_bytes: usize,
+) -> Result<(), PrivateOramMutationJournalError> {
+    if maximum_count == 0 {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
     let Some(cleared) = aggregate.lifecycle.last_cleared.as_ref() else {
         return Ok(());
     };
@@ -4043,16 +4133,229 @@ fn retain_acknowledged_gc_obligation_v2(
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     obligations.push(candidate);
-    // Obligations are retained newest-last; once the bounded history is full the oldest ones
-    // are dropped rather than refusing every further admission of the collection.
-    while obligations.len() > MAX_OUTSTANDING_GC_OBLIGATIONS
-        || (obligations.len() > 1
-            && gc_obligations_serialized_len_v2(obligations)? > MAX_OUTSTANDING_GC_OBLIGATION_BYTES)
+    // Detailed obligations are retained newest-last. The aggregate transition commits the
+    // removed prefix in compacted_owner_archive_histories before publishing this suffix.
+    while obligations.len() > maximum_count
+        || (obligations.len() > 1 && gc_obligations_serialized_len_v2(obligations)? > maximum_bytes)
     {
         obligations.remove(0);
     }
-    if gc_obligations_serialized_len_v2(obligations)? > MAX_OUTSTANDING_GC_OBLIGATION_BYTES {
+    if gc_obligations_serialized_len_v2(obligations)? > maximum_bytes {
         obligations.pop();
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn acknowledged_owner_archive_expectation_v2(
+    cleared: &PrivateOramMutationClearedStateV2,
+) -> Result<PrivateOramOwnerAcknowledgedArchiveExpectationV2, PrivateOramMutationJournalError> {
+    if !matches!(
+        cleared.resolution,
+        PrivateOramMutationClearResolutionV2::Acknowledged(_)
+    ) {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    let mut pending = cleared.clone();
+    pending.resolution = PrivateOramMutationClearResolutionV2::Pending;
+    pending.resolution_digest = clear_resolution_digest_v2(&pending)?;
+    pending.tombstone_digest = cleared_state_digest_v2(&pending)?;
+    validate_cleared_state_v2(&pending)?;
+    PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+        cleared.generation,
+        cleared.owner_peer_id,
+        cleared.terminal_record_digest.clone(),
+        pending.tombstone_digest,
+        cleared.clear_receipt_digest.clone(),
+    )
+    .map_err(|_| PrivateOramMutationJournalError::Corrupt)
+}
+
+fn advance_compacted_owner_archive_histories_v1(
+    current: &PrivateOramMutationConsensusAggregateV2,
+    next: &[PrivateOramAcknowledgedGcObligationV2],
+    operation: PrivateOramMutationMaterialOperationV2,
+    retain_history: bool,
+) -> Result<Vec<PrivateOramOwnerCompactedArchiveHistoryV1>, PrivateOramMutationJournalError> {
+    if retain_history {
+        require_complete_acknowledged_archive_history_v1(current)?;
+    }
+    let mut histories = current.compacted_owner_archive_histories.clone();
+    if next == current.outstanding_gc_obligations {
+        return Ok(histories);
+    }
+    if !retain_history {
+        // Historical entries must reproduce their original aggregate digest. Once history is
+        // committed, a missing/downgraded floor must never discard it on a later admission.
+        return if histories.is_empty() {
+            Ok(histories)
+        } else {
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        };
+    }
+    // Reservation preparation may only compact an exact prefix. Admission may additionally
+    // append the acknowledged predecessor. Neither path may drop a hole or replace a tuple.
+    let removed = next
+        .first()
+        .map_or(current.outstanding_gc_obligations.len(), |first| {
+            current
+                .outstanding_gc_obligations
+                .partition_point(|obligation| obligation.generation < first.generation)
+        });
+    let retained = &current.outstanding_gc_obligations[removed..];
+    match operation {
+        PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared
+            if next == retained => {}
+        PrivateOramMutationMaterialOperationV2::Admission => {
+            let cleared = current
+                .lifecycle
+                .last_cleared
+                .as_ref()
+                .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+            if next.len() != retained.len() + 1
+                || !next.starts_with(retained)
+                || next.last() != Some(&new_gc_obligation_v2(current, cleared.clone())?)
+            {
+                return Err(PrivateOramMutationJournalError::InvalidTransition);
+            }
+        }
+        _ => return Err(PrivateOramMutationJournalError::InvalidTransition),
+    }
+    for obligation in &current.outstanding_gc_obligations[..removed] {
+        let owner = obligation.acknowledged_tombstone.owner_peer_id;
+        let binding =
+            acknowledged_owner_archive_expectation_v2(&obligation.acknowledged_tombstone)?;
+        let index = histories.binary_search_by_key(&owner, |history| history.owner_peer_id());
+        let history = PrivateOramOwnerCompactedArchiveHistoryV1::append(
+            index.ok().map(|index| &histories[index]),
+            &binding,
+        )
+        .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+        match index {
+            Ok(index) => histories[index] = history,
+            Err(index) => histories.insert(index, history),
+        }
+    }
+    Ok(histories)
+}
+
+/// Exercises the retention boundary with two real, fully acknowledged generations supplied by
+/// the parent-journal integration fixture, without creating thousands of cryptographic journals.
+#[cfg(test)]
+pub(crate) fn assert_gc_compaction_retains_owner_history_for_test(
+    state: &PrivateOramMutationAuthorityStateV2,
+    previous_lease: &PrivateOramMutationLease,
+) {
+    let current = require_aggregate_v2(state).unwrap();
+    assert_eq!(current.outstanding_gc_obligations.len(), 1);
+    let first = &current.outstanding_gc_obligations[0];
+    assert_eq!(first.generation, 1);
+    let next_obligation =
+        new_gc_obligation_v2(current, current.lifecycle.last_cleared.clone().unwrap()).unwrap();
+    assert_eq!(next_obligation.generation, 2);
+    let expected = PrivateOramOwnerCompactedArchiveHistoryV1::append(
+        None,
+        &acknowledged_owner_archive_expectation_v2(&first.acknowledged_tombstone).unwrap(),
+    )
+    .unwrap();
+    let next_bytes =
+        gc_obligations_serialized_len_v2(std::slice::from_ref(&next_obligation)).unwrap();
+    for (max_count, max_bytes) in [
+        (1, MAX_OUTSTANDING_GC_OBLIGATION_BYTES),
+        (MAX_OUTSTANDING_GC_OBLIGATIONS, next_bytes),
+    ] {
+        let mut next = current.outstanding_gc_obligations.clone();
+        retain_acknowledged_gc_obligation_with_limits_v2(current, &mut next, max_count, max_bytes)
+            .unwrap();
+        assert_eq!(next, vec![next_obligation.clone()]);
+        let histories = advance_compacted_owner_archive_histories_v1(
+            current,
+            &next,
+            PrivateOramMutationMaterialOperationV2::Admission,
+            true,
+        )
+        .unwrap();
+        assert_eq!(histories, vec![expected.clone()]);
+        assert_eq!(
+            serde_json::from_slice::<Vec<PrivateOramOwnerCompactedArchiveHistoryV1>>(
+                &serde_json::to_vec(&histories).unwrap()
+            )
+            .unwrap(),
+            histories
+        );
+        // Replaying the same historical pre-wire9 admission preserves its old empty proof.
+        assert!(
+            advance_compacted_owner_archive_histories_v1(
+                current,
+                &next,
+                PrivateOramMutationMaterialOperationV2::Admission,
+                false,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            advance_compacted_owner_archive_histories_v1(
+                current,
+                &next,
+                PrivateOramMutationMaterialOperationV2::Renewal,
+                true,
+            )
+            .is_err()
+        );
+    }
+    let mut missing_legacy_prefix = current.clone();
+    missing_legacy_prefix.outstanding_gc_obligations.clear();
+    assert!(require_complete_acknowledged_archive_history_v1(&missing_legacy_prefix).is_err());
+    assert!(
+        advance_compacted_owner_archive_histories_v1(
+            &missing_legacy_prefix,
+            &[next_obligation],
+            PrivateOramMutationMaterialOperationV2::Admission,
+            true,
+        )
+        .is_err()
+    );
+    wire_tests::assert_reservation_compacts_gc_at_capacity(state, previous_lease, &expected);
+}
+
+fn require_complete_acknowledged_archive_history_v1(
+    aggregate: &PrivateOramMutationConsensusAggregateV2,
+) -> Result<(), PrivateOramMutationJournalError> {
+    // Activation starts at generation zero; every admitted successor requires the preceding
+    // generation's acknowledgement. A legacy suffix above one cannot establish the missing
+    // prefix, even if the corresponding old owner archives have also disappeared locally.
+    let mut count = 0_u64;
+    let mut through = 0_u64;
+    for history in &aggregate.compacted_owner_archive_histories {
+        count = count
+            .checked_add(history.archive_count())
+            .ok_or(PrivateOramMutationJournalError::Corrupt)?;
+        through = through.max(history.through_generation());
+    }
+    if count != through {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    for obligation in &aggregate.outstanding_gc_obligations {
+        if through.checked_add(1) != Some(obligation.generation) {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        through = obligation.generation;
+    }
+    let complete = match aggregate.lifecycle.last_cleared.as_ref() {
+        Some(cleared)
+            if matches!(
+                cleared.resolution,
+                PrivateOramMutationClearResolutionV2::Acknowledged(_)
+            ) =>
+        {
+            // The newest acknowledgement joins the GC suffix on the following admission.
+            through == cleared.generation || through.checked_add(1) == Some(cleared.generation)
+        }
+        Some(cleared) => through.checked_add(1) == Some(cleared.generation),
+        None => through == 0,
+    };
+    if !complete {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     Ok(())
@@ -4256,6 +4559,7 @@ fn validate_aggregate_v2(
                 aggregate.pending_reservation_challenge.as_ref(),
                 &aggregate.reservation_challenge_outcomes,
                 aggregate.reservation_challenge_outcome_accumulator.as_ref(),
+                &aggregate.compacted_owner_archive_histories,
             )?
     {
         return Err(PrivateOramMutationJournalError::Corrupt);
@@ -4388,7 +4692,43 @@ fn validate_aggregate_v2(
     {
         return Err(PrivateOramMutationJournalError::Corrupt);
     }
-    let mut previous_generation = None;
+    if aggregate.compacted_owner_archive_histories.len()
+        > aggregate.owner_checkpoint_table.checkpoints().len()
+    {
+        return Err(PrivateOramMutationJournalError::Corrupt);
+    }
+    let mut previous_owner = None;
+    let mut compacted_through = 0;
+    let mut compacted_count = 0_u64;
+    for history in &aggregate.compacted_owner_archive_histories {
+        history
+            .validate()
+            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
+        if previous_owner.is_some_and(|owner| owner >= history.owner_peer_id())
+            || aggregate
+                .owner_checkpoint_table
+                .checkpoint_for_owner(history.owner_peer_id())
+                .is_none()
+            || history.through_generation() >= aggregate.lease_slot.generation
+        {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        }
+        previous_owner = Some(history.owner_peer_id());
+        compacted_through = compacted_through.max(history.through_generation());
+        compacted_count = compacted_count
+            .checked_add(history.archive_count())
+            .ok_or(PrivateOramMutationJournalError::Corrupt)?;
+    }
+    if compacted_count > compacted_through
+        || aggregate
+            .lifecycle
+            .last_cleared
+            .as_ref()
+            .is_some_and(|cleared| cleared.generation <= compacted_through)
+    {
+        return Err(PrivateOramMutationJournalError::Corrupt);
+    }
+    let mut previous_generation = Some(compacted_through);
     if aggregate.outstanding_gc_obligations.len() > MAX_OUTSTANDING_GC_OBLIGATIONS
         || gc_obligations_serialized_len_v2(&aggregate.outstanding_gc_obligations)?
             > MAX_OUTSTANDING_GC_OBLIGATION_BYTES
@@ -4403,6 +4743,10 @@ fn validate_aggregate_v2(
             return Err(PrivateOramMutationJournalError::Corrupt);
         }
         previous_generation = Some(obligation.generation);
+    }
+    if !aggregate.compacted_owner_archive_histories.is_empty() {
+        require_complete_acknowledged_archive_history_v1(aggregate)
+            .map_err(|_| PrivateOramMutationJournalError::Corrupt)?;
     }
     if aggregate.rejected_admissions.len() > MAX_REJECTED_ADMISSIONS
         || rejected_admissions_serialized_len_v2(&aggregate.rejected_admissions)?
@@ -4990,6 +5334,20 @@ fn validate_append_reservation_capacity_v2(
     reservation_canonical_json: &str,
     reservation: &PrivateOramMutationAppendReservationV2,
 ) -> Result<(), PrivateOramMutationJournalError> {
+    validate_append_reservation_capacity_with_gc_limit_v2(
+        aggregate,
+        reservation_canonical_json,
+        reservation,
+        MAX_OUTSTANDING_GC_OBLIGATION_BYTES,
+    )
+}
+
+fn validate_append_reservation_capacity_with_gc_limit_v2(
+    aggregate: &PrivateOramMutationConsensusAggregateV2,
+    reservation_canonical_json: &str,
+    reservation: &PrivateOramMutationAppendReservationV2,
+    maximum_gc_bytes: usize,
+) -> Result<(), PrivateOramMutationJournalError> {
     let reserved_rejection = usize::try_from(reservation.reserved_rejection_bytes())
         .map_err(|_| PrivateOramMutationJournalError::InvalidTransition)?;
     let reserved_cleanup = usize::try_from(reservation.reserved_cleanup_bytes())
@@ -5011,7 +5369,7 @@ fn validate_append_reservation_capacity_v2(
         .is_none_or(|bytes| bytes > MAX_REJECTED_ADMISSION_BYTES)
         || gc_bytes
             .checked_add(reserved_cleanup)
-            .is_none_or(|bytes| bytes > MAX_OUTSTANDING_GC_OBLIGATION_BYTES)
+            .is_none_or(|bytes| bytes > maximum_gc_bytes)
         || outcome_bytes
             .checked_add(APPEND_RESERVATION_MANDATORY_HEADROOM_BYTES)
             .is_none_or(|bytes| bytes > MAX_APPEND_OUTCOME_BYTES)
@@ -5026,8 +5384,14 @@ fn validate_prepared_reservation_challenge_capacity_v3(
     aggregate: &PrivateOramMutationConsensusAggregateV2,
     challenge_canonical_json: &str,
     reservation: &PrivateOramMutationAppendReservationV2,
+    maximum_gc_bytes: usize,
 ) -> Result<(), PrivateOramMutationJournalError> {
-    validate_append_reservation_capacity_v2(aggregate, challenge_canonical_json, reservation)?;
+    validate_append_reservation_capacity_with_gc_limit_v2(
+        aggregate,
+        challenge_canonical_json,
+        reservation,
+        maximum_gc_bytes,
+    )?;
     let committed_bytes = serde_json::to_vec(aggregate)
         .map_err(|_| PrivateOramMutationJournalError::Corrupt)?
         .len();
@@ -5039,6 +5403,81 @@ fn validate_prepared_reservation_challenge_capacity_v3(
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
     Ok(())
+}
+
+fn project_gc_retention_for_reservation_v3(
+    current: &PrivateOramMutationConsensusAggregateV2,
+    challenge_canonical_json: &str,
+    reservation: &PrivateOramMutationAppendReservationV2,
+    maximum_gc_count: usize,
+    maximum_gc_bytes: usize,
+) -> Result<Vec<PrivateOramAcknowledgedGcObligationV2>, PrivateOramMutationJournalError> {
+    require_complete_acknowledged_archive_history_v1(current)?;
+    if maximum_gc_count == 0
+        || maximum_gc_count > MAX_OUTSTANDING_GC_OBLIGATIONS
+        || maximum_gc_bytes > MAX_OUTSTANDING_GC_OBLIGATION_BYTES
+    {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    let available_gc_bytes = maximum_gc_bytes
+        .checked_sub(
+            usize::try_from(reservation.reserved_cleanup_bytes())
+                .map_err(|_| PrivateOramMutationJournalError::InvalidTransition)?,
+        )
+        .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+    // Reserve one entry for the predecessor transferred by the next admission. Search the
+    // bounded suffix instead of repeatedly serializing and removing one large obligation.
+    let mut removed = current
+        .outstanding_gc_obligations
+        .len()
+        .saturating_sub(maximum_gc_count - 1);
+    let mut upper = current.outstanding_gc_obligations.len();
+    while removed < upper {
+        let middle = removed + (upper - removed) / 2;
+        if gc_obligations_serialized_len_v2(&current.outstanding_gc_obligations[middle..])?
+            > available_gc_bytes
+        {
+            removed = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    let mut projected = current.clone();
+    projected.outstanding_gc_obligations.drain(..removed);
+    projected.compacted_owner_archive_histories = advance_compacted_owner_archive_histories_v1(
+        current,
+        &projected.outstanding_gc_obligations,
+        PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared,
+        true,
+    )?;
+    // Count the proof metadata in every byte budget. The projected digest strings have the
+    // same fixed encoded size; the actual transition recomputes them from the original state.
+    if validate_prepared_reservation_challenge_capacity_v3(
+        &projected,
+        challenge_canonical_json,
+        reservation,
+        maximum_gc_bytes,
+    )
+    .is_err()
+        && !projected.outstanding_gc_obligations.is_empty()
+    {
+        // The aggregate-wide budget can require more space than the dedicated GC budget.
+        // Compact the remaining prefix in one bounded pass, then recheck every original cap.
+        projected.outstanding_gc_obligations.clear();
+        projected.compacted_owner_archive_histories = advance_compacted_owner_archive_histories_v1(
+            current,
+            &[],
+            PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared,
+            true,
+        )?;
+    }
+    validate_prepared_reservation_challenge_capacity_v3(
+        &projected,
+        challenge_canonical_json,
+        reservation,
+        maximum_gc_bytes,
+    )?;
+    Ok(projected.outstanding_gc_obligations)
 }
 
 fn pending_reservation_challenge_v1(
@@ -6737,6 +7176,7 @@ fn aggregate_core_digest_from_parts_v2(
     reservation_challenge_outcome_accumulator: Option<
         &PrivateOramMutationReservationOutcomeAccumulatorV1,
     >,
+    compacted_owner_archive_histories: &[PrivateOramOwnerCompactedArchiveHistoryV1],
 ) -> Result<String, PrivateOramMutationJournalError> {
     let mut hasher = Sha256::new();
     hasher.update(AGGREGATE_CORE_DIGEST_DOMAIN_V2);
@@ -6807,6 +7247,20 @@ fn aggregate_core_digest_from_parts_v2(
                 RESERVATION_CHALLENGE_OUTCOME_ACCUMULATOR_COMPONENT_TAG_V1,
             )?;
             hash_digest(&mut hasher, &accumulator.accumulator_digest)?;
+        }
+    }
+    // Empty history preserves old aggregate digests. Present metadata is fully committed so a
+    // snapshot cannot change the owner, count, or floor while retaining the same chain root.
+    if !compacted_owner_archive_histories.is_empty() {
+        hash_len_prefixed_bytes(&mut hasher, OWNER_ARCHIVE_HISTORY_COMPONENT_TAG_V1)?;
+        hasher.update((compacted_owner_archive_histories.len() as u64).to_be_bytes());
+        for history in compacted_owner_archive_histories {
+            hash_digest(
+                &mut hasher,
+                &history
+                    .commitment_digest()
+                    .map_err(|_| PrivateOramMutationJournalError::Corrupt)?,
+            )?;
         }
     }
     Ok(BASE64URL_NOPAD.encode(&hasher.finalize()))
@@ -6881,6 +7335,7 @@ pub(crate) fn private_oram_mutation_aggregate_apply_context_v2(
         request_digest,
         expected_aggregate_digest,
         next_outer_binding_digest,
+        retain_compacted_owner_archive_history: false,
         _not_send_or_sync: PhantomData,
     };
     validate_apply_locator_v2(&context.locator)?;
@@ -7014,6 +7469,7 @@ pub(crate) fn private_oram_mutation_aggregate_apply_context_with_outer_binding_f
         request_digest,
         expected_aggregate_digest: aggregate.aggregate_digest.clone(),
         next_outer_binding_digest,
+        retain_compacted_owner_archive_history: false,
         _not_send_or_sync: PhantomData,
     };
     validate_apply_locator_v2(&context.locator)?;
@@ -7200,6 +7656,7 @@ mod wire_tests {
             aggregate.pending_reservation_challenge.as_ref(),
             &aggregate.reservation_challenge_outcomes,
             aggregate.reservation_challenge_outcome_accumulator.as_ref(),
+            &aggregate.compacted_owner_archive_histories,
         )
         .unwrap();
         aggregate.authority_core_digest = authority_core_digest.clone();
@@ -7209,6 +7666,423 @@ mod wire_tests {
         aggregate.last_material_transition.receipt_digest =
             material_transition_receipt_digest_v2(&aggregate.last_material_transition).unwrap();
         aggregate.aggregate_digest = aggregate_digest_v2(aggregate).unwrap();
+    }
+
+    pub(super) fn assert_reservation_compacts_gc_at_capacity(
+        state: &PrivateOramMutationAuthorityStateV2,
+        previous_lease: &PrivateOramMutationLease,
+        expected_history: &PrivateOramOwnerCompactedArchiveHistoryV1,
+    ) {
+        use super::super::format::{
+            PrivateOramMutationFormatFloorBarrierInputV2,
+            private_oram_mutation_format_floor_from_barrier_v2,
+        };
+        use crate::content_manager::private_oram_mutation_journal::encode_private_oram_mutation_admission_recovery_manifest_v2;
+
+        let current = state.aggregate().unwrap();
+        assert_eq!(current.owner_checkpoint_table.checkpoints().len(), 1);
+        let checkpoint = &current.owner_checkpoint_table.checkpoints()[0];
+        let owner_key = Ed25519KeyPair::from_seed_unchecked(&[12; 32]).unwrap();
+        let mut lease = previous_lease.clone();
+        lease.generation = current.lease_slot.generation + 1;
+        lease.writer_fence = current.lease_slot.max_writer_fence + 1;
+        let predecessor = current.lifecycle.last_cleared.as_ref().unwrap();
+        lease.base_record_digest = predecessor
+            .cleanup_witness
+            .terminal_consensus_state_digest
+            .clone();
+        lease.base_state_sequence = predecessor
+            .cleanup_witness
+            .terminal_consensus_state_sequence;
+        lease.mutation_id = digest(160);
+        lease.signed_mutation_digest = digest(161);
+        lease.transition_digest = digest(162);
+        lease.phase = PrivateOramMutationLeasePhase::Preparing;
+        let (base, manifest) = private_oram_mutation_append_fixture_for_test(
+            &lease,
+            current.append_authority_context().unwrap(),
+            1,
+            &[lease.owner_peer_id],
+            PrivateOramActivationAuthorityLocatorV1::from_parts_for_test(1, digest(163)),
+        );
+        let intent = private_oram_mutation_reservation_intent_v3(&base).unwrap();
+        let checkpoint_context = private_oram_owner_checkpoint_reservation_context_v1(
+            current.owner_checkpoint_table(),
+            intent.intent_digest().to_string(),
+        )
+        .unwrap();
+        let nonce = BASE64URL_NOPAD.encode(&[164; 16]);
+        let challenge = private_oram_mutation_prepared_reservation_challenge_v3(
+            base.clone(),
+            intent.clone(),
+            checkpoint_context.clone(),
+            vec![nonce.clone()],
+        )
+        .unwrap();
+        let challenge_json =
+            encode_private_oram_mutation_prepared_reservation_challenge_v3(&challenge).unwrap();
+        let mut challenge_applied = current.last_material_transition.locator.clone();
+        challenge_applied.index += 2;
+        let floor = private_oram_mutation_format_floor_from_barrier_v2(
+            PrivateOramMutationFormatFloorBarrierInputV2 {
+                consensus_history_id_digest: current
+                    .activation
+                    .authority_key
+                    .consensus_history_id_digest
+                    .clone(),
+                raft_group_id_digest: current
+                    .activation
+                    .authority_key
+                    .raft_group_id_digest
+                    .clone(),
+                format_epoch: 6,
+                minimum_reader_protocol: 9,
+                minimum_writer_protocol: 9,
+                snapshot_format_epoch: 6,
+                membership_generation: 1,
+                eligible_peer_set_digest: digest(165),
+                eligible_process_incarnations_digest: digest(166),
+                capability_manifest_digest: digest(167),
+                required_binary_capability_digest: digest(168),
+                activation_enabled: true,
+                term: challenge_applied.term,
+                index: challenge_applied.index - 1,
+            },
+        )
+        .unwrap();
+        let target = &base.owner_targets()[0];
+        let signed_prepare = sign_private_oram_owner_reservation_prepare_v1(
+            &owner_key,
+            PrivateOramOwnerReservationPrepareChallengeV1 {
+                version: PRIVATE_ORAM_OWNER_RESERVATION_PREPARE_VERSION_V1,
+                consensus_history_id_digest: current
+                    .activation
+                    .authority_key
+                    .consensus_history_id_digest
+                    .clone(),
+                raft_group_id_digest: current
+                    .activation
+                    .authority_key
+                    .raft_group_id_digest
+                    .clone(),
+                collection_id: lease.collection_id.clone(),
+                collection_lifetime_id_digest: current
+                    .activation
+                    .authority_key
+                    .collection_lifetime_id_digest
+                    .clone(),
+                collection_incarnation_digest: current
+                    .activation
+                    .collection_incarnation_digest
+                    .clone(),
+                activation_anchor_digest: current.activation.anchor_digest.clone(),
+                capability_epoch: current.activation.compatibility_epoch,
+                protocol_capability_digest: private_oram_mutation_protocol_capability_digest_v2(),
+                membership_epoch: 7,
+                reservation_intent_digest: intent.intent_digest().to_string(),
+                checkpoint_context_digest: checkpoint_context.context_digest().to_string(),
+                committed_challenge_digest: challenge.prepared_challenge_digest().to_string(),
+                challenge_applied_term: challenge_applied.term,
+                challenge_applied_index: challenge_applied.index,
+                attempt_id: base.attempt_id().to_string(),
+                challenge_nonce: nonce,
+                expected_checkpoint_record_digest: checkpoint
+                    .checkpoint_record_digest()
+                    .to_string(),
+                expected_checkpoint_sequence: checkpoint.checkpoint_sequence(),
+                expected_owner_target_digest: target.target_digest().to_string(),
+                reserved_terminal_intent_key: target.intent_key().to_string(),
+                owner_index: 0,
+                owner_count: 1,
+                owner_enrollment_id: checkpoint.owner_enrollment_id().to_string(),
+                owner_peer_id: checkpoint.owner_peer_id(),
+                owner_store_incarnation_digest: checkpoint
+                    .lifecycle_state()
+                    .owner_store_incarnation_digest
+                    .clone(),
+                authority_registry_digest: digest(22),
+                owner_registry_digest: digest(23),
+            },
+            checkpoint.lifecycle_state().clone(),
+            checkpoint.lifecycle_state().generation,
+            digest(169),
+            checkpoint.owner_signer().clone(),
+        )
+        .unwrap();
+        let binding =
+            private_oram_owner_checkpoint_reservation_binding_v1(0, checkpoint, signed_prepare)
+                .unwrap();
+        let reservation = private_oram_mutation_append_reservation_v3(
+            base.clone(),
+            intent,
+            checkpoint_context,
+            challenge.clone(),
+            challenge_applied.clone(),
+            vec![binding],
+        )
+        .unwrap();
+        let reservation_json =
+            encode_private_oram_mutation_append_reservation_v3(&reservation).unwrap();
+        let gc_bytes =
+            gc_obligations_serialized_len_v2(&current.outstanding_gc_obligations).unwrap();
+        let byte_boundary = usize::try_from(base.reserved_cleanup_bytes()).unwrap() + gc_bytes - 1;
+        let original = encode_private_oram_mutation_tagged_authority_wire_json_v2(state).unwrap();
+        for (max_count, max_bytes) in [
+            (1, MAX_OUTSTANDING_GC_OBLIGATION_BYTES),
+            (MAX_OUTSTANDING_GC_OBLIGATIONS, byte_boundary),
+        ] {
+            let context = |current: &PrivateOramMutationAuthorityStateV2, kind, request, offset| {
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    current,
+                    kind,
+                    request,
+                    challenge_applied.term,
+                    challenge_applied.index + offset,
+                )
+                .unwrap()
+            };
+            // Exercise the historical branch through the same real prepare transition.
+            let legacy = apply_prepare_append_reservation_challenge_with_gc_limits_v3(
+                state,
+                challenge_json.clone(),
+                context(
+                    state,
+                    PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared,
+                    challenge.prepared_challenge_digest().to_string(),
+                    0,
+                ),
+                max_count,
+                max_bytes,
+            );
+            if max_bytes == byte_boundary {
+                assert!(
+                    legacy.is_err(),
+                    "old capacity gate rejects before admission can prune"
+                );
+            } else {
+                let legacy = legacy.unwrap();
+                assert_eq!(
+                    legacy.aggregate().unwrap().outstanding_gc_obligations,
+                    current.outstanding_gc_obligations
+                );
+                assert!(
+                    legacy
+                        .aggregate()
+                        .unwrap()
+                        .compacted_owner_archive_histories
+                        .is_empty()
+                );
+            }
+            let challenged = apply_prepare_append_reservation_challenge_with_gc_limits_v3(
+                state,
+                challenge_json.clone(),
+                context(
+                    state,
+                    PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared,
+                    challenge.prepared_challenge_digest().to_string(),
+                    0,
+                )
+                .with_owner_archive_history_floor(&floor)
+                .unwrap(),
+                max_count,
+                max_bytes,
+            )
+            .unwrap();
+            let projected = challenged.aggregate().unwrap();
+            assert!(projected.outstanding_gc_obligations.is_empty());
+            assert_eq!(
+                projected.compacted_owner_archive_histories,
+                vec![expected_history.clone()]
+            );
+            assert_eq!(
+                projected
+                    .pending_reservation_challenge
+                    .as_ref()
+                    .unwrap()
+                    .pre_challenge_aggregate_digest,
+                current.aggregate_digest
+            );
+            assert_eq!(
+                projected
+                    .pending_reservation_challenge
+                    .as_ref()
+                    .unwrap()
+                    .attempt_sequence,
+                current.transition_ordinal + 1
+            );
+            assert_eq!(
+                apply_prepare_append_reservation_challenge_with_gc_limits_v3(
+                    &challenged,
+                    challenge_json.clone(),
+                    context(
+                        &challenged,
+                        PrivateOramMutationMaterialOperationV2::AppendReservationChallengePrepared,
+                        challenge.prepared_challenge_digest().to_string(),
+                        0
+                    )
+                    .with_owner_archive_history_floor(&floor)
+                    .unwrap(),
+                    max_count,
+                    max_bytes,
+                )
+                .unwrap(),
+                challenged
+            );
+            assert_eq!(
+                encode_private_oram_mutation_tagged_authority_wire_json_v2(state).unwrap(),
+                original
+            );
+
+            let reserved = apply_private_oram_mutation_authority_create_append_reservation_v3(
+                &challenged,
+                reservation_json.clone(),
+                context(
+                    &challenged,
+                    PrivateOramMutationMaterialOperationV2::AppendReservationFinalizedV3,
+                    reservation.reservation_digest_v3().to_string(),
+                    1,
+                ),
+            )
+            .unwrap();
+            let manifest_json =
+                encode_private_oram_mutation_admission_recovery_manifest_v2(&manifest).unwrap();
+            let prepared_request =
+                decode_private_oram_mutation_append_reservation_wire(&reservation_json)
+                    .unwrap()
+                    .append_prepared_request_digest(&manifest)
+                    .unwrap();
+            let prepared = apply_private_oram_mutation_authority_append_prepared_v2(
+                &reserved,
+                manifest_json.clone(),
+                context(
+                    &reserved,
+                    PrivateOramMutationMaterialOperationV2::AppendPrepared,
+                    prepared_request,
+                    2,
+                ),
+            )
+            .unwrap();
+            let admission_request = private_oram_mutation_admission_request_digest_v2(
+                &lease,
+                manifest.manifest_digest(),
+            )
+            .unwrap();
+            let admitted = apply_private_oram_mutation_authority_admission_v2(
+                &prepared,
+                lease.clone(),
+                manifest_json,
+                context(
+                    &prepared,
+                    PrivateOramMutationMaterialOperationV2::Admission,
+                    admission_request,
+                    3,
+                )
+                .with_owner_archive_history_floor(&floor)
+                .unwrap(),
+            )
+            .unwrap();
+            let result = admitted.aggregate().unwrap();
+            assert_eq!(result.lease_slot.active.as_ref(), Some(&lease));
+            assert_eq!(
+                result.compacted_owner_archive_histories,
+                vec![expected_history.clone()]
+            );
+            assert_eq!(result.outstanding_gc_obligations.len(), 1);
+            assert_eq!(result.outstanding_gc_obligations[0].generation, 2);
+            require_complete_acknowledged_archive_history_v1(result).unwrap();
+            let encoded =
+                encode_private_oram_mutation_tagged_authority_wire_json_v2(&admitted).unwrap();
+            assert!(decode_private_oram_mutation_authority_wire_json_v2(&encoded).is_ok());
+        }
+    }
+
+    #[test]
+    fn compacted_archive_metadata_is_committed_by_the_aggregate_digest() {
+        let mut aggregate = activated_authority().aggregate().unwrap().clone();
+        let historical = aggregate.authority_core_digest.clone();
+        let encoded = serde_json::to_value(&aggregate).unwrap();
+        assert!(encoded.get("compacted_owner_archive_histories").is_none());
+        let decoded: PrivateOramMutationConsensusAggregateV2 =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, aggregate);
+        let binding = PrivateOramOwnerAcknowledgedArchiveExpectationV2::try_new(
+            2,
+            11,
+            digest(60),
+            digest(61),
+            digest(62),
+        )
+        .unwrap();
+        let history = PrivateOramOwnerCompactedArchiveHistoryV1::append(None, &binding).unwrap();
+        aggregate.compacted_owner_archive_histories = vec![history.clone()];
+        refresh_aggregate_digests_for_test(&mut aggregate);
+        let committed = aggregate.authority_core_digest.clone();
+        assert_ne!(historical, committed);
+        for (field, value) in [
+            ("owner_peer_id", json!(13)),
+            ("archive_count", json!(2)),
+            ("through_generation", json!(3)),
+            ("history_digest", json!(digest(63))),
+        ] {
+            let mut changed = serde_json::to_value(&history).unwrap();
+            changed[field] = value;
+            aggregate.compacted_owner_archive_histories =
+                vec![serde_json::from_value(changed).unwrap()];
+            refresh_aggregate_digests_for_test(&mut aggregate);
+            assert_ne!(aggregate.authority_core_digest, committed, "{field}");
+        }
+    }
+
+    #[test]
+    fn compacted_archive_history_requires_an_applied_reader_and_writer_floor() {
+        use super::super::format::{
+            PrivateOramMutationFormatFloorBarrierInputV2,
+            private_oram_mutation_format_floor_from_barrier_v2,
+        };
+        let state = activated_authority();
+        let context = || {
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &state,
+                PrivateOramMutationMaterialOperationV2::Admission,
+                digest(60),
+                1,
+                20,
+            )
+            .unwrap()
+        };
+        assert!(!context().retain_compacted_owner_archive_history);
+        for (reader, writer, index, valid) in [
+            (8, 8, 19, false),
+            (9, 8, 19, false),
+            (8, 9, 19, false),
+            (9, 9, 19, true),
+            (9, 9, 20, false),
+        ] {
+            let floor = private_oram_mutation_format_floor_from_barrier_v2(
+                PrivateOramMutationFormatFloorBarrierInputV2 {
+                    consensus_history_id_digest: digest(1),
+                    raft_group_id_digest: digest(2),
+                    format_epoch: 4,
+                    minimum_reader_protocol: reader,
+                    minimum_writer_protocol: writer,
+                    snapshot_format_epoch: 4,
+                    membership_generation: 1,
+                    eligible_peer_set_digest: digest(61),
+                    eligible_process_incarnations_digest: digest(62),
+                    capability_manifest_digest: digest(63),
+                    required_binary_capability_digest: digest(64),
+                    activation_enabled: true,
+                    term: 1,
+                    index,
+                },
+            )
+            .unwrap();
+            let result = context().with_owner_archive_history_floor(&floor);
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                assert!(result.unwrap().retain_compacted_owner_archive_history);
+            }
+        }
     }
 
     fn raw_slot() -> PrivateOramMutationLeaseSlotV2 {

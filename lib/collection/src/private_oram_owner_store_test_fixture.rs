@@ -898,7 +898,7 @@ mod prestage_tests {
         PRIVATE_ORAM_PARENT_JOURNAL_LOCK_FILE_V2, PRIVATE_ORAM_PARENT_TERMINAL_ARCHIVE_FILE_V2,
         PrivateOramDurableOwnerFinalizedTokenV1, PrivateOramOwnerAcknowledgedArchiveExpectationV2,
         PrivateOramOwnerArchivedGenerationV1, PrivateOramOwnerCommittedArchiveGrantIndexV1,
-        PrivateOramOwnerCommittedArchiveGrantV1,
+        PrivateOramOwnerCommittedArchiveGrantV1, PrivateOramOwnerCompactedArchiveHistoryV1,
         PrivateOramOwnerNewGenerationReadinessExpectationV2,
         encode_private_oram_owner_committed_archive_grant_v1,
         set_fail_owner_archive_after_canonical_rename_v1,
@@ -3856,6 +3856,109 @@ mod prestage_tests {
         store
             .require_ready_for_new_generation_v2(&readiness)
             .unwrap();
+    }
+
+    #[test]
+    fn compacted_owner_archive_history_survives_reopen_and_snapshot_but_rejects_pair_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection_path = temp.path().join("collection");
+        let fixture = PrivateOramOwnerStorePairTestFixtureV1::new(&collection_path, [56; 32]);
+        let peer_key_pair = Ed25519KeyPair::from_seed_unchecked(&[116; 32]).unwrap();
+        let store = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        let mut receipts = Vec::new();
+        for (generation, marker) in [(2, 186), (3, 187)] {
+            let material = material(&fixture, &peer_key_pair, marker, generation);
+            let (receipt, terminal) = install_adopt_and_finalize(&fixture, &store, &material);
+            store
+                .archive_committed_generation_v1(committed_archive_input(
+                    &receipt, &terminal, marker,
+                ))
+                .unwrap();
+            receipts.push((receipt, marker));
+        }
+        let full =
+            readiness_expectation(&store, &[(&receipts[0].0, 186), (&receipts[1].0, 187)], 245);
+        let history = PrivateOramOwnerCompactedArchiveHistoryV1::append(
+            None,
+            &full.acknowledged_archives()[0],
+        )
+        .unwrap();
+        let make_expectation = |history| {
+            PrivateOramOwnerNewGenerationReadinessExpectationV2::try_new_with_compacted_history(
+                TEST_COLLECTION_ID.to_string(),
+                store
+                    .inspect_lifecycle_v2(receipts[0].0.intent_key())
+                    .unwrap()
+                    .owner_store_incarnation_digest()
+                    .to_string(),
+                digest(245),
+                full.acknowledged_archives()[1..].to_vec(),
+                history,
+            )
+            .unwrap()
+        };
+        let compacted = make_expectation(Some(history.clone()));
+        let reopened = PrivateOramOwnerPrestageStoreV2::new(fixture.hnsw_store().root_path());
+        reopened
+            .require_ready_for_new_generation_v2(&compacted)
+            .unwrap();
+        reopened
+            .acquire_snapshot_guard_v2(&compacted)
+            .unwrap()
+            .validate_held_v2()
+            .unwrap();
+        assert_ne!(
+            full.snapshot_authority_digest_v2().unwrap(),
+            compacted.snapshot_authority_digest_v2().unwrap()
+        );
+
+        // Dropping the old expectation without a consensus commitment cannot authorize a suffix.
+        assert_eq!(
+            reopened.require_ready_for_new_generation_v2(&make_expectation(None)),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        for (field, value) in [
+            ("history_digest", serde_json::json!(digest(250))),
+            ("archive_count", serde_json::json!(2)),
+            ("through_generation", serde_json::json!(1)),
+        ] {
+            let mut encoded = serde_json::to_value(&history).unwrap();
+            encoded[field] = value;
+            let altered: PrivateOramOwnerCompactedArchiveHistoryV1 =
+                serde_json::from_value(encoded).unwrap();
+            let bad = make_expectation(Some(altered));
+            assert_ne!(
+                compacted.snapshot_authority_digest_v2().unwrap(),
+                bad.snapshot_authority_digest_v2().unwrap()
+            );
+            assert_eq!(
+                reopened.require_ready_for_new_generation_v2(&bad),
+                Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+            );
+        }
+
+        // Remove the same old generation from all three locally consistent histories. The
+        // committed prefix still requires it, even though the retained suffix is intact.
+        fs::remove_dir_all(
+            fixture
+                .owner_journal()
+                .root_path()
+                .join("completed-v2-00000000000000000002"),
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            store
+                .root_path()
+                .join("retired")
+                .join(receipts[0].0.intent_key()),
+        )
+        .unwrap();
+        fs::remove_dir_all(canonical_parent_completed_path(&store, 2)).unwrap();
+        assert_eq!(
+            reopened.require_ready_for_new_generation_v2(&compacted),
+            Err(PrivateOramOwnerJournalError::ExternalRecoveryRequired)
+        );
+        assert!(reopened.acquire_snapshot_guard_v2(&compacted).is_err());
     }
 
     #[test]
