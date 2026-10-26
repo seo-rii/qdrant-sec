@@ -39,8 +39,10 @@ from .test_private_oram_sessions import (
     _open_hnsw_owner_session,
     _open_result_owner_session,
     _post_result,
+    _private_oram_consensus_protocol_projection,
     _upload_hnsw,
     _upload_result_oram,
+    _wait_for_private_oram_consensus_protocol_projection,
 )
 from .test_private_oram_v2_activation import (
     _activation_bundle,
@@ -665,19 +667,18 @@ def test_private_oram_paired_append_commits_after_the_coordinator_restarts(
     os.environ.get("QDRANT_PRIVATE_ORAM_CRASH_TESTS") != "1",
     reason="needs a qdrant binary built with --features private-oram-crash-points",
 )
-def test_private_oram_paired_append_aborts_once_its_signed_lease_expired(
+def test_private_oram_paired_append_stays_fenced_after_its_signed_lease_expired(
     tmp_path: pathlib.Path, append_client: AppendClient
 ):
     """The coordinator is killed once recovery readiness is certified, before its decision, and
-    restarted only after the mutation's signed lease (shortened to 90 s) expired. A mutation is
-    never applied after its validity window: the restarted lease owner fences it with an abort
-    decision, the terminal resume rolls every owner back, and the genesis state opens again while
-    the appended state is refused."""
+    restarted only after the mutation's signed lease (shortened to 90 s) expired. Expiry supplies
+    no durable abort intent: repeated supervisor scans must leave the exact old state and the
+    Preparing lease fenced, refuse both old/new session opens, and admit no new generation."""
     crash_point = "mutation_v2_before_consensus_commit"
     cluster = _start_tls_append_cluster(
         tmp_path,
         append_client,
-        "v2_expired_abort",
+        "v2_expired_fenced",
         coordinator_env={CRASH_POINT_ENV: crash_point, MUTATION_LEASE_ENV: "90"},
     )
     genesis_state_digest = _enroll(cluster.leader_url, append_client)
@@ -689,13 +690,57 @@ def test_private_oram_paired_append_aborts_once_its_signed_lease_expired(
     _restart_dead_coordinator(
         cluster,
         crash_point,
-        "v2_expired_abort_restarted.log",
+        "v2_expired_fenced_restarted.log",
         not_before_unix=expires_at_unix + 2,
     )
 
+    wait_for(lambda: _leader_url(cluster.peer_urls) is not None, wait_for_timeout=60)
+    observed_status = {}
+
+    def owner_requires_recovery() -> bool:
+        supervisor = _status(cluster.leader_url)["supervisor"]
+        if (
+            supervisor["state"] != "blocked"
+            or supervisor["block_reason"] != "reconcile_failure"
+            or supervisor["failed"] != 1
+            or supervisor["reconciled"] != 0
+        ):
+            return False
+        observed_status.update(supervisor)
+        return True
+
+    wait_for(owner_requires_recovery, wait_for_timeout=60)
+    fenced = _wait_for_private_oram_consensus_protocol_projection(cluster.peer_dirs)
+    states = fenced["private_oram_mutation_states"]
+    authorities = fenced["private_oram_mutation_lease_slots"]
+    assert len(states) == len(authorities) == 1
+    state = next(iter(states.values()))
+    authority = next(iter(authorities.values()))["authority"]
+    assert authority["mode"] == "activated"
+    lease_slot = authority["state"]["lease_slot"]
+    assert state["state_sequence"] == 0
+    assert state["signed_state_digest"] == genesis_state_digest
+    assert lease_slot["generation"] == 1
+    assert lease_slot["last_clear"] is None
+    assert lease_slot["active"]["phase"] == "preparing"
+    assert lease_slot["active"]["expires_at_unix"] == expires_at_unix
+
+    # Observe another completed recovery attempt, not just the initial startup projection.
+    first_scan = observed_status["generation"]
+    wait_for(
+        lambda: owner_requires_recovery() and observed_status["generation"] > first_scan,
+        wait_for_timeout=30,
+    )
     # `open_next` adopts the appended state, so the genesis state's open body comes first.
     genesis_open = append_client.call("open")
     appended_open = append_client.call("open_next")
-    opened_digest = _wait_until_state_opens(cluster.peer_urls, genesis_open, appended_open)
-    assert opened_digest == genesis_state_digest
+    leader_url = _leader_url(cluster.peer_urls)
+    assert leader_url is not None
+    for open_body in [genesis_open, appended_open]:
+        response = _mutation_post(leader_url, "open", open_body)
+        assert 400 <= response.status_code < 500, response.text
+    assert all(
+        _private_oram_consensus_protocol_projection(peer_dir) == fenced
+        for peer_dir in cluster.peer_dirs
+    )
     _assert_no_plaintext_leaks(cluster.peer_dirs, appended, committed=False)

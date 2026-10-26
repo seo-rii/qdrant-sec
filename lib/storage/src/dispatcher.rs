@@ -3199,24 +3199,6 @@ impl Dispatcher {
                     "private ORAM mutation consensus commit projection is unavailable",
                 )
             })?;
-        if current_state != *plan.expected_new_state()
-            && (current_state != *plan.expected_old_state()
-                || current_slot.active.as_ref() != Some(plan.lease()))
-        {
-            return Err(StorageError::PreconditionFailed {
-                description: "private ORAM mutation consensus commit authority changed".to_string(),
-            });
-        }
-
-        let operation = consensus_state.private_oram_mutation_v2_consensus_commit_operation(
-            plan.lease().generation,
-            plan.expected_new_state().clone(),
-        )?;
-        let _ = consensus_state
-            .propose_consensus_op_with_await(operation, wait_timeout)
-            .await;
-        private_oram_mutation_pause_before_commit_projection_v2().await;
-
         let PrivateOramConsensusTransitionV2::Mutation(receipt) =
             &plan.expected_new_state().last_transition
         else {
@@ -3233,6 +3215,36 @@ impl Dispatcher {
             committed_signed_state_digest: plan.expected_new_state().signed_state_digest.clone(),
             receipt_digest: canonical_private_oram_mutation_receipt_digest(receipt)?,
         };
+        if current_state == *plan.expected_new_state()
+            && current_slot.active.as_ref().is_some_and(|lease| {
+                private_oram_mutation_lease_matches_monotonic_renewal_v2(
+                    &expected_committed_lease,
+                    lease,
+                )
+            })
+        {
+            return Ok(());
+        }
+        let mut preparing_lease = current_slot
+            .active
+            .filter(|lease| {
+                current_state == *plan.expected_old_state()
+                    && private_oram_mutation_lease_matches_monotonic_renewal_v2(plan.lease(), lease)
+            })
+            .ok_or_else(|| StorageError::PreconditionFailed {
+                description: "private ORAM mutation consensus commit authority changed".to_string(),
+            })?;
+        expected_committed_lease.expires_at_unix = preparing_lease.expires_at_unix;
+        expected_committed_lease.renewal_revision = preparing_lease.renewal_revision;
+
+        let operation = consensus_state.private_oram_mutation_v2_consensus_commit_operation(
+            plan.lease().generation,
+            plan.expected_new_state().clone(),
+        )?;
+        let _ = consensus_state
+            .propose_consensus_op_with_await(operation, wait_timeout)
+            .await;
+        private_oram_mutation_pause_before_commit_projection_v2().await;
 
         for attempt in 0..=PRIVATE_ORAM_COMMIT_PROJECTION_POLL_ATTEMPTS {
             let Some((committed_state, committed_slot)) =
@@ -3243,17 +3255,32 @@ impl Dispatcher {
                 ));
             };
             if committed_state == *plan.expected_new_state()
-                && committed_slot.active.as_ref() == Some(&expected_committed_lease)
+                && committed_slot.active.as_ref().is_some_and(|lease| {
+                    private_oram_mutation_lease_matches_monotonic_renewal_v2(
+                        &expected_committed_lease,
+                        lease,
+                    )
+                })
             {
                 return Ok(());
             }
             let exact_old = committed_state == *plan.expected_old_state()
-                && committed_slot.active.as_ref() == Some(plan.lease());
+                && committed_slot.active.as_ref().is_some_and(|lease| {
+                    private_oram_mutation_lease_matches_monotonic_renewal_v2(
+                        &preparing_lease,
+                        lease,
+                    )
+                });
             if !exact_old || attempt == PRIVATE_ORAM_COMMIT_PROJECTION_POLL_ATTEMPTS {
                 return Err(StorageError::service_error(
                     "private ORAM mutation consensus commit outcome requires recovery",
                 ));
             }
+            // Each coherent observation raises the renewal floor: a later projection cannot
+            // roll back to an earlier renewal even when it still follows the admitted plan.
+            preparing_lease = committed_slot.active.unwrap();
+            expected_committed_lease.expires_at_unix = preparing_lease.expires_at_unix;
+            expected_committed_lease.renewal_revision = preparing_lease.renewal_revision;
             tokio::time::sleep(PRIVATE_ORAM_COMMIT_PROJECTION_POLL_INTERVAL).await;
         }
         Err(StorageError::service_error(
@@ -3467,6 +3494,25 @@ impl Dispatcher {
     pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwSharedDrain> {
         self.toc.get_collection_hw_metrics(collection)
     }
+}
+
+/// Accepts only the same immutable lease and phase, with unchanged or strictly advanced renewal
+/// evidence. The caller supplies the exact expected committed receipt when observing a commit.
+fn private_oram_mutation_lease_matches_monotonic_renewal_v2(
+    expected: &PrivateOramMutationLease,
+    current: &PrivateOramMutationLease,
+) -> bool {
+    let same_renewal = current.renewal_revision == expected.renewal_revision
+        && current.expires_at_unix == expected.expires_at_unix;
+    let newer_renewal = current.renewal_revision > expected.renewal_revision
+        && current.expires_at_unix > expected.expires_at_unix;
+    if !same_renewal && !newer_renewal {
+        return false;
+    }
+    let mut renewed = expected.clone();
+    renewed.renewal_revision = current.renewal_revision;
+    renewed.expires_at_unix = current.expires_at_unix;
+    &renewed == current
 }
 
 fn validate_private_oram_replica_prepare_acks(
@@ -3840,6 +3886,130 @@ pub fn classify_private_oram_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preparing_mutation_lease() -> PrivateOramMutationLease {
+        PrivateOramMutationLease {
+            generation: 1,
+            collection_id: "collection".to_string(),
+            owner_peer_id: 7,
+            mutation_id: "mutation".to_string(),
+            signed_mutation_digest: "signed-mutation".to_string(),
+            transition_digest: "transition".to_string(),
+            base_record_digest: "base-record".to_string(),
+            base_state_sequence: 0,
+            writer_lease_digest: "writer-lease".to_string(),
+            writer_fence: 1,
+            issued_at_unix: 100,
+            expires_at_unix: 200,
+            renewal_revision: 0,
+            phase: PrivateOramMutationLeasePhase::Preparing,
+        }
+    }
+
+    #[test]
+    fn private_oram_commit_projection_accepts_only_monotonic_renewal() {
+        let admitted = preparing_mutation_lease();
+        let renewed = PrivateOramMutationLease {
+            expires_at_unix: 300,
+            renewal_revision: 2,
+            ..admitted.clone()
+        };
+        assert!(private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &admitted, &admitted,
+        ));
+        assert!(private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &admitted, &renewed,
+        ));
+        for inconsistent in [
+            PrivateOramMutationLease {
+                expires_at_unix: 300,
+                ..admitted.clone()
+            },
+            PrivateOramMutationLease {
+                renewal_revision: 2,
+                ..admitted.clone()
+            },
+            PrivateOramMutationLease {
+                expires_at_unix: 199,
+                renewal_revision: 2,
+                ..admitted.clone()
+            },
+        ] {
+            assert!(!private_oram_mutation_lease_matches_monotonic_renewal_v2(
+                &admitted,
+                &inconsistent,
+            ));
+        }
+        // A projection following an observed renewal cannot return to the admitted lease.
+        assert!(!private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &renewed, &admitted,
+        ));
+    }
+
+    #[test]
+    fn private_oram_commit_projection_preserves_every_immutable_lease_field() {
+        let admitted = preparing_mutation_lease();
+        let renewed = PrivateOramMutationLease {
+            expires_at_unix: 300,
+            renewal_revision: 1,
+            ..admitted.clone()
+        };
+        let changes: &[fn(&mut PrivateOramMutationLease)] = &[
+            |lease| lease.generation += 1,
+            |lease| lease.collection_id.push_str("-other"),
+            |lease| lease.owner_peer_id += 1,
+            |lease| lease.mutation_id.push_str("-other"),
+            |lease| lease.signed_mutation_digest.push_str("-other"),
+            |lease| lease.transition_digest.push_str("-other"),
+            |lease| lease.base_record_digest.push_str("-other"),
+            |lease| lease.base_state_sequence += 1,
+            |lease| lease.writer_lease_digest.push_str("-other"),
+            |lease| lease.writer_fence += 1,
+            |lease| lease.issued_at_unix += 1,
+            |lease| lease.phase = PrivateOramMutationLeasePhase::AbortDecided,
+        ];
+        for change in changes {
+            let mut unrelated = renewed.clone();
+            change(&mut unrelated);
+            assert!(!private_oram_mutation_lease_matches_monotonic_renewal_v2(
+                &admitted, &unrelated,
+            ));
+        }
+    }
+
+    #[test]
+    fn private_oram_commit_projection_requires_the_exact_committed_receipt() {
+        let preparing = preparing_mutation_lease();
+        let expected = PrivateOramMutationLease {
+            phase: PrivateOramMutationLeasePhase::ConsensusCommitted {
+                committed_record_digest: "committed-record".to_string(),
+                committed_state_sequence: 1,
+                committed_signed_state_digest: "committed-state".to_string(),
+                receipt_digest: "receipt".to_string(),
+            },
+            ..preparing.clone()
+        };
+        let mut renewed = PrivateOramMutationLease {
+            expires_at_unix: 300,
+            renewal_revision: 1,
+            ..expected.clone()
+        };
+        assert!(private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &expected, &renewed,
+        ));
+        assert!(!private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &expected, &preparing,
+        ));
+        let PrivateOramMutationLeasePhase::ConsensusCommitted { receipt_digest, .. } =
+            &mut renewed.phase
+        else {
+            unreachable!()
+        };
+        receipt_digest.push_str("-other");
+        assert!(!private_oram_mutation_lease_matches_monotonic_renewal_v2(
+            &expected, &renewed,
+        ));
+    }
 
     #[test]
     fn private_oram_recovery_requires_exact_consensus_state() {

@@ -1612,13 +1612,10 @@ async fn complete_private_oram_admitted_handoff_v2(
     decide_private_oram_admitted_mutation_v2(dispatcher, coordinated.admission()).await
 }
 
-/// The decision for an admitted mutation whose recovery readiness is certified and whose
-/// reservation outcome is acknowledged. It commits, unless the lease the client's mutation
-/// signed has expired: a mutation is never applied after its signed validity window, and Raft
-/// apply cannot read a clock, so the lease owner fences an expired one with the
-/// `Preparing -> AbortDecided` transition instead. Both transitions require the preparing lease;
-/// if a commit and an abort race, Raft order decides and the terminal resume finishes whichever
-/// applied.
+/// Commits an admitted mutation whose recovery readiness is certified and whose reservation
+/// outcome is acknowledged, while its signed lease is valid. Expiry alone is not abort
+/// authority: an expired preparing lease remains fenced until an authorized recovery policy
+/// can supply durable abort intent and worker-quiescence evidence.
 async fn decide_private_oram_admitted_mutation_v2(
     dispatcher: &Dispatcher,
     admission: &PrivateOramMutationAdmissionPlanV2,
@@ -1629,82 +1626,32 @@ async fn decide_private_oram_admitted_mutation_v2(
     let key = PrivateOramMutationKey {
         collection_id: admission.lease().collection_id.clone(),
     };
-    if private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-        return Ok(());
-    }
     // Renewals can move the expiry of the lease consensus holds.
-    let expires_at_unix = consensus
+    let expires_at_unix = match consensus
         .private_oram_mutation_lease_slot(&key)
         .and_then(|slot| slot.active)
         .filter(|lease| lease.generation == admission.lease().generation)
-        .map_or(admission.lease().expires_at_unix, |lease| {
-            lease.expires_at_unix
-        });
+    {
+        Some(lease) => match lease.phase {
+            PrivateOramMutationLeasePhase::Preparing => lease.expires_at_unix,
+            PrivateOramMutationLeasePhase::ConsensusCommitted { .. } => {
+                // Confirm the exact paired state and receipt even when a prior proposal won.
+                return commit_private_oram_admitted_mutation_v2(dispatcher, admission).await;
+            }
+            // Existing durable decisions remain the terminal recovery path's responsibility.
+            PrivateOramMutationLeasePhase::AbortDecided => return Ok(()),
+        },
+        None => admission.lease().expires_at_unix,
+    };
     if current_unix_secs()? < expires_at_unix {
         commit_private_oram_admitted_mutation_v2(dispatcher, admission).await
     } else {
-        abort_private_oram_admitted_mutation_v2(dispatcher, admission).await
-    }
-}
-
-/// Whether consensus already holds a decision (commit or abort) for the admitted generation.
-fn private_oram_admitted_mutation_decided_v2(
-    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
-    key: &PrivateOramMutationKey,
-    admission: &PrivateOramMutationAdmissionPlanV2,
-) -> bool {
-    consensus
-        .private_oram_mutation_lease_slot(key)
-        .and_then(|slot| slot.active)
-        .is_some_and(|lease| {
-            lease.generation == admission.lease().generation
-                && lease.phase != PrivateOramMutationLeasePhase::Preparing
+        Err(StorageError::PreconditionFailed {
+            description:
+                "private ORAM admitted mutation lease expired and requires authorized recovery"
+                    .to_string(),
         })
-}
-
-/// Fences an expired admitted mutation with the `Preparing -> AbortDecided` transition of the
-/// lease consensus holds (renewals may have moved its expiry); the terminal resume then rolls
-/// every owner back to the exact old state and cleans up.
-async fn abort_private_oram_admitted_mutation_v2(
-    dispatcher: &Dispatcher,
-    admission: &PrivateOramMutationAdmissionPlanV2,
-) -> StorageResult<()> {
-    let consensus = dispatcher
-        .consensus_state()
-        .ok_or_else(invalid_owner_prestage)?;
-    let key = PrivateOramMutationKey {
-        collection_id: admission.lease().collection_id.clone(),
-    };
-    let preparing = consensus
-        .private_oram_mutation_lease_slot(&key)
-        .and_then(|slot| slot.active)
-        .filter(|lease| {
-            lease.generation == admission.lease().generation
-                && lease.phase == PrivateOramMutationLeasePhase::Preparing
-        });
-    let Some(preparing) = preparing else {
-        return if private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-            Ok(())
-        } else {
-            Err(invalid_owner_prestage())
-        };
-    };
-    if consensus.private_oram_mutation_state(&key).as_ref() != Some(admission.expected_old_state())
-    {
-        return Err(invalid_owner_prestage());
     }
-    let mut abort_decided = preparing;
-    abort_decided.phase = PrivateOramMutationLeasePhase::AbortDecided;
-    let operation = consensus.private_oram_mutation_v2_abort_decision_operation(abort_decided)?;
-    let _applied = consensus
-        .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
-        .await;
-    if !private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-        return Err(StorageError::service_error(
-            "private ORAM mutation abort decision was not applied",
-        ));
-    }
-    Ok(())
 }
 
 /// The commit decision. With every owner pre-staged and adopted, the point staged and the
@@ -1718,51 +1665,12 @@ async fn commit_private_oram_admitted_mutation_v2(
     dispatcher: &Dispatcher,
     admission: &PrivateOramMutationAdmissionPlanV2,
 ) -> StorageResult<()> {
-    let consensus = dispatcher
-        .consensus_state()
-        .ok_or_else(invalid_owner_prestage)?;
-    let key = PrivateOramMutationKey {
-        collection_id: admission.lease().collection_id.clone(),
-    };
-    let committed = || {
-        consensus
-            .private_oram_mutation_lease_slot(&key)
-            .and_then(|slot| slot.active)
-            .is_some_and(|lease| {
-                lease.generation == admission.lease().generation
-                    && matches!(
-                        lease.phase,
-                        PrivateOramMutationLeasePhase::ConsensusCommitted { .. }
-                    )
-            })
-            && consensus.private_oram_mutation_state(&key).as_ref()
-                == Some(admission.expected_new_state())
-    };
-    if committed() {
-        return Ok(());
-    }
-    if consensus.private_oram_mutation_state(&key).as_ref() != Some(admission.expected_old_state())
-    {
-        // The other proposer's commit can apply between the two reads.
-        return if committed() {
-            Ok(())
-        } else {
-            Err(invalid_owner_prestage())
-        };
-    }
-    let operation = consensus.private_oram_mutation_v2_consensus_commit_operation(
-        admission.lease().generation,
-        admission.expected_new_state().clone(),
-    )?;
-    let _applied = consensus
-        .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
-        .await;
-    if !committed() {
-        return Err(StorageError::service_error(
-            "private ORAM mutation commit was not applied",
-        ));
-    }
-    Ok(())
+    dispatcher
+        .submit_private_oram_mutation_consensus_commit_v2(
+            admission,
+            Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+        )
+        .await
 }
 
 /// Parent materialization, owner adoption and point staging advance the coordinator's journal
@@ -1837,8 +1745,9 @@ async fn record_private_oram_parent_progress_v2(
 /// or when its live handoff failed (for example because Raft leadership moved while it was in
 /// flight). It reloads the exact admitted plan from the retained recovery manifest, re-runs the
 /// steps before recovery readiness unless readiness is already certified, acknowledges the
-/// reservation outcome and decides: it commits, or aborts a mutation whose signed lease expired.
-/// A committed or abort-decided lease is the terminal resume's.
+/// reservation outcome and commits while the signed lease is valid. An expired preparing lease
+/// stays fenced for authorized recovery. A committed or previously abort-decided lease is the
+/// terminal resume's.
 pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     dispatcher: &Dispatcher,
     settings: &Settings,
