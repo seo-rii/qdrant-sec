@@ -502,10 +502,9 @@ impl PrivateOramExternalRecoveryVerification {
             match entry.header().entry_type() {
                 tar::EntryType::Directory => {}
                 tar::EntryType::Regular | tar::EntryType::GNUSparse => {
-                    let size = entry
-                        .header()
-                        .size()
-                        .map_err(|_| invalid_staging_request())?;
+                    // Use the logical size applied by the tar reader, including PAX
+                    // overrides and sparse expansion, rather than the raw header.
+                    let size = entry.size();
                     unpacked_bytes = unpacked_bytes
                         .checked_add(size)
                         .ok_or_else(invalid_staging_request)?;
@@ -3132,6 +3131,37 @@ mod tests {
         archive
     }
 
+    fn pax_sized_tar_snapshot(bytes: &[u8]) -> Vec<u8> {
+        let value = format!("size={}\n", bytes.len());
+        let mut record_len = value.len() + 2;
+        let record = loop {
+            let record = format!("{record_len} {value}");
+            if record.len() == record_len {
+                break record;
+            }
+            record_len = record.len();
+        };
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_ustar();
+            header.set_path("PaxHeaders/payload.bin").unwrap();
+            header.set_entry_type(tar::EntryType::XHeader);
+            header.set_mode(0o600);
+            header.set_size(record.len() as u64);
+            header.set_cksum();
+            builder.append(&header, record.as_bytes()).unwrap();
+
+            header.set_path("payload.bin").unwrap();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, bytes).unwrap();
+            builder.finish().unwrap();
+        }
+        archive
+    }
+
     fn upload_staging_snapshot(
         temp: &tempfile::TempDir,
         snapshot: &[u8],
@@ -3505,6 +3535,57 @@ mod tests {
         let staging = upload_staging_snapshot(&temp, &snapshot);
         let limits = PrivateOramExternalRecoveryConfig {
             max_unpacked_bytes: 512,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        assert!(staging.prepare_verification_with_limits(&limits).is_err());
+        assert!(!staging.verified_collection_path().exists());
+        assert!(
+            !staging
+                .operation_path()
+                .join(PRIVATE_ORAM_EXTERNAL_RECOVERY_VERIFY_TEMP_DIR)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_recovery_verify_accounts_effective_pax_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = [7_u8; 1536];
+        let snapshot = pax_sized_tar_snapshot(&payload);
+        let mut archive = tar::Archive::new(snapshot.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.header().size().unwrap(), 0);
+        assert_eq!(entry.size(), payload.len() as u64);
+        let mut extracted = Vec::new();
+        entry.read_to_end(&mut extracted).unwrap();
+        assert_eq!(extracted, payload);
+
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: payload.len() as u64,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+        let (_, resources) = staging.prepare_verification_with_limits(&limits).unwrap();
+        assert_eq!(
+            resources,
+            PrivateOramExternalRecoveryArchiveResources {
+                entry_count: 1,
+                logical_bytes: payload.len() as u64,
+            },
+        );
+    }
+
+    #[test]
+    fn external_recovery_verify_rejects_effective_pax_size_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = pax_sized_tar_snapshot(&[7_u8; 1536]);
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: 1024,
             min_free_space_bytes: 0,
             ..Default::default()
         };
