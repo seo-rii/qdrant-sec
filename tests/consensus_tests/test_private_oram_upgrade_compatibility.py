@@ -652,8 +652,12 @@ def test_previous_binary_downgrade_fails_closed_without_mutating_wire_9_state(
     previous_floor = previous_state["private_oram_mutation_format_floor"]
     assert previous_floor["minimum_reader_protocol"] < WIRE_9
     assert previous_floor["minimum_writer_protocol"] < WIRE_9
+    assert previous_floor["version"] == 1
+    assert "required_binary_capability_digest" not in previous_floor
     assert (
-        previous_floor["required_binary_capability_digest"]
+        previous_state["private_oram_activation_authority"]["bundle"]["manifest"][
+            "required_binary_capability_digest"
+        ]
         == LEGACY_V3_BINARY_CAPABILITY_DIGEST
     )
 
@@ -718,6 +722,7 @@ def test_previous_binary_downgrade_fails_closed_without_mutating_wire_9_state(
 
     state = _raft_state(peer_dir)
     floor = state["private_oram_mutation_format_floor"]
+    assert floor["version"] == 2
     assert floor["minimum_reader_protocol"] == WIRE_9
     assert floor["minimum_writer_protocol"] == WIRE_9
     assert floor["required_binary_capability_digest"] == identity["binary_capability_digest"]
