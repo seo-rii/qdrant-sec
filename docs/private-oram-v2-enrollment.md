@@ -67,6 +67,16 @@ activation"). This document proposes the missing enrollment path.
 
 ## Implementation status
 
+- Capability upgrades install a consecutively signed activation-authority
+  successor through startup configuration before gathering the new cluster
+  proof. If a fully enabled older protocol floor already exists, the authority
+  durably retains its exact signed predecessor and the old floor digest.
+  Restart before `PrepareTaggedWrites` verifies both signatures, their parent
+  link and that exact floor binding; it preserves the old applied floor and
+  keeps new-protocol writes fenced. Another authority rotation is refused
+  until the floor catches up. The bounded predecessor record remains verifiable
+  after activation; missing or invalid evidence never permits a capability
+  mismatch. Install the new binary on every peer before completing activation.
 - Step 1 is implemented as a new consensus operation,
   `ConsensusOperations::EnrollPrivateOramMutationCollectionV2` (carrying an
   `InitializePrivateOramMutationState`), applied by `apply_enroll_v2` in

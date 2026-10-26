@@ -2984,6 +2984,8 @@ impl Persistent {
     /// A configured bundle is an immutable startup expectation. A consecutive externally signed
     /// successor may be installed only while no two-phase activation barrier is pending; this is
     /// the operator-controlled capability upgrade path used before gathering a new cluster proof.
+    /// A capability change retains its signed predecessor and exact old floor until the barrier
+    /// catches up, so restarting before Prepare does not discard or bypass the applied floor.
     pub fn load_or_init_with_private_oram_mutation_v2_activation(
         storage_path: impl AsRef<Path>,
         first_peer: bool,
@@ -3118,6 +3120,16 @@ impl Persistent {
             })?;
             if manifest.required_binary_capability_digest
                 != format_floor.required_binary_capability_digest()
+                && !(state.private_oram_capability_upgrade_can_start(format_floor)
+                    && state
+                        .private_oram_activation_authority
+                        .as_ref()
+                        .is_some_and(|authority| {
+                            authority.capability_upgrade_matches_floor(
+                                format_floor.floor_digest(),
+                                format_floor.required_binary_capability_digest(),
+                            )
+                        }))
             {
                 return Err(StorageError::service_error(
                     "private ORAM mutation format floor requires a different binary capability",
@@ -3416,6 +3428,19 @@ impl Persistent {
         self.private_oram_activation_authority_at_read(&trust_anchor)
     }
 
+    fn private_oram_capability_upgrade_can_start(
+        &self,
+        floor: &PrivateOramMutationFormatFloorV2,
+    ) -> bool {
+        self.private_oram_mutation_activation_pending.is_none()
+            && floor.activation_enabled()
+            && floor.format_epoch() >= 2
+            && floor.format_epoch().is_multiple_of(2)
+            && floor.snapshot_format_epoch() == floor.format_epoch()
+            && floor.minimum_reader_protocol() == floor.minimum_writer_protocol()
+            && floor.minimum_reader_protocol() < PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+    }
+
     /// Dormant local CAS primitive. No consensus operation invokes it until mixed-version safety is
     /// established, so successful return must not be treated as cluster-wide activation.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3427,7 +3452,7 @@ impl Persistent {
     ) -> Result<(), StorageError> {
         self.ensure_private_oram_activation_authority_durability_known()?;
         self.configure_private_oram_activation_authority_trust_anchor(trust_anchor)?;
-        let new_state = plan_private_oram_activation_authority_cas_v1(
+        let mut new_state = plan_private_oram_activation_authority_cas_v1(
             self.private_oram_activation_authority.as_ref(),
             expected,
             new_bundle,
@@ -3448,6 +3473,31 @@ impl Persistent {
                 "persisted private ORAM activation authority failed verification",
             ),
         })?;
+        if let Some(current) = &self.private_oram_activation_authority
+            && let Some(floor) = &self.private_oram_mutation_format_floor
+        {
+            if self.private_oram_mutation_activation_pending.is_some()
+                || self.current_unapplied_entry().is_some()
+                || current.manifest().required_binary_capability_digest
+                    != floor.required_binary_capability_digest()
+            {
+                return Err(StorageError::PreconditionFailed {
+                    description: "private ORAM activation authority cannot rotate before its capability upgrade completes"
+                        .to_string(),
+                });
+            }
+            if new_state.manifest().required_binary_capability_digest
+                != floor.required_binary_capability_digest()
+            {
+                if !self.private_oram_capability_upgrade_can_start(floor) {
+                    return Err(StorageError::PreconditionFailed {
+                        description: "private ORAM activation authority capability upgrade requires an older fully enabled format floor"
+                            .to_string(),
+                    });
+                }
+                new_state.retain_capability_upgrade_predecessor(current, floor.floor_digest());
+            }
+        }
         let previous = self.private_oram_activation_authority.replace(new_state);
         self.save_or_rollback_on_definitive(move |persistent| {
             persistent.private_oram_activation_authority = previous;
@@ -8110,6 +8160,18 @@ mod tests {
     }
 
     fn install_private_oram_mutation_test_capability_floor(persistent: &mut Persistent) {
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            persistent,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+            &test_digest(6),
+        );
+    }
+
+    fn install_private_oram_mutation_test_capability_floor_with_protocol(
+        persistent: &mut Persistent,
+        protocol: u16,
+        required_binary_capability_digest: &str,
+    ) {
         for format_epoch in 1..=4 {
             persistent
                 .set_unapplied_entries(format_epoch, format_epoch)
@@ -8121,14 +8183,15 @@ mod tests {
                         consensus_history_id_digest: test_digest(1),
                         raft_group_id_digest: test_digest(2),
                         format_epoch,
-                        minimum_reader_protocol: PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                        minimum_writer_protocol: PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+                        minimum_reader_protocol: protocol,
+                        minimum_writer_protocol: protocol,
                         snapshot_format_epoch: format_epoch,
                         membership_generation: 1,
                         eligible_peer_set_digest: test_digest(3),
                         eligible_process_incarnations_digest: test_digest(4),
                         capability_manifest_digest: test_digest(5),
-                        required_binary_capability_digest: test_digest(6),
+                        required_binary_capability_digest: required_binary_capability_digest
+                            .to_string(),
                         activation_enabled: format_epoch >= 2,
                         term: 1,
                         index: format_epoch,
@@ -8566,6 +8629,192 @@ mod tests {
                 .unwrap()
                 .bundle(),
             &successor,
+        );
+    }
+
+    #[test]
+    fn activation_authority_capability_upgrade_survives_restart_before_prepare() {
+        let (authority_key, trust_anchor, genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &genesis,
+        )
+        .unwrap();
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            &mut first,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION - 1,
+            &genesis.manifest.required_binary_capability_digest,
+        );
+        let old_floor = first.private_oram_mutation_format_floor.clone().unwrap();
+        let old_authority = first.private_oram_activation_authority.clone().unwrap();
+        drop(first);
+
+        let mut manifest = genesis.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(old_authority.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let mut previous_authority = None;
+        for _ in 0..2 {
+            let restarted = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(7),
+                &trust_anchor,
+                &successor,
+            )
+            .unwrap();
+            assert_eq!(
+                restarted.private_oram_mutation_format_floor.as_ref(),
+                Some(&old_floor)
+            );
+            assert!(restarted.private_oram_mutation_activation_pending.is_none());
+            let authority = restarted
+                .private_oram_activation_authority
+                .as_ref()
+                .unwrap();
+            assert_eq!(authority.bundle(), &successor);
+            let encoded = serde_json::to_value(authority).unwrap();
+            assert_eq!(
+                encoded["capability_upgrade"]["predecessor"],
+                serde_json::to_value(&genesis).unwrap()
+            );
+            assert_eq!(
+                encoded["capability_upgrade"]["format_floor_digest"],
+                old_floor.floor_digest()
+            );
+            if let Some(previous) = &previous_authority {
+                assert_eq!(authority, previous);
+            }
+            previous_authority = Some(authority.clone());
+        }
+
+        let installed = previous_authority.unwrap();
+        let mut manifest = successor.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(installed.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(92);
+        let third = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let before = fs::read(temp.path().join(STATE_FILE_NAME)).unwrap();
+        let error = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &third,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rotate before its capability upgrade completes")
+        );
+        assert_eq!(fs::read(temp.path().join(STATE_FILE_NAME)).unwrap(), before);
+
+        let saved: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let mut missing = saved.clone();
+        missing["private_oram_activation_authority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_upgrade");
+        let mut wrong_floor = saved.clone();
+        wrong_floor["private_oram_activation_authority"]["capability_upgrade"]["format_floor_digest"] =
+            serde_json::json!(test_digest(93));
+        let mut forged_predecessor = saved.clone();
+        forged_predecessor["private_oram_activation_authority"]["capability_upgrade"]["predecessor"]
+            ["signature"]["sig"] = serde_json::json!(BASE64URL_NOPAD.encode(&[93; 64]));
+        for invalid in [missing, wrong_floor, forged_predecessor] {
+            fs::write(
+                temp.path().join(STATE_FILE_NAME),
+                serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                    temp.path(),
+                    true,
+                    false,
+                    Some(7),
+                    &trust_anchor,
+                    &successor,
+                )
+                .is_err()
+            );
+        }
+        fs::write(temp.path().join(STATE_FILE_NAME), &before).unwrap();
+        Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &successor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn activation_authority_capability_rotation_requires_an_older_protocol_floor() {
+        let (authority_key, trust_anchor, genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &genesis,
+        )
+        .unwrap();
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            &mut state,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+            &genesis.manifest.required_binary_capability_digest,
+        );
+        let installed = state.private_oram_activation_authority.clone().unwrap();
+        let mut manifest = genesis.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(installed.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        let error = state
+            .compare_and_swap_private_oram_activation_authority(expected, &successor, &trust_anchor)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an older fully enabled format floor")
+        );
+        assert_eq!(
+            state.private_oram_activation_authority.as_ref(),
+            Some(&installed)
         );
     }
 
