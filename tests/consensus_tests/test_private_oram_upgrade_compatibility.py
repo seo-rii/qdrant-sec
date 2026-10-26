@@ -33,7 +33,8 @@ PREVIOUS_BINARY_ENV = "QDRANT_PRIVATE_ORAM_PREVIOUS_BINARY"
 PREVIOUS_REVISION_ENV = "QDRANT_PRIVATE_ORAM_PREVIOUS_REVISION"
 BUILD_PREVIOUS_BINARY_ENV = "QDRANT_BUILD_PRIVATE_ORAM_PREVIOUS_BINARY"
 CURRENT_BINARY_ENV = "QDRANT_PRIVATE_ORAM_CURRENT_BINARY"
-PINNED_PREVIOUS_REVISION = "74b0ba5492b480f293946280e4cd562d484ba927"
+# This wire-7 baseline includes the applied membership-index activation fix (b6a2c4c85).
+PINNED_PREVIOUS_REVISION = "76ca9ae178c8789c0eae3c2abcf7e7b4ff8d2189"
 LEGACY_V3_BINARY_CAPABILITY_DIGEST = "dAtfKtcZBHNaXhM-amdoNULrgFbKmnO_EWz8LcJy3l4"
 WIRE_9 = 9
 PEER_IDS = (101, 102, 103)
@@ -642,6 +643,8 @@ def test_previous_binary_downgrade_fails_closed_without_mutating_wire_9_state(
     )
     leader = wait_peer_added(peer.api_url)
     assert leader == PEER_IDS[0]
+    # A known leader can still have bootstrap entries waiting to be applied.
+    _wait_for_activation_state_quiescent([peer_dir])
     assert_http_ok(_activate(peer.api_url))
     assert _activation_status(peer.api_url)["reservation_v3_write_floor_active"] is True
     _stop_peer(running_peers, peer)
