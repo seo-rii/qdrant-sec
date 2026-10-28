@@ -69,7 +69,7 @@ pub enum EncryptionError {
     InvalidEncoding,
     #[error("nonce must decode to 96 bits")]
     InvalidNonceLength,
-    #[error("ciphertext is shorter than the authentication tag")]
+    #[error("ciphertext length is outside the supported bounds")]
     InvalidCiphertextLength,
     #[error("encryption failed")]
     SealFailed,
@@ -875,6 +875,11 @@ impl AeadCipher {
         context: EncryptionContext<'_>,
         aad_suffix: &[u8],
     ) -> Result<EncryptedEnvelope, EncryptionError> {
+        // Apply the same bound as the reader, including the tag added below. This also
+        // covers nested encodings such as CKKS's base64 ciphertext and JSON metadata.
+        if plaintext.len() > ENCRYPTED_ENVELOPE_CIPHERTEXT_MAX_BYTES - TAG_LEN {
+            return Err(EncryptionError::InvalidCiphertextLength);
+        }
         self.reserve_invocation()?;
         let rng = SystemRandom::new();
         let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -1187,6 +1192,36 @@ mod tests {
         // never moves past the limit.
         assert_eq!(cipher.decrypt(&envelope, context).unwrap(), b"last");
         assert_eq!(cipher.invocations(), AES_GCM_RANDOM_NONCE_INVOCATION_LIMIT);
+    }
+
+    #[test]
+    fn cipher_envelope_size_limit_preserves_nonce_budget_and_roundtrips_at_maximum() {
+        let cipher = AeadCipher::new_with_material_fingerprint(
+            "size-boundary:key",
+            SecretKey::generate().unwrap(),
+            "size-boundary/material",
+        )
+        .unwrap();
+        let context = EncryptionContext::payload_text("docs", "1", "body");
+        let mut plaintext = vec![7; ENCRYPTED_ENVELOPE_CIPHERTEXT_MAX_BYTES - TAG_LEN + 1];
+
+        assert_eq!(
+            cipher.encrypt(&plaintext, context),
+            Err(EncryptionError::InvalidCiphertextLength),
+        );
+        assert_eq!(cipher.invocations(), 0);
+
+        plaintext.pop();
+        let encrypted = cipher.encrypt(&plaintext, context).unwrap();
+        assert_eq!(cipher.invocations(), 1);
+        assert_eq!(
+            BASE64URL_NOPAD
+                .decode(encrypted.ciphertext.as_bytes())
+                .unwrap()
+                .len(),
+            ENCRYPTED_ENVELOPE_CIPHERTEXT_MAX_BYTES,
+        );
+        assert!(cipher.decrypt(&encrypted, context).unwrap() == plaintext);
     }
 
     #[test]

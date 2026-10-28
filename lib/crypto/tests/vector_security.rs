@@ -62,11 +62,11 @@ impl CkksVectorBackend for SealedTestBackend {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct OversizedCiphertextBackend;
+struct SizedCiphertextBackend(usize);
 
-impl CkksVectorBackend for OversizedCiphertextBackend {
+impl CkksVectorBackend for SizedCiphertextBackend {
     fn encrypt(&self, _input: CkksEncryptionInput<'_>) -> Result<Vec<u8>, CkksError> {
-        Ok(vec![7_u8; 17 * 1024 * 1024])
+        Ok(vec![7_u8; self.0])
     }
 }
 
@@ -714,7 +714,7 @@ fn ckks_vector_rejects_oversized_ciphertext_at_seal_and_proof_boundaries() {
         "embedding",
         CkksParameters::openfhe_default_128_bit(),
         SecretKey::from_bytes([29u8; 32]),
-        OversizedCiphertextBackend,
+        SizedCiphertextBackend(17 * 1024 * 1024),
     )
     .unwrap();
 
@@ -751,6 +751,125 @@ fn ckks_vector_rejects_oversized_ciphertext_at_seal_and_proof_boundaries() {
         matches!(err, CkksError::MalformedEnvelope(ref message) if message.contains("maximum size")),
         "{err:?}",
     );
+}
+
+#[test]
+fn ckks_vector_rejects_ciphertext_that_outgrows_its_envelope() {
+    // The raw ciphertext fits the 16 MiB CKKS cap, but its base64 alone consumes
+    // the entire envelope budget before JSON metadata and the AEAD tag are added.
+    let encryptor = test_ckks_encryptor(
+        "tenant-a:ckks",
+        "embedding",
+        CkksParameters::openfhe_default_128_bit(),
+        SecretKey::generate().unwrap(),
+        SizedCiphertextBackend(12 * 1024 * 1024),
+    )
+    .unwrap();
+    let material = public_material();
+    let items = [
+        CkksVectorBatchItem {
+            point_id: "point-1",
+            values: &[1.0, 2.0],
+        },
+        CkksVectorBatchItem {
+            point_id: "point-2",
+            values: &[3.0, 4.0],
+        },
+    ];
+    assert!(matches!(
+        encryptor.encrypt("docs", "point-1", &material, items[0].values),
+        Err(CkksError::Envelope(
+            EncryptionError::InvalidCiphertextLength
+        )),
+    ));
+    assert!(matches!(
+        encryptor.encrypt_batch("docs", &material, &items),
+        Err(CkksError::Envelope(
+            EncryptionError::InvalidCiphertextLength
+        )),
+    ));
+    assert!(matches!(
+        encryptor.encrypt_sidecar_payload_value("docs", "point-1", &material, items[0].values),
+        Err(CkksError::Envelope(
+            EncryptionError::InvalidCiphertextLength
+        )),
+    ));
+}
+
+#[test]
+fn ckks_vector_wrapped_size_boundary_roundtrips_through_batch_and_proof() {
+    const ENVELOPE_MAX_BYTES: usize = 16 * 1024 * 1024;
+    let material = public_material();
+    let resource_key = SecretKey::generate().unwrap();
+    let make_encryptor = |ciphertext_len| {
+        CkksVectorEncryptor::new_from_resource_key_with_material_fingerprint(
+            "tenant-a:ckks",
+            "embedding",
+            CkksParameters::openfhe_default_128_bit(),
+            &resource_key,
+            "tenant-a/vector@v1",
+            SizedCiphertextBackend(ciphertext_len),
+        )
+        .unwrap()
+    };
+    let items = [
+        CkksVectorBatchItem {
+            point_id: "point-1",
+            values: &[1.0, 2.0],
+        },
+        CkksVectorBatchItem {
+            point_id: "point-2",
+            values: &[3.0, 4.0],
+        },
+    ];
+
+    // Measure the actual serialized header and tag so the boundary follows the wire
+    // format, including its metadata, rather than assuming a fixed raw CKKS limit.
+    let sample = make_encryptor(1)
+        .encrypt("docs", "point-1", &material, items[0].values)
+        .unwrap();
+    let fixed_overhead = BASE64URL_NOPAD
+        .decode(sample.envelope.ciphertext.as_bytes())
+        .unwrap()
+        .len()
+        - BASE64URL_NOPAD.encode(&[7]).len();
+    let max_raw_len = (ENVELOPE_MAX_BYTES - fixed_overhead) * 3 / 4;
+    let encryptor = make_encryptor(max_raw_len);
+
+    let encrypted_batch = encryptor.encrypt_batch("docs", &material, &items).unwrap();
+    for (item, encrypted) in items.iter().zip(&encrypted_batch) {
+        let wrapped_len = BASE64URL_NOPAD
+            .decode(encrypted.envelope.ciphertext.as_bytes())
+            .unwrap()
+            .len();
+        assert!(wrapped_len <= ENVELOPE_MAX_BYTES);
+        assert!(ENVELOPE_MAX_BYTES - wrapped_len <= 1);
+        let opened = encryptor
+            .open("docs", item.point_id, &material, encrypted)
+            .unwrap();
+        let ciphertext = BASE64URL_NOPAD
+            .decode(opened.ciphertext.as_bytes())
+            .unwrap();
+        assert_eq!(ciphertext.len(), max_raw_len);
+        assert!(ciphertext.iter().all(|byte| *byte == 7));
+    }
+    drop(encrypted_batch);
+
+    let (value, proof) = encryptor
+        .encrypt_sidecar_payload_value("docs", "point-1", &material, items[0].values)
+        .unwrap();
+    let reopened_proof = encryptor
+        .verify_stored_sidecar_payload_value("docs", "point-1", &material, &value)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.envelope_key(), reopened_proof.envelope_key());
+
+    assert!(matches!(
+        make_encryptor(max_raw_len + 1).encrypt("docs", "point-1", &material, items[0].values),
+        Err(CkksError::Envelope(
+            EncryptionError::InvalidCiphertextLength
+        )),
+    ));
 }
 
 #[test]
