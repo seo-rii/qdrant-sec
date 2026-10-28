@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use segment::common::operation_time_statistics::OperationDurationsAggregator;
 use segment::entry::ReadSegmentEntry as _;
 use segment::segment::Segment;
-use segment::types::HnswGlobalConfig;
+use segment::types::{HnswGlobalConfig, Indexes};
 
 use super::config::SegmentOptimizerConfig;
 use super::segment_optimizer::{OptimizationPlanner, SegmentOptimizer};
@@ -80,10 +80,7 @@ impl IndexingOptimizer {
 
                 let optimize_for_index = is_big_for_index
                     && if is_encrypted_vector {
-                        !matches!(
-                            vector_data.index,
-                            segment::types::Indexes::CkksCiphertextHnsw { .. }
-                        )
+                        !matches!(vector_data.index, Indexes::CkksCiphertextHnsw { .. })
                     } else {
                         !is_indexed
                     };
