@@ -201,11 +201,49 @@ fi
   "ids": [{ "num": 2 }, { "num": 3 }, { "num": 4 }]
 }' $QDRANT_HOST qdrant.Points/Get
 
-"${docker_grpcurl[@]}" -d '{
+# An omitted protobuf limit is zero and must return a successful empty result.
+response=$("${docker_grpcurl[@]}" -d '{
   "collection_name": "test_collection",
   "positive": [{ "num": 1 }],
   "negative": [{ "num": 2 }]
-}' $QDRANT_HOST qdrant.Points/Recommend
+}' $QDRANT_HOST qdrant.Points/Recommend)
+jq -e '(.result // []) == []' <<< "$response"
+
+# Even an all-zero batch must retain one empty result for each request.
+response=$("${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "recommend_points": [
+    {
+      "collection_name": "test_collection",
+      "positive": [{ "num": 1 }],
+      "limit": 0
+    },
+    {
+      "collection_name": "test_collection",
+      "positive": [{ "num": 3 }]
+    }
+  ]
+}' $QDRANT_HOST qdrant.Points/RecommendBatch)
+jq -e '(.result | length) == 2 and all(.result[]; (.result // []) == [])' <<< "$response"
+
+# A zero-limit entry must not shift a later nonempty recommendation result.
+response=$("${docker_grpcurl[@]}" -d '{
+  "collection_name": "test_collection",
+  "recommend_points": [
+    {
+      "collection_name": "test_collection",
+      "positive": [{ "num": 1 }],
+      "limit": 0
+    },
+    {
+      "collection_name": "test_collection",
+      "positive": [{ "num": 1 }],
+      "negative": [{ "num": 2 }],
+      "limit": 2
+    }
+  ]
+}' $QDRANT_HOST qdrant.Points/RecommendBatch)
+jq -e '(.result | length) == 2 and ((.result[0].result // []) == []) and (.result[1].result | length) == 2' <<< "$response"
 
 # old format
 "${docker_grpcurl[@]}" -d '{
