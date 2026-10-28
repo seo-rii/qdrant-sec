@@ -1,10 +1,10 @@
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use collection::collection::Collection;
 use collection::config::CollectionConfigInternal;
 use collection::shards::shard::PeerId;
-use common::fs::safe_delete_in_tmp;
+use common::fs::{move_dir, safe_delete_in_tmp};
 use common::tar_unpack::tar_unpack_file;
 use fs_err as fs;
 use fs_err::File;
@@ -14,6 +14,7 @@ use storage::content_manager::alias_mapping::AliasPersistence;
 use storage::content_manager::snapshots::SnapshotConfig;
 use storage::content_manager::snapshots::recover::reject_ordinary_private_oram_v2_snapshot_recovery;
 use storage::content_manager::toc::{ALIASES_PATH, COLLECTIONS_DIR};
+use tempfile::TempDir;
 
 use crate::common::crypto::validate_recovered_collection_crypto_config;
 #[cfg(test)]
@@ -21,6 +22,29 @@ use crate::common::crypto::validate_recovered_collection_crypto_runtime;
 use crate::common::private_hnsw::validate_recovered_private_hnsw_oram_snapshot_signatures;
 use crate::common::private_result_oram::validate_recovered_private_result_oram_snapshot_signatures;
 use crate::settings::Settings;
+
+fn snapshot_recovery_temp_dir(
+    temp_base: Option<&Path>,
+    default_base: &Path,
+    prefix: &str,
+) -> Result<TempDir, String> {
+    let base = temp_base.unwrap_or(default_base);
+    fs::create_dir_all(base).map_err(|err| {
+        format!(
+            "Failed to create snapshot recovery temp directory {}: {err}",
+            base.display(),
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .map_err(|err| {
+            format!(
+                "Failed to create snapshot recovery work directory in {}: {err}",
+                base.display(),
+            )
+        })
+}
 
 /// Recover snapshots from the given arguments
 ///
@@ -76,11 +100,12 @@ pub fn recover_snapshots(
             }
             info!("Overwriting collection {collection_name}");
         }
-        let collection_temp_path =
-            temp_dir.map_or_else(|| collection_path.with_extension("tmp"), PathBuf::from);
+        // A configured temp path is a shared parent, not a directory this recovery owns.
+        let collection_temp =
+            snapshot_recovery_temp_dir(temp_dir, &collection_dir_path, "collection-snapshot-")?;
         if let Err(err) = Collection::restore_snapshot(
             snapshot_data,
-            &collection_temp_path,
+            collection_temp.path(),
             this_peer_id,
             is_distributed,
         ) {
@@ -88,15 +113,20 @@ pub fn recover_snapshots(
                 "Failed to recover snapshot {collection_name}: {err}"
             ));
         }
-        if let Err(err) = validate_restored_collection_crypto_runtime(
+        validate_restored_collection_crypto_runtime(
             settings,
             collection_name,
-            &collection_temp_path,
-        ) {
-            let _ = safe_delete_in_tmp(&collection_temp_path, &storage_dir.join(".deleted"))
-                .and_then(|to_delete| to_delete.close());
-            return Err(err);
-        }
+            collection_temp.path(),
+        )?;
+
+        // Complete a possible cross-filesystem copy before replacing the current collection.
+        // Publication can then use one rename on the collection filesystem.
+        let install_temp =
+            snapshot_recovery_temp_dir(None, &collection_dir_path, ".snapshot-install-")?;
+        let install_path = install_temp.path().join("collection");
+        move_dir(collection_temp.path(), &install_path).map_err(|err| {
+            format!("Failed to stage recovered snapshot for collection {collection_name}: {err}",)
+        })?;
         // Remove collection_path directory if exists
         if collection_path.exists()
             && let Err(err) = safe_delete_in_tmp(&collection_path, &storage_dir.join(".deleted"))
@@ -106,7 +136,7 @@ pub fn recover_snapshots(
                 "Failed to remove collection {collection_name}: {err}",
             ));
         }
-        fs::rename(&collection_temp_path, &collection_path).map_err(|err| {
+        fs::rename(&install_path, &collection_path).map_err(|err| {
             format!(
                 "Failed to move recovered snapshot for collection {collection_name} into place: {err}",
             )
@@ -125,15 +155,15 @@ pub fn recover_full_snapshot(
     is_distributed: bool,
     settings: &Settings,
 ) -> Result<Vec<String>, String> {
-    let snapshot_temp_path = temp_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| storage_dir.join("snapshots_recovery_tmp"));
-    fs::create_dir_all(&snapshot_temp_path).map_err(|err| {
-        format!(
-            "Failed to create full snapshot recovery temp directory {}: {err}",
-            snapshot_temp_path.display(),
-        )
-    })?;
+    let snapshot_temp = snapshot_recovery_temp_dir(temp_dir, storage_dir, "full-snapshot-")?;
+    // TempDir makes its path absolute. Preserve the caller's path form when creating CLI
+    // mappings: a newly introduced Windows drive colon would be parsed as a separator.
+    // The helper creates one named child directly below the requested base.
+    let snapshot_temp_name = snapshot_temp
+        .path()
+        .file_name()
+        .ok_or_else(|| "Snapshot recovery work directory name is missing".to_string())?;
+    let snapshot_temp_path = temp_dir.unwrap_or(storage_dir).join(snapshot_temp_name);
 
     // Un-tar snapshot into temporary directory
     tar_unpack_file(Path::new(snapshot_path), &snapshot_temp_path)
@@ -202,12 +232,9 @@ pub fn recover_full_snapshot(
     }
 
     // Remove temporary directory
-    fs::remove_dir_all(&snapshot_temp_path).map_err(|err| {
-        format!(
-            "Failed to remove full snapshot recovery temp directory {}: {err}",
-            snapshot_temp_path.display(),
-        )
-    })?;
+    snapshot_temp
+        .close()
+        .map_err(|err| format!("Failed to remove full snapshot recovery work directory: {err}",))?;
     Ok(recovered_collection)
 }
 
@@ -316,6 +343,7 @@ fn validate_restored_collection_crypto_params(
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+    use std::path::PathBuf;
 
     use collection::config::{
         COLLECTION_CONFIG_FILE, CollectionConfigInternal, CollectionEncryptionConfig,
@@ -331,6 +359,7 @@ mod tests {
     use collection::private_result_oram_store::{
         PRIVATE_RESULT_ORAM_DIR, PrivateResultOramEpochState, PrivateResultOramStore,
     };
+    use collection::shards::shard_config::{SHARD_CONFIG_FILE, ShardConfig, ShardType};
     use data_encoding::BASE64URL_NOPAD;
     use qdrant_sec::{
         LocalMasterKeyProvider, MasterKeyProvider, OramKind, OramParams,
@@ -356,6 +385,228 @@ mod tests {
 
     const RESULT_KEY_ID: &str = "tenant-a/result-private-rk";
     const RESULT_SIGNING_KEY_ID: &str = "tenant-a/private-result-signing-v1";
+
+    fn write_cli_plain_snapshot(path: &Path, marker: &[u8]) {
+        let mut config = recovered_private_hnsw_config();
+        config.params.encryption = None;
+        let config = serde_json::to_vec(&config).unwrap();
+        // The CLI must restore an actual configured shard. A temporary shard keeps these
+        // file-publication tests independent of segment data and replica-state fixtures.
+        let shard_config = serde_json::to_vec(&ShardConfig {
+            r#type: ShardType::Temporary,
+        })
+        .unwrap();
+        let shard_config_path = format!("0/{SHARD_CONFIG_FILE}");
+        let mut archive = tar::Builder::new(fs::File::create(path).unwrap());
+        for (name, bytes) in [
+            (COLLECTION_CONFIG_FILE, config.as_slice()),
+            (shard_config_path.as_str(), shard_config.as_slice()),
+            ("restored-content.txt", marker),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive.append_data(&mut header, name, bytes).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    fn cli_snapshot_mapping(snapshot: &Path, collection: &str) -> Vec<String> {
+        vec![format!("{}:{collection}", snapshot.display())]
+    }
+
+    fn cli_snapshot_test_root() -> (TempDir, PathBuf) {
+        let owner = tempfile::Builder::new()
+            .prefix("cli-recovery-test-")
+            .tempdir_in(".")
+            .unwrap();
+        // Keep an absolute RAII owner but pass relative paths to the existing CLI parser,
+        // whose path:collection syntax does not support Windows absolute drive paths.
+        let root = PathBuf::from(owner.path().file_name().unwrap());
+        assert!(root.is_relative());
+        (owner, root)
+    }
+
+    fn directory_entries(path: &Path) -> Vec<PathBuf> {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn cli_snapshot_recovery_preserves_shared_temp_and_creates_collection_parent() {
+        let (_owner, root) = cli_snapshot_test_root();
+        let snapshot = root.join("plain.snapshot");
+        write_cli_plain_snapshot(&snapshot, b"restored collection");
+        let temp_base = root.join("shared-temp");
+        fs::create_dir(&temp_base).unwrap();
+        let unrelated = temp_base.join("unrelated-working-file");
+        fs::write(&unrelated, b"keep this file in place").unwrap();
+        let storage = root.join("new-storage");
+
+        assert_eq!(
+            recover_snapshots(
+                &cli_snapshot_mapping(&snapshot, "restored"),
+                false,
+                Some(&temp_base),
+                &storage,
+                7,
+                false,
+                &Settings::new(None).unwrap(),
+            )
+            .unwrap(),
+            vec!["restored"]
+        );
+
+        let restored = storage.join(COLLECTIONS_DIR).join("restored");
+        assert_eq!(
+            fs::read(restored.join("restored-content.txt")).unwrap(),
+            b"restored collection"
+        );
+        assert!(!restored.join("unrelated-working-file").exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep this file in place");
+        assert_eq!(directory_entries(&temp_base), vec![unrelated]);
+        assert_eq!(
+            directory_entries(&storage.join(COLLECTIONS_DIR)),
+            vec![restored]
+        );
+    }
+
+    #[test]
+    fn cli_snapshot_recovery_failure_preserves_shared_temp_and_existing_collection() {
+        let (_owner, root) = cli_snapshot_test_root();
+        let snapshot = root.join("plain.snapshot");
+        write_cli_plain_snapshot(&snapshot, b"new collection");
+        let broken_snapshot = root.join("broken.snapshot");
+        fs::write(&broken_snapshot, b"incomplete archive").unwrap();
+        let temp_base = root.join("shared-temp");
+        fs::create_dir(&temp_base).unwrap();
+        let unrelated = temp_base.join("unrelated-working-file");
+        fs::write(&unrelated, b"keep this file in place").unwrap();
+        let storage = root.join("storage");
+        let restored = storage.join(COLLECTIONS_DIR).join("restored");
+        fs::create_dir_all(&restored).unwrap();
+        let old_content = restored.join("old-content.txt");
+        fs::write(&old_content, b"old collection").unwrap();
+        let settings = Settings::new(None).unwrap();
+
+        assert!(
+            recover_snapshots(
+                &cli_snapshot_mapping(&broken_snapshot, "restored"),
+                true,
+                Some(&temp_base),
+                &storage,
+                7,
+                false,
+                &settings,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&old_content).unwrap(), b"old collection");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"keep this file in place");
+        assert_eq!(directory_entries(&temp_base), vec![unrelated.clone()]);
+
+        recover_snapshots(
+            &cli_snapshot_mapping(&snapshot, "restored"),
+            true,
+            Some(&temp_base),
+            &storage,
+            7,
+            false,
+            &settings,
+        )
+        .unwrap();
+        assert!(!old_content.exists());
+        assert_eq!(
+            fs::read(restored.join("restored-content.txt")).unwrap(),
+            b"new collection"
+        );
+        assert_eq!(directory_entries(&temp_base), vec![unrelated]);
+    }
+
+    #[test]
+    fn cli_full_snapshot_recovery_isolates_outer_and_collection_work_directories() {
+        for custom_temp in [false, true] {
+            let (_owner, root) = cli_snapshot_test_root();
+            let storage = root.join("new-storage");
+            let temp_base = root.join("shared-temp");
+            assert!(storage.is_relative());
+            assert!(temp_base.is_relative());
+            fs::create_dir(&temp_base).unwrap();
+            let unrelated = temp_base.join("unrelated-working-file");
+            fs::write(&unrelated, b"keep this file in place").unwrap();
+            let docs = root.join("docs.snapshot");
+            let notes = root.join("notes.snapshot");
+            write_cli_plain_snapshot(&docs, b"docs collection");
+            write_cli_plain_snapshot(&notes, b"notes collection");
+            let full_snapshot = root.join("full.snapshot");
+            let config = serde_json::to_vec(&SnapshotConfig {
+                collections_mapping: HashMap::from([
+                    ("docs".to_string(), "docs.snapshot".to_string()),
+                    ("notes".to_string(), "notes.snapshot".to_string()),
+                ]),
+                collections_aliases: HashMap::from([(
+                    "docs-alias".to_string(),
+                    "docs".to_string(),
+                )]),
+            })
+            .unwrap();
+            let mut archive = tar::Builder::new(fs::File::create(&full_snapshot).unwrap());
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_size(config.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "config.json", config.as_slice())
+                .unwrap();
+            archive
+                .append_path_with_name(&docs, "docs.snapshot")
+                .unwrap();
+            archive
+                .append_path_with_name(&notes, "notes.snapshot")
+                .unwrap();
+            archive.finish().unwrap();
+            drop(archive);
+
+            let mut recovered = recover_full_snapshot(
+                custom_temp.then_some(temp_base.as_path()),
+                full_snapshot.to_str().unwrap(),
+                &storage,
+                false,
+                7,
+                false,
+                &Settings::new(None).unwrap(),
+            )
+            .unwrap();
+            recovered.sort();
+            assert_eq!(recovered, vec!["docs", "notes"]);
+            let collections = storage.join(COLLECTIONS_DIR);
+            assert_eq!(
+                fs::read(collections.join("docs/restored-content.txt")).unwrap(),
+                b"docs collection"
+            );
+            assert_eq!(
+                fs::read(collections.join("notes/restored-content.txt")).unwrap(),
+                b"notes collection"
+            );
+            assert_eq!(
+                AliasPersistence::open(&storage.join(ALIASES_PATH))
+                    .unwrap()
+                    .get("docs-alias"),
+                Some("docs".to_string())
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep this file in place");
+            assert_eq!(directory_entries(&temp_base), vec![unrelated]);
+            assert_eq!(
+                directory_entries(&collections),
+                vec![collections.join("docs"), collections.join("notes")]
+            );
+        }
+    }
 
     fn recovered_private_hnsw_config() -> CollectionConfigInternal {
         CollectionConfigInternal {
