@@ -1624,19 +1624,6 @@ impl PrivateOramDetachedMutationAppendV2 {
         &self.job.material.session.response.vector_name
     }
 
-    pub(crate) fn paired_hnsw_session_id(&self) -> &str {
-        &self.job.material.session.hnsw.session_id
-    }
-
-    pub(crate) fn paired_result_session_id(&self) -> Option<&str> {
-        self.job
-            .material
-            .session
-            .result
-            .as_ref()
-            .map(|result| result.session_id.as_str())
-    }
-
     pub(crate) fn validated_owner_prepare(&self) -> &PrivateOramValidatedOwnerPrepareV1 {
         &self.job.material.validated_owner_prepare
     }

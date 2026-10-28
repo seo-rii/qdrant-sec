@@ -76,9 +76,7 @@ use storage::rbac::{Access, AccessRequirements};
 
 use super::auth::Auth;
 use super::private_hnsw::{
-    begin_private_hnsw_collection_lifecycle,
-    begin_private_hnsw_collection_lifecycle_for_paired_mutation,
-    resolve_private_hnsw_context_from_snapshot,
+    begin_private_hnsw_collection_lifecycle, resolve_private_hnsw_context_from_snapshot,
 };
 use super::private_oram_mutation_session::{
     PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS, PrivateOramDetachedMutationAppendV2,
@@ -88,7 +86,6 @@ use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::do_install_local_private_oram_owner_recovery_capsule_v2;
 use super::private_result_oram::{
     begin_private_result_oram_collection_lifecycle,
-    begin_private_result_oram_collection_lifecycle_for_paired_mutation,
     resolve_private_result_oram_context_from_snapshot,
 };
 use crate::settings::Settings;
@@ -2830,16 +2827,15 @@ pub(crate) async fn coordinate_private_oram_owner_prestage_v2(
         .map_err(|_| invalid_owner_prestage())?;
         let owner_result: StorageResult<_> = async {
             if owner_peer_id == coordinator_peer_id {
-                let receipt = install_private_oram_owner_prestage_with_paired_sessions_v2(
+                // Detaching the append job already released its paired read sessions.
+                // The local owner acquires the same lifecycle guard as a remote owner;
+                // requiring the consumed read sessions here would reject every append.
+                let receipt = install_private_oram_owner_prestage_v2(
                     toc,
                     settings,
                     consensus,
                     &verified_request,
                     &package_canonical_json,
-                    PrivateOramOwnerPrestagePairedSessionsV2 {
-                        hnsw_session_id: validated.paired_hnsw_session_id(),
-                        result_session_id: validated.paired_result_session_id(),
-                    },
                 )
                 .await?;
                 let resolution_receipt = confirm_private_oram_owner_installed_reservation_v3(
@@ -3050,56 +3046,12 @@ async fn resolve_private_oram_reserved_attempt_rejection_v2(
     }
 }
 
-#[derive(Clone, Copy)]
-struct PrivateOramOwnerPrestagePairedSessionsV2<'a> {
-    hnsw_session_id: &'a str,
-    result_session_id: Option<&'a str>,
-}
-
 pub(crate) async fn install_private_oram_owner_prestage_v2(
     toc: &storage::content_manager::toc::TableOfContent,
     settings: &Settings,
     consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
     verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
     package_canonical_json: &[u8],
-) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
-    install_private_oram_owner_prestage_inner_v2(
-        toc,
-        settings,
-        consensus,
-        verified_request,
-        package_canonical_json,
-        None,
-    )
-    .await
-}
-
-async fn install_private_oram_owner_prestage_with_paired_sessions_v2(
-    toc: &storage::content_manager::toc::TableOfContent,
-    settings: &Settings,
-    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
-    verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
-    package_canonical_json: &[u8],
-    paired_sessions: PrivateOramOwnerPrestagePairedSessionsV2<'_>,
-) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
-    install_private_oram_owner_prestage_inner_v2(
-        toc,
-        settings,
-        consensus,
-        verified_request,
-        package_canonical_json,
-        Some(paired_sessions),
-    )
-    .await
-}
-
-async fn install_private_oram_owner_prestage_inner_v2(
-    toc: &storage::content_manager::toc::TableOfContent,
-    settings: &Settings,
-    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
-    verified_request: &VerifiedPrivateOramOwnerPrestageRequestV2,
-    package_canonical_json: &[u8],
-    paired_sessions: Option<PrivateOramOwnerPrestagePairedSessionsV2<'_>>,
 ) -> StorageResult<PrivateOramOwnerPrestageReceiptV2> {
     let request = verified_request.request();
     let package = decode_private_oram_owner_prestage_package_v2(package_canonical_json)
@@ -3128,28 +3080,8 @@ async fn install_private_oram_owner_prestage_inner_v2(
         .indexes
         .iter()
         .any(|index| index.kind() == qdrant_sec::PrivateOramIndexKindV2::Result);
-    if paired_sessions.is_some_and(|sessions| has_result != sessions.result_session_id.is_some()) {
-        return Err(invalid_owner_prestage());
-    }
-    let _hnsw_lifecycle = if let Some(sessions) = paired_sessions {
-        begin_private_hnsw_collection_lifecycle_for_paired_mutation(
-            collection.name(),
-            &config,
-            &request.vector_name,
-            sessions.hnsw_session_id,
-        )?
-    } else {
-        begin_private_hnsw_collection_lifecycle(collection.name(), &config)?
-    };
-    let _result_lifecycle = if let Some(result_session_id) =
-        paired_sessions.and_then(|sessions| sessions.result_session_id)
-    {
-        begin_private_result_oram_collection_lifecycle_for_paired_mutation(
-            collection.name(),
-            &config,
-            result_session_id,
-        )?
-    } else if has_result {
+    let _hnsw_lifecycle = begin_private_hnsw_collection_lifecycle(collection.name(), &config)?;
+    let _result_lifecycle = if has_result {
         begin_private_result_oram_collection_lifecycle(collection.name(), &config)?
     } else {
         None
