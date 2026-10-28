@@ -8843,11 +8843,24 @@ def test_private_oram_active_reshard_snapshot_bootstraps_wiped_scale_up_target(
         in source_log_path.read_text(),
         wait_for_timeout=30,
     )
+    # Restoration publishes these directories asynchronously. The strict locator below
+    # asserts that a directory exists, so it cannot serve as the readiness predicate.
     wait_for(
-        lambda: _private_oram_buckets_dir(peer_dirs[target_index], "hnsw").is_dir()
-        and _private_oram_buckets_dir(peer_dirs[target_index], "result").is_dir(),
+        lambda: all(
+            len([
+                path
+                for path in peer_dirs[target_index].rglob(pattern)
+                if path.is_dir()
+            ]) == 1
+            for pattern in (
+                f"private_hnsw_oram/{VECTOR}/buckets",
+                "private_result_oram/buckets",
+            )
+        ),
         wait_for_timeout=30,
     )
+    assert _private_oram_buckets_dir(peer_dirs[target_index], "hnsw").is_dir()
+    assert _private_oram_buckets_dir(peer_dirs[target_index], "result").is_dir()
     wait_for_collection_shard_transfers_count(source_url, COLLECTION, 0)
     wait_for_collection_shard_transfers_count(target_url, COLLECTION, 0)
     _assert_private_oram_sessions_blocked_during_resharding(
