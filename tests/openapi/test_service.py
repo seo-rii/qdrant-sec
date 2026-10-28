@@ -129,12 +129,28 @@ def test_telemetry_detail(level: int):
     endpoint = result['requests']['rest']['responses']['PUT /collections/{collection_name}/points']
     assert endpoint['200']['count'] > 0
 
+    recovery = result['private_oram_external_recovery']
+    assert set(recovery.keys()) == {
+        'reserved_bytes', 'staging_reservations', 'worker_limit', 'workers_in_use',
+        'preflight_scanned_logical_bytes', 'preflight_scanned_entries',
+    }
+    for value in recovery.values():
+        assert type(value) is int
+        assert value >= 0
+    assert recovery['worker_limit'] > 0
+    assert recovery['workers_in_use'] <= recovery['worker_limit']
+
     if level == 0:
-        assert set(result.keys()) == {'id', 'app', 'collections', 'cluster', 'requests'}
+        assert set(result.keys()) == {
+            'id', 'app', 'collections', 'cluster', 'requests', 'private_oram_external_recovery',
+        }
         assert set(result['collections'].keys()) == {'number_of_collections'}
         return
     else:
-        assert set(result.keys()) == {'id', 'app', 'collections', 'cluster', 'requests', 'memory', 'hardware'}
+        assert set(result.keys()) == {
+            'id', 'app', 'collections', 'cluster', 'requests', 'memory', 'hardware',
+            'private_oram_external_recovery',
+        }
         assert set(result['collections'].keys()) == {'number_of_collections', 'collections', 'snapshots'}
 
     last_queried = endpoint['200']['last_responded'].replace('Z', '+00:00')
