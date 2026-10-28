@@ -1220,8 +1220,7 @@ fn validate_private_graph_parent(path: &Path) -> io::Result<()> {
             }
             let mode = metadata.permissions().mode();
             if mode & 0o022 != 0 {
-                let sticky_ancestor =
-                    Some(directory) != direct_parent && mode & nix::libc::S_ISVTX != 0;
+                let sticky_ancestor = Some(directory) != direct_parent && mode & 0o1000 != 0;
                 if sticky_ancestor {
                     parent = directory.parent();
                     continue;
