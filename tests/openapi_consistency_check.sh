@@ -69,15 +69,15 @@ PRIVATE_ORAM_OPERATIONS=(
 )
 
 for PRIVATE_ORAM_OPERATION in "${PRIVATE_ORAM_OPERATIONS[@]}"; do
-    IFS='|' read -r METHOD PATH OPERATION_ID <<< "$PRIVATE_ORAM_OPERATION"
+    IFS='|' read -r METHOD API_PATH OPERATION_ID <<< "$PRIVATE_ORAM_OPERATION"
     if ! jq -e \
         --arg method "$METHOD" \
-        --arg path "$PATH" \
+        --arg path "$API_PATH" \
         --arg operation_id "$OPERATION_ID" \
         '.paths[$path][$method].operationId == $operation_id' \
         ./docs/redoc/master/openapi.json >/dev/null
     then
-        echo "ERROR: Missing private ORAM OpenAPI operation: $METHOD $PATH -> $OPERATION_ID"
+        echo "ERROR: Missing private ORAM OpenAPI operation: $METHOD $API_PATH -> $OPERATION_ID"
         exit 1
     fi
 done
