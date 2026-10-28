@@ -352,6 +352,7 @@ mod tests {
     use collection::private_result_oram_store::{
         PRIVATE_RESULT_ORAM_DIR, PrivateResultOramEpochState, PrivateResultOramStore,
     };
+    use collection::shards::shard_config::{SHARD_CONFIG_FILE, ShardConfig, ShardType};
     use data_encoding::BASE64URL_NOPAD;
     use qdrant_sec::{
         LocalMasterKeyProvider, MasterKeyProvider, OramKind, OramParams,
@@ -382,9 +383,17 @@ mod tests {
         let mut config = recovered_private_hnsw_config();
         config.params.encryption = None;
         let config = serde_json::to_vec(&config).unwrap();
+        // The CLI must restore an actual configured shard. A temporary shard keeps these
+        // file-publication tests independent of segment data and replica-state fixtures.
+        let shard_config = serde_json::to_vec(&ShardConfig {
+            r#type: ShardType::Temporary,
+        })
+        .unwrap();
+        let shard_config_path = format!("0/{SHARD_CONFIG_FILE}");
         let mut archive = tar::Builder::new(fs::File::create(path).unwrap());
         for (name, bytes) in [
             (COLLECTION_CONFIG_FILE, config.as_slice()),
+            (shard_config_path.as_str(), shard_config.as_slice()),
             ("restored-content.txt", marker),
         ] {
             let mut header = tar::Header::new_gnu();
