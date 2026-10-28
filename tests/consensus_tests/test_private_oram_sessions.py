@@ -1926,24 +1926,9 @@ def test_private_oram_mutation_v2_append_commits_and_cleans_up(
     )
     assert accepted == {"accepted": True, "phase": "prestage_pending"}
 
-    def detached_job_completed_prestage() -> bool:
-        status = _post_result(
-            f"{leader_url}/collections/{COLLECTION}/private-oram/v2/mutation/status",
-            {"session_id": opened["session_id"]},
-        )
-        phase = status["append_phase"]
-        assert phase not in {
-            "quarantined",
-            "not_submitted",
-            "rejected_ack_pending",
-            "rejected_ack_complete",
-            "terminal_aborted",
-        }, status
-        return phase not in {"prestage_pending", "prestaging"}
-
     # The HTTP handler consumed the paired read sessions while detaching this job.
-    # Its local owner must still be able to pre-stage and reach admission.
-    wait_for(detached_job_completed_prestage, wait_for_timeout=30)
+    # Check durable progress: successful cleanup may already have removed the session.
+    # Requiring its consumed read sessions for local prestage would prevent this commit.
     _wait_for_private_oram_epochs(peer_dirs, NEXT_EPOCH, 2)
 
     terminal_projection: dict[str, dict] = {}
