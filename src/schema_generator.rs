@@ -37,7 +37,9 @@ use crate::common::update::{CreateFieldIndex, UpdateOperations};
 
 mod actix;
 mod common;
+mod consensus;
 mod settings;
+mod tonic;
 mod tracing;
 
 #[derive(Serialize, JsonSchema)]
