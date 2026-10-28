@@ -53,9 +53,10 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::append_res
     decode_private_oram_mutation_prepared_reservation_challenge_v3,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
-    DecodedPrivateOramMutationAuthorityWireV2, PrivateOramMutationAuthorityStateV2,
-    PrivateOramMutationConsensusAggregateV2, PrivateOramMutationMaterialOperationV2,
-    PrivateOramMutationOwnerEnrollmentPlanV2, PrivateOramMutationPendingReservationChallengeV1,
+    DecodedPrivateOramMutationAuthorityWireV2, OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1,
+    PrivateOramMutationAuthorityStateV2, PrivateOramMutationConsensusAggregateV2,
+    PrivateOramMutationMaterialOperationV2, PrivateOramMutationOwnerEnrollmentPlanV2,
+    PrivateOramMutationPendingReservationChallengeV1,
     PrivateOramMutationRecoveryCapsulesCertificateV2,
     PrivateOramMutationReservationChallengeOutcomeV1,
     acknowledge_private_oram_mutation_authority_clear_v2,
@@ -504,8 +505,20 @@ impl<'a> PrivateOramMutationPatchView<'a> {
     fn new(persistent: &'a mut Persistent) -> Self {
         let private_oram_activation_authority =
             persistent.private_oram_activation_authority.clone();
-        let private_oram_mutation_format_floor =
-            persistent.private_oram_mutation_v3_write_floor().cloned();
+        // Historical wire-8 entries still replay with their original V3 semantics after the
+        // binary raises its advertised protocol. New proposals use the current writer gate.
+        let private_oram_mutation_format_floor = persistent
+            .private_oram_mutation_format_floor
+            .as_ref()
+            .filter(|floor| {
+                floor.activation_enabled()
+                    && floor.minimum_reader_protocol() >= 8
+                    && floor.minimum_writer_protocol() >= 8
+                    && persistent
+                        .private_oram_mutation_activation_pending
+                        .is_none()
+            })
+            .cloned();
         Self {
             private_oram_epochs: &mut persistent.private_oram_epochs,
             private_oram_session_leases: &persistent.private_oram_session_leases,
@@ -1171,7 +1184,22 @@ impl<'a> PrivateOramMutationPatchView<'a> {
                     apply_private_oram_mutation_authority_prepare_append_reservation_challenge_v3(
                         &current_authority,
                         challenge_canonical_json.clone(),
-                        context,
+                        if let Some(floor) = self
+                            .private_oram_mutation_format_floor
+                            .as_ref()
+                            .filter(|floor| {
+                                floor.minimum_reader_protocol()
+                                    >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                                    && floor.minimum_writer_protocol()
+                                        >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                            })
+                        {
+                            context
+                                .with_owner_archive_history_floor(floor)
+                                .map_err(private_oram_mutation_authority_invalid)?
+                        } else {
+                            context
+                        },
                     )
                     .map_err(private_oram_mutation_authority_invalid)?;
                 validate_private_oram_material_result_v2(
@@ -1559,7 +1587,22 @@ impl<'a> PrivateOramMutationPatchView<'a> {
                     &current_authority,
                     lease.clone(),
                     recovery_manifest_canonical_json.clone(),
-                    context,
+                    if let Some(floor) =
+                        self.private_oram_mutation_format_floor
+                            .as_ref()
+                            .filter(|floor| {
+                                floor.minimum_reader_protocol()
+                                    >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                                    && floor.minimum_writer_protocol()
+                                        >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                            })
+                    {
+                        context
+                            .with_owner_archive_history_floor(floor)
+                            .map_err(private_oram_mutation_authority_invalid)?
+                    } else {
+                        context
+                    },
                 )
                 .map_err(private_oram_mutation_authority_invalid)?;
                 validate_private_oram_material_result_v2(&next_authority, &next_slot, &next_outer)?;
@@ -7519,8 +7562,14 @@ fn validate_private_oram_mutation_authority_format_snapshot(
         {
             return Err(invalid());
         }
-        if authority.aggregate().is_some() {
-            if !format_floor.activation_enabled() {
+        if let Some(aggregate) = authority.aggregate() {
+            if !format_floor.activation_enabled()
+                || (aggregate.has_compacted_owner_archive_history()
+                    && (format_floor.minimum_reader_protocol()
+                        < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                        || format_floor.minimum_writer_protocol()
+                            < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1))
+            {
                 return Err(invalid());
             }
             plan_private_oram_mutation_authority_floor_acceptance_v2(

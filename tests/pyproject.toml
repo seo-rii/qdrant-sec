@@ -27,6 +27,7 @@ package = false
 [tool.pytest.ini_options]
 markers = [
     "longrunning: marks tests as long-running (deselect with '-m \"not longrunning\"')",
+    "private_oram_upgrade: requires a real pinned previous Qdrant binary",
     "xdist_group: group tests to run on the same worker (for pytest-xdist)",
 ]
 addopts = """
