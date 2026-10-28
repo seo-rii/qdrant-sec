@@ -193,8 +193,8 @@ jobs:
           echo "::add-matcher::.github/rust-problem-matchers.json"
           exit "$status"
 
-      - name: Run CLI snapshot crypto preflight tests
-        run: cargo test --locked -p qdrant cli_snapshot_crypto_preflight_rejects
+      - name: Run CLI snapshot recovery and preflight tests
+        run: cargo test --locked -p qdrant --bin qdrant snapshots::tests::cli_
 
       - name: Run storage create-collection compatibility test
         run: cargo test --locked -p storage alias
