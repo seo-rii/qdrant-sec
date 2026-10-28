@@ -10822,6 +10822,7 @@ mod tests {
                 assert_eq!(&watermark, next_first.watermark());
             }
         }
+        assert_eq!(watermark.sequence(), next_snapshot.state.sequence);
         assert!(
             next_journal
                 .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
@@ -10831,17 +10832,42 @@ mod tests {
                 .is_none()
         );
 
-        // A future generation is not a retained predecessor, even at the exact journal sequence.
+        // Keep the sequence equal to the active journal so only the generation distinguishes
+        // this watermark from the current-generation control accepted above.
+        let future_temp = tempfile::tempdir().unwrap();
+        let (future_pair, future_fixture) = paired_store_fixture_with_writer_fence(
+            &future_temp,
+            next_fixture.preparing_lease.writer_fence + 1,
+        );
+        let future_journal = journal(&future_temp, &future_fixture);
+        point_stage_owner_capsule_package_v2(
+            &future_journal,
+            &future_fixture,
+            &future_pair,
+            11,
+            activation_locator_for_capsule_test(215),
+        );
+        let future_snapshot = future_journal.load_v2().unwrap().unwrap();
+        let future_point_stage = derive_private_oram_mutation_parent_watermark_at_sequence_v2(
+            &future_snapshot,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
+        )
+        .unwrap();
+        assert_eq!(
+            future_point_stage.watermark().lease_generation(),
+            next_fixture.preparing_lease.generation + 1
+        );
+        assert_eq!(
+            future_point_stage.watermark().sequence(),
+            next_snapshot.state.sequence
+        );
+        assert_eq!(
+            next_journal.load_v2().unwrap().unwrap().state.phase,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable
+        );
         assert!(matches!(
-            first_journal.next_private_oram_mutation_parent_progress_before_decision_v2(
-                LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
-                    reconcile_snapshot(
-                        &first_fixture.old_consensus,
-                        first_fixture.preparing_lease.clone(),
-                    )
-                    .with_parent_watermark_for_test(next_first.watermark().clone()),
-                    100,
-                )
+            next_journal.next_private_oram_mutation_parent_progress_before_decision_v2(
+                preparing_at(future_point_stage.watermark().clone(),)
             ),
             Err(PrivateOramMutationJournalError::InvalidTransition)
         ));
