@@ -631,7 +631,7 @@ mod platform {
                 return Err(PrivateOramPeerIdentityError::InvalidStorageRoot);
             }
         } else if mode & 0o022 != 0 {
-            let root_owned_sticky = owner == 0 && mode & nix::libc::S_ISVTX != 0;
+            let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
             if !root_owned_sticky {
                 return Err(PrivateOramPeerIdentityError::InvalidStorageRoot);
             }

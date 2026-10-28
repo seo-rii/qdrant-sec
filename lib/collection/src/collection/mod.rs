@@ -1733,8 +1733,7 @@ fn validate_client_payload_nonce_replay_cache_parent(path: &Path) -> CollectionR
         }
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
-            let sticky_ancestor =
-                Some(directory) != direct_parent && mode & nix::libc::S_ISVTX != 0;
+            let sticky_ancestor = Some(directory) != direct_parent && mode & 0o1000 != 0;
             if sticky_ancestor {
                 current = directory.parent();
                 continue;
