@@ -5876,6 +5876,7 @@ dependencies = [
  "slog-stdlog",
  "storage",
  "sys-info",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
