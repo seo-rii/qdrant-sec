@@ -1652,6 +1652,62 @@ def _assert_replica_can_open_current_sessions(
         )
 
 
+def _activate_private_oram_mutation_v3_for_fixture(leader_url: str) -> dict:
+    # These fixtures run only current peers and require the V3 writer floor. Upgrade
+    # tests that intentionally retain an old floor use their own activation helper.
+    deadline = time.monotonic() + 90
+    last_activation = None
+    last_status = None
+    transient_errors = (
+        "private ORAM activation requires a stable voter configuration",
+        "private ORAM activation requires a stable local consensus state",
+        "private ORAM activation evidence does not match stable local consensus state",
+        "private ORAM activation acknowledgement failed on peer ",
+        "private ORAM activation timed out",
+    )
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            break
+        response = requests.post(
+            f"{leader_url}/cluster/private-oram/mutation-v2/activate",
+            params={"timeout": min(60, int(remaining))},
+            timeout=remaining,
+        )
+        last_activation = (response.status_code, response.text)
+        # An arbitrary refusal (including unsupported binary capabilities) is a
+        # fixture error. Only consensus-readiness failures can become ready later.
+        assert response.status_code == 200 or (
+            response.status_code == 500
+            and any(error in response.text for error in transient_errors)
+        ), f"mutation activation refused: {last_activation}; status: {last_status}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        status_response = requests.get(
+            f"{leader_url}/cluster/private-oram/mutation-v2/status",
+            timeout=min(30, remaining),
+        )
+        last_status = (status_response.status_code, status_response.text)
+        assert status_response.status_code == 200, (
+            f"mutation activation status failed: {last_status}; activate: {last_activation}"
+        )
+        status = status_response.json()["result"]
+        if (
+            status["status"] == "active"
+            and status["reservation_v3_write_floor_active"] is True
+        ):
+            return status
+        assert status["status"] in {"unprepared", "prepared", "active"}, last_status
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    raise AssertionError(
+        "mutation activation did not reach the active V3 writer floor within 90 seconds; "
+        f"activate: {last_activation}; status: {last_status}"
+    )
+
+
 def _prepare_private_oram_mutation_v2_collection(
     tmp_path: pathlib.Path,
     extra_env_by_peer: list[dict[str, str]] | None = None,
@@ -1745,27 +1801,7 @@ def _prepare_private_oram_mutation_v2_collection(
 
     signed_genesis = _sign_private_oram_mutation_v2_genesis(context, fixture)
     enroll_body = _private_oram_v2_wire_body(signed_genesis["rest_enroll_body"])
-    activation_status = None
-    for _ in range(3):
-        requests.post(
-            f"{leader_url}/cluster/private-oram/mutation-v2/activate",
-            params={"timeout": 60},
-            timeout=70,
-        )
-        status_response = requests.get(
-            f"{leader_url}/cluster/private-oram/mutation-v2/status",
-            timeout=30,
-        )
-        assert_http_ok(status_response)
-        activation_status = status_response.json()["result"]
-        if (
-            activation_status["status"] == "active"
-            and activation_status["reservation_v3_write_floor_active"] is True
-        ):
-            break
-    assert activation_status is not None
-    assert activation_status["status"] == "active"
-    assert activation_status["reservation_v3_write_floor_active"] is True
+    _activate_private_oram_mutation_v3_for_fixture(leader_url)
 
     enrolled = _post_result(
         f"{leader_url}/collections/{COLLECTION}/private-oram/v2/mutation/enroll",
