@@ -1565,12 +1565,12 @@ impl PrivateOramMutationJournal {
     }
 
     /// Before the decision, the next parent progress consensus lacks for this journal: admission
-    /// leaves the cleanup lifecycle `Admitted` with no watermark, while the coordinator's journal
-    /// moves through lease acquired, owners prepared and point staged (sequences 1 to 3), and
-    /// every owner's recovery capsule install requires the consensus watermark of the staged
-    /// point. Valid only while the admitted lease is still preparing over the exact old state;
-    /// `None` once consensus holds the journal's watermark. After the decision, the resume below
-    /// drives parent progress instead.
+    /// leaves the cleanup lifecycle `Admitted` with no current-generation watermark, while the
+    /// coordinator's journal moves through lease acquired, owners prepared and point staged
+    /// (sequences 1 to 3), and every owner's recovery capsule install requires the consensus
+    /// watermark of the staged point. Valid only while the admitted lease is still preparing
+    /// over the exact old state; `None` once consensus holds the journal's watermark. After the
+    /// decision, the resume below drives parent progress instead.
     #[doc(hidden)]
     pub fn next_private_oram_mutation_parent_progress_before_decision_v2(
         &self,
@@ -1599,7 +1599,16 @@ impl PrivateOramMutationJournal {
         {
             return Err(PrivateOramMutationJournalError::InvalidTransition);
         }
-        let parent_watermark = authority.reconcile.parent_watermark();
+        let parent_watermark = match authority.reconcile.parent_watermark() {
+            // Admission retains the last cleared generation's terminal watermark until the
+            // current generation records its first progress. Its sequence belongs to another
+            // journal and must not suppress this generation's initial proposal.
+            Some(watermark) if watermark.lease_generation() < active_lease.generation => None,
+            Some(watermark) if watermark.lease_generation() > active_lease.generation => {
+                return Err(PrivateOramMutationJournalError::InvalidTransition);
+            }
+            watermark => watermark,
+        };
         let next_sequence = match parent_watermark {
             // The first progress, which the parent-progress apply checks against the admitted
             // record itself.
@@ -1670,6 +1679,9 @@ impl PrivateOramMutationJournal {
         let parent_watermark = authority
             .reconcile
             .parent_watermark()
+            .filter(|watermark| {
+                watermark.lease_generation() == snapshot.descriptor.preparing_lease.generation
+            })
             .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
         let journal_sequence = snapshot.state.phase.sequence();
         if parent_watermark.sequence() > journal_sequence {

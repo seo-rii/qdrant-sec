@@ -10750,6 +10750,126 @@ mod tests {
     }
 
     #[test]
+    fn v2_parent_progress_starts_next_generation_after_retained_terminal() {
+        let first_temp = tempfile::tempdir().unwrap();
+        let (_, first_fixture) = paired_store_fixture(&first_temp);
+        let first_journal = journal(&first_temp, &first_fixture);
+        let first_terminal = v2_parent_watermark_expectation(
+            &first_journal,
+            &first_fixture,
+            PrivateOramMutationDecisionKindV2::ExactOldAbort,
+            PrivateOramMutationJournalPhaseV2::PointResolved,
+        );
+
+        // An aborted generation preserves the old consensus state. Build the next signed
+        // mutation over that same state, with its own paired owner journals and writer fence.
+        let next_temp = tempfile::tempdir().unwrap();
+        let (next_pair, next_fixture) = paired_store_fixture_with_writer_fence(
+            &next_temp,
+            first_fixture.preparing_lease.writer_fence + 1,
+        );
+        assert_eq!(next_fixture.old_consensus, first_fixture.old_consensus);
+        assert_eq!(
+            next_fixture.preparing_lease.generation,
+            first_fixture.preparing_lease.generation + 1
+        );
+        let next_journal = journal(&next_temp, &next_fixture);
+        point_stage_owner_capsule_package_v2(
+            &next_journal,
+            &next_fixture,
+            &next_pair,
+            11,
+            activation_locator_for_capsule_test(214),
+        );
+        let next_snapshot = next_journal.load_v2().unwrap().unwrap();
+        assert!(first_terminal.watermark().sequence() > next_snapshot.state.sequence);
+        let next_first =
+            derive_private_oram_mutation_parent_watermark_at_sequence_v2(&next_snapshot, 1)
+                .unwrap();
+        let preparing_at = |watermark| {
+            LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                reconcile_snapshot(
+                    &next_fixture.old_consensus,
+                    next_fixture.preparing_lease.clone(),
+                )
+                .with_parent_watermark_for_test(watermark),
+                100,
+            )
+        };
+
+        // Until its first progress applies, admission still exposes the previous generation's
+        // terminal watermark. Its higher sequence must not stall the new journal at sequence 3.
+        let mut watermark = first_terminal.watermark().clone();
+        assert_eq!(
+            preparing_at(watermark.clone()).active_parent_watermark_sequence(),
+            None
+        );
+        for expected_sequence in 1..=3 {
+            let proposal = next_journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
+                    watermark,
+                ))
+                .unwrap()
+                .expect("the current generation still lacks parent progress")
+                .into_proposal();
+            watermark = proposal.expectation().watermark().clone();
+            assert_eq!(watermark.sequence(), expected_sequence);
+            assert_eq!(
+                watermark.lease_generation(),
+                next_fixture.preparing_lease.generation
+            );
+            if expected_sequence == 1 {
+                assert_eq!(&watermark, next_first.watermark());
+            }
+        }
+        assert!(
+            next_journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
+                    watermark,
+                ))
+                .unwrap()
+                .is_none()
+        );
+
+        // A future generation is not a retained predecessor, even at the exact journal sequence.
+        assert!(matches!(
+            first_journal.next_private_oram_mutation_parent_progress_before_decision_v2(
+                LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                    reconcile_snapshot(
+                        &first_fixture.old_consensus,
+                        first_fixture.preparing_lease.clone(),
+                    )
+                    .with_parent_watermark_for_test(next_first.watermark().clone()),
+                    100,
+                )
+            ),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+
+        // Post-decision recovery requires progress from the decided generation. Equal sequence
+        // numbers from an older journal must not authorize the next recovery step.
+        let old_point_stage = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+            &first_terminal,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_journal.open_private_oram_mutation_resume_v2(
+                LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                    reconcile_snapshot(
+                        &next_fixture.new_consensus,
+                        next_fixture.committed_lease.clone(),
+                    )
+                    .with_parent_watermark_for_test(old_point_stage.watermark().clone()),
+                    100,
+                ),
+                "docs",
+            ),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+    }
+
+    #[test]
     fn v2_opaque_resume_facade_advances_no_server_terminal_sequence() {
         let temp = tempfile::tempdir().unwrap();
         let (pair, fixture) = paired_store_fixture(&temp);
@@ -12999,6 +13119,7 @@ mod tests {
         let aggregate = authority.aggregate().unwrap();
         assert_eq!(aggregate.lease_slot().active.as_ref(), Some(&next_lease));
         assert_eq!(authority.lease_slot(), aggregate.lease_slot());
+        assert_eq!(aggregate.parent_watermark(), Some(terminal.watermark()));
         assert_ne!(aggregate.outer_binding_digest(), digest(240));
         assert_eq!(aggregate.outer_binding_digest().len(), 43);
         assert_eq!(aggregate.aggregate_digest().len(), 43);
