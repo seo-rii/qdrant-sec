@@ -2455,6 +2455,7 @@ mod tests {
             source_peer_id: 13,
             target_peer_id: 17,
             active_transfer_resume: None,
+            resume_if_task_missing: false,
         };
         let error = service
             .request_private_oram_shard_recovery(13, recovery)

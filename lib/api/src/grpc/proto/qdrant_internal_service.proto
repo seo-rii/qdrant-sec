@@ -436,6 +436,9 @@ message RequestPrivateOramShardRecoveryRequest {
   uint64 target_peer_id = 4;
   // Present only to restart an exact active fixed-layout transfer with fresh preinstall.
   PrivateOramActiveTransferResumeContext active_transfer_resume = 5;
+  // Source recovery retries must leave a running or finished transfer task alone.
+  // Requires an exact durable source preinstall intent and active_transfer_resume.
+  bool resume_if_task_missing = 6;
 }
 
 message PrivateOramActiveTransferResumeContext {

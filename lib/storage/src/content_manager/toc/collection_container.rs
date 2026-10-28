@@ -826,6 +826,7 @@ impl TableOfContent {
                                             .clone(),
                                     },
                                 ),
+                                resume_if_task_missing: false,
                             };
                             let channel_service = self.channel_service.clone();
                             let pending =
