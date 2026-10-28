@@ -5075,6 +5075,80 @@ def test_private_oram_external_restore_recovers_from_process_enospc(
         assert unmounted.returncode == 0, unmounted.stderr
 
 
+def test_private_oram_external_restore_status_during_verify_keeps_rest_worker_available(
+    tmp_path: pathlib.Path,
+):
+    pause_file = tmp_path / "private-oram-verify-status.pause"
+    peer_urls, _, fixture, _, _ = _start_private_oram_cluster(
+        tmp_path,
+        1,
+        1,
+        extra_env={
+            "QDRANT__SERVICE__MAX_WORKERS": "1",
+            "QDRANT__STORAGE__PRIVATE_ORAM_EXTERNAL_RECOVERY__MAX_TOTAL_STAGED_BYTES": str(
+                3 * 1024 * 1024 * 1024
+            ),
+            "QDRANT__STORAGE__PRIVATE_ORAM_EXTERNAL_RECOVERY__MAX_UNPACKED_BYTES": str(
+                1024 * 1024 * 1024
+            ),
+            "QDRANT_STAGING_PRIVATE_ORAM_EXTERNAL_RECOVERY_ARCHIVE_PREFLIGHT_PAUSE_FILE": str(
+                pause_file
+            ),
+        },
+        capture_stderr=True,
+    )
+    owner_url = peer_urls[0]
+    _upload_hnsw(owner_url, fixture)
+    _upload_result_oram(owner_url, fixture)
+    snapshot_path, checkpoint_bundle = _export_private_oram_recovery_snapshot(
+        owner_url,
+        tmp_path,
+        fixture,
+    )
+    operation_token = _begin_and_upload_private_oram_snapshot(
+        owner_url,
+        snapshot_path,
+        checkpoint_bundle,
+    )
+
+    recovery_url = f"{owner_url}/collections/{COLLECTION}/private-oram/recovery"
+    pause_file.write_text("pause")
+    log_path = pathlib.Path(init_pytest_log_folder()) / "private_oram_peer_0.log"
+    pause_marker = "Private ORAM staging external recovery archive-preflight pause reached"
+    with ThreadPoolExecutor(max_workers=2) as requests_in_flight:
+        try:
+            verify = requests_in_flight.submit(
+                requests.post,
+                f"{recovery_url}/verify",
+                json={"operation_token": operation_token},
+                timeout=30,
+            )
+            wait_for(
+                lambda: log_path.exists() and pause_marker in log_path.read_text(),
+                wait_for_timeout=10,
+            )
+            status = requests_in_flight.submit(
+                requests.get,
+                f"{recovery_url}/status",
+                headers={"x-qdrant-private-oram-recovery-token": operation_token},
+                timeout=30,
+            )
+            time.sleep(0.25)
+            assert not status.done(), "status must wait for the held verification flock"
+            ready = requests.get(f"{owner_url}/readyz", timeout=3)
+            assert_http_ok(ready)
+        finally:
+            pause_file.unlink(missing_ok=True)
+
+        verified = verify.result(timeout=10)
+        observed = status.result(timeout=10)
+        assert_http_ok(verified)
+        assert_http_ok(observed)
+        assert verified.json()["result"]["phase"] == "verified"
+        assert observed.json()["result"]["phase"] == "verified"
+        assert_http_ok(requests.get(f"{owner_url}/readyz", timeout=3))
+
+
 def test_private_oram_external_restore_worker_limit_is_process_wide(
     tmp_path: pathlib.Path,
 ):
