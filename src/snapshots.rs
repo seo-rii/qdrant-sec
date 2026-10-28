@@ -156,10 +156,17 @@ pub fn recover_full_snapshot(
     settings: &Settings,
 ) -> Result<Vec<String>, String> {
     let snapshot_temp = snapshot_recovery_temp_dir(temp_dir, storage_dir, "full-snapshot-")?;
-    let snapshot_temp_path = snapshot_temp.path();
+    // TempDir makes its path absolute. Preserve the caller's path form when creating CLI
+    // mappings: a newly introduced Windows drive colon would be parsed as a separator.
+    // The helper creates one named child directly below the requested base.
+    let snapshot_temp_name = snapshot_temp
+        .path()
+        .file_name()
+        .ok_or_else(|| "Snapshot recovery work directory name is missing".to_string())?;
+    let snapshot_temp_path = temp_dir.unwrap_or(storage_dir).join(snapshot_temp_name);
 
     // Un-tar snapshot into temporary directory
-    tar_unpack_file(Path::new(snapshot_path), snapshot_temp_path)
+    tar_unpack_file(Path::new(snapshot_path), &snapshot_temp_path)
         .map_err(|err| format!("Failed to unpack full snapshot {snapshot_path}: {err}"))?;
 
     // Read configuration file with snapshot-to-collection mapping
@@ -409,6 +416,18 @@ mod tests {
         vec![format!("{}:{collection}", snapshot.display())]
     }
 
+    fn cli_snapshot_test_root() -> (TempDir, PathBuf) {
+        let owner = tempfile::Builder::new()
+            .prefix("cli-recovery-test-")
+            .tempdir_in(".")
+            .unwrap();
+        // Keep an absolute RAII owner but pass relative paths to the existing CLI parser,
+        // whose path:collection syntax does not support Windows absolute drive paths.
+        let root = PathBuf::from(owner.path().file_name().unwrap());
+        assert!(root.is_relative());
+        (owner, root)
+    }
+
     fn directory_entries(path: &Path) -> Vec<PathBuf> {
         let mut entries = fs::read_dir(path)
             .unwrap()
@@ -420,14 +439,14 @@ mod tests {
 
     #[test]
     fn cli_snapshot_recovery_preserves_shared_temp_and_creates_collection_parent() {
-        let root = TempDir::new().unwrap();
-        let snapshot = root.path().join("plain.snapshot");
+        let (_owner, root) = cli_snapshot_test_root();
+        let snapshot = root.join("plain.snapshot");
         write_cli_plain_snapshot(&snapshot, b"restored collection");
-        let temp_base = root.path().join("shared-temp");
+        let temp_base = root.join("shared-temp");
         fs::create_dir(&temp_base).unwrap();
         let unrelated = temp_base.join("unrelated-working-file");
         fs::write(&unrelated, b"keep this file in place").unwrap();
-        let storage = root.path().join("new-storage");
+        let storage = root.join("new-storage");
 
         assert_eq!(
             recover_snapshots(
@@ -459,16 +478,16 @@ mod tests {
 
     #[test]
     fn cli_snapshot_recovery_failure_preserves_shared_temp_and_existing_collection() {
-        let root = TempDir::new().unwrap();
-        let snapshot = root.path().join("plain.snapshot");
+        let (_owner, root) = cli_snapshot_test_root();
+        let snapshot = root.join("plain.snapshot");
         write_cli_plain_snapshot(&snapshot, b"new collection");
-        let broken_snapshot = root.path().join("broken.snapshot");
+        let broken_snapshot = root.join("broken.snapshot");
         fs::write(&broken_snapshot, b"incomplete archive").unwrap();
-        let temp_base = root.path().join("shared-temp");
+        let temp_base = root.join("shared-temp");
         fs::create_dir(&temp_base).unwrap();
         let unrelated = temp_base.join("unrelated-working-file");
         fs::write(&unrelated, b"keep this file in place").unwrap();
-        let storage = root.path().join("storage");
+        let storage = root.join("storage");
         let restored = storage.join(COLLECTIONS_DIR).join("restored");
         fs::create_dir_all(&restored).unwrap();
         let old_content = restored.join("old-content.txt");
@@ -512,17 +531,19 @@ mod tests {
     #[test]
     fn cli_full_snapshot_recovery_isolates_outer_and_collection_work_directories() {
         for custom_temp in [false, true] {
-            let root = TempDir::new().unwrap();
-            let storage = root.path().join("new-storage");
-            let temp_base = root.path().join("shared-temp");
+            let (_owner, root) = cli_snapshot_test_root();
+            let storage = root.join("new-storage");
+            let temp_base = root.join("shared-temp");
+            assert!(storage.is_relative());
+            assert!(temp_base.is_relative());
             fs::create_dir(&temp_base).unwrap();
             let unrelated = temp_base.join("unrelated-working-file");
             fs::write(&unrelated, b"keep this file in place").unwrap();
-            let docs = root.path().join("docs.snapshot");
-            let notes = root.path().join("notes.snapshot");
+            let docs = root.join("docs.snapshot");
+            let notes = root.join("notes.snapshot");
             write_cli_plain_snapshot(&docs, b"docs collection");
             write_cli_plain_snapshot(&notes, b"notes collection");
-            let full_snapshot = root.path().join("full.snapshot");
+            let full_snapshot = root.join("full.snapshot");
             let config = serde_json::to_vec(&SnapshotConfig {
                 collections_mapping: HashMap::from([
                     ("docs".to_string(), "docs.snapshot".to_string()),
