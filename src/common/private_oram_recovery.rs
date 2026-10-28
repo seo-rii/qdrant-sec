@@ -64,7 +64,8 @@ use storage::content_manager::snapshots::recover::{
     SnapshotConfigValidator, verify_private_oram_external_recovery_snapshot,
 };
 use storage::content_manager::toc::{
-    PrivateOramExternalRecoveryCollectionInstallGuard, TableOfContent,
+    PrivateOramExternalRecoveryCollectionInstallGuard, PrivateOramExternalRecoveryReservation,
+    TableOfContent,
 };
 use storage::dispatcher::Dispatcher;
 use storage::rbac::{Access, AccessRequirements};
@@ -203,6 +204,95 @@ async fn acquire_private_oram_external_recovery_execution(
         }
     };
     Ok(execution.lock_owned().await)
+}
+
+// A verification/install transaction keeps its collection flock across async waits. Every
+// competing staging operation must wait in the blocking pool, never on the REST worker that
+// must poll the transaction's continuation and eventually release that flock.
+async fn private_oram_external_recovery_io<T: Send + 'static>(
+    operation: impl FnOnce() -> StorageResult<T> + Send + 'static,
+) -> StorageResult<T> {
+    tokio::task::spawn_blocking(operation).await.map_err(|_| {
+        StorageError::service_error("private ORAM external recovery storage task failed")
+    })?
+}
+
+struct PrivateOramExternalRecoveryIoWorker {
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl PrivateOramExternalRecoveryIoWorker {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            permit: Arc::new(permit),
+        }
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> StorageResult<T> + Send + 'static,
+    ) -> StorageResult<T> {
+        let permit = Arc::clone(&self.permit);
+        private_oram_external_recovery_io(move || {
+            // Dropping a request does not stop spawn_blocking. Keep its worker reservation
+            // until the actual filesystem operation has completed, including error paths.
+            let _permit = permit;
+            operation()
+        })
+        .await
+    }
+
+    async fn update_install(
+        &self,
+        mut transaction: PrivateOramExternalRecoveryInstallTransaction,
+        operation: impl FnOnce(&mut PrivateOramExternalRecoveryInstallTransaction) -> StorageResult<()>
+        + Send
+        + 'static,
+    ) -> StorageResult<(
+        PrivateOramExternalRecoveryInstallTransaction,
+        StorageResult<()>,
+    )> {
+        self.run(move || {
+            let result = operation(&mut transaction);
+            Ok((transaction, result))
+        })
+        .await
+    }
+
+    async fn cancel_prepared_install(
+        &self,
+        staging: &PrivateOramExternalRecoveryStaging,
+        collection_name: &str,
+        lease: &PrivateOramExternalRecoveryLease,
+    ) -> StorageResult<()> {
+        let staging = staging.clone();
+        let collection_name = collection_name.to_string();
+        let lease = lease.clone();
+        self.run(move || staging.cancel_prepared_install_if_present(&collection_name, &lease))
+            .await
+    }
+}
+
+struct PrivateOramExternalRecoveryStartedStaging {
+    staging: PrivateOramExternalRecoveryStaging,
+    reservation: Option<PrivateOramExternalRecoveryReservation>,
+}
+
+impl Drop for PrivateOramExternalRecoveryStartedStaging {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let staging = self.staging.clone();
+        // A completed JoinHandle can be dropped by the REST worker when its request is
+        // cancelled. Cleanup may itself wait for the file lock, so it must also stay off
+        // that worker. The cleanup task owns the reservation until its files are removed.
+        let _cleanup = tokio::task::spawn_blocking(move || {
+            if staging.abort().is_err() {
+                reservation.persist();
+            }
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1356,12 +1446,26 @@ pub async fn do_begin_private_oram_external_recovery(
         &context.collection_id,
         &operation_id_hash,
     )?;
-    staging.begin_with_limits(
-        &checkpoint_digest,
-        checkpoint_bundle,
-        lease_expires_at_unix,
-        toc.private_oram_external_recovery_limits(),
-    )?;
+    let resource_limits = toc.private_oram_external_recovery_limits().clone();
+    let begin_staging = staging.clone();
+    let begin_checkpoint_digest = checkpoint_digest.clone();
+    let mut started = private_oram_external_recovery_io(move || {
+        begin_staging.begin_with_limits(
+            &begin_checkpoint_digest,
+            checkpoint_bundle,
+            lease_expires_at_unix,
+            &resource_limits,
+        )?;
+        Ok(PrivateOramExternalRecoveryStartedStaging {
+            staging: begin_staging,
+            reservation: Some(reservation),
+        })
+    })
+    .await?;
+    let reservation = started
+        .reservation
+        .take()
+        .expect("new staging owns its resource reservation");
 
     let operation = recovery_operation(
         PrivateOramExternalRecoveryPhase::Begin,
@@ -1376,9 +1480,14 @@ pub async fn do_begin_private_oram_external_recovery(
     {
         let observed = dispatcher.private_oram_consensus_external_recovery(&key)?;
         if observed.as_ref() != Some(&desired) {
-            if staging.abort().is_err() {
-                reservation.persist();
-            }
+            let abort_staging = staging.clone();
+            private_oram_external_recovery_io(move || {
+                if abort_staging.abort().is_err() {
+                    reservation.persist();
+                }
+                Ok(())
+            })
+            .await?;
             return Err(error);
         }
     }
@@ -1388,11 +1497,14 @@ pub async fn do_begin_private_oram_external_recovery(
         .as_ref()
         .ok_or_else(invalid_external_recovery_state)?
         .backup_generation;
-    let status = staging.status_for_consensus_lease(
-        &checkpoint_digest,
-        backup_generation,
-        lease_expires_at_unix,
-    )?;
+    let status = private_oram_external_recovery_io(move || {
+        staging.status_for_consensus_lease(
+            &checkpoint_digest,
+            backup_generation,
+            lease_expires_at_unix,
+        )
+    })
+    .await?;
     Ok(PrivateOramExternalRecoveryBeginResponse {
         operation_token,
         status,
@@ -1441,12 +1553,15 @@ pub async fn do_upload_private_oram_external_recovery_chunk(
     .await?;
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(auth, &pass);
-    let status = active.staging.append_chunk_with_limits(
-        chunk.chunk_index,
-        chunk.path,
-        chunk.sha256,
-        toc.private_oram_external_recovery_limits(),
-    )?;
+    let staging = active.staging;
+    let chunk_index = chunk.chunk_index;
+    let chunk_path = chunk.path.to_path_buf();
+    let chunk_sha256 = chunk.sha256.to_string();
+    let resource_limits = toc.private_oram_external_recovery_limits().clone();
+    let status = private_oram_external_recovery_io(move || {
+        staging.append_chunk_with_limits(chunk_index, &chunk_path, &chunk_sha256, &resource_limits)
+    })
+    .await?;
     ensure_active_recovery_unchanged(dispatcher, &active.key, &active.lease)?;
     Ok(status)
 }
@@ -1464,7 +1579,9 @@ pub async fn do_verify_private_oram_external_recovery(
     )?;
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(auth, &pass);
-    let _resource_worker = toc.try_acquire_private_oram_external_recovery_worker()?;
+    let io = PrivateOramExternalRecoveryIoWorker::new(
+        toc.try_acquire_private_oram_external_recovery_worker()?,
+    );
     let active = resolve_active_private_oram_external_recovery(
         dispatcher,
         auth,
@@ -1479,13 +1596,9 @@ pub async fn do_verify_private_oram_external_recovery(
     private_oram_external_recovery_pause_after_worker_acquire().await;
     let staging = active.staging.clone();
     let resource_limits = toc.private_oram_external_recovery_limits().clone();
-    let (verification, archive_resources) = tokio::task::spawn_blocking(move || {
-        staging.prepare_verification_with_limits(&resource_limits)
-    })
-    .await
-    .map_err(|_| {
-        StorageError::service_error("private ORAM external recovery prepare task failed")
-    })??;
+    let (verification, archive_resources) = io
+        .run(move || staging.prepare_verification_with_limits(&resource_limits))
+        .await?;
     toc.record_private_oram_external_recovery_archive_scan(archive_resources);
     let checkpoint_bundle = verification.checkpoint_bundle();
     let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(checkpoint_bundle)?;
@@ -1505,24 +1618,24 @@ pub async fn do_verify_private_oram_external_recovery(
     let existing_config = active.context.config.clone();
     let this_peer_id = active.context.this_peer_id;
     let recovery_mode = settings.storage.recovery_mode.clone();
-    let verification = tokio::task::spawn_blocking(move || {
-        verify_private_oram_external_recovery_snapshot(
-            &collection_name,
-            &verification,
-            this_peer_id,
-            &existing_config,
-            recovery_mode.as_deref(),
-            Some(&validator),
-        )?;
-        Ok::<_, StorageError>(verification)
-    })
-    .await
-    .map_err(|_| {
-        StorageError::service_error("private ORAM external recovery verify task failed")
-    })??;
+    let verification = io
+        .run(move || {
+            verify_private_oram_external_recovery_snapshot(
+                &collection_name,
+                &verification,
+                this_peer_id,
+                &existing_config,
+                recovery_mode.as_deref(),
+                Some(&validator),
+            )?;
+            Ok(verification)
+        })
+        .await?;
 
     ensure_private_oram_owner_readiness_unchanged(dispatcher, &active.context)?;
-    let status = active.staging.mark_verified(verification)?;
+    let status = io
+        .run(move || active.staging.mark_verified(verification))
+        .await?;
     ensure_active_recovery_unchanged(dispatcher, &active.key, &active.lease)?;
     private_oram_external_recovery_crash_at("verified");
     Ok(status)
@@ -1556,13 +1669,18 @@ pub async fn do_commit_private_oram_external_recovery(
         .ok_or_else(invalid_external_recovery_state)?;
     let pass = new_unchecked_verification_pass();
     let toc = dispatcher.toc(auth, &pass);
-    let _resource_worker = toc.try_acquire_private_oram_external_recovery_worker()?;
+    let io = PrivateOramExternalRecoveryIoWorker::new(
+        toc.try_acquire_private_oram_external_recovery_worker()?,
+    );
     let staging = PrivateOramExternalRecoveryStaging::new(
         toc.storage_path(),
         &context.collection_id,
         &operation_id_hash,
     )?;
-    staging.ensure_install_free_space(toc.private_oram_external_recovery_limits())?;
+    let space_staging = staging.clone();
+    let resource_limits = toc.private_oram_external_recovery_limits().clone();
+    io.run(move || space_staging.ensure_install_free_space(&resource_limits))
+        .await?;
     if state.active_lease.is_none() {
         let backup_generation = state.committed_backup_generation;
         let checkpoint_digest = state
@@ -1573,7 +1691,12 @@ pub async fn do_commit_private_oram_external_recovery(
             .committed_install_intent_digest
             .as_deref()
             .ok_or_else(invalid_external_recovery_state)?;
-        let mut transaction = staging.resume_committed_install(collection_name, &state)?;
+        let resume_staging = staging.clone();
+        let resume_name = collection_name.to_string();
+        let resume_state = state.clone();
+        let mut transaction = io
+            .run(move || resume_staging.resume_committed_install(&resume_name, &resume_state))
+            .await?;
         let install_guard = toc
             .acquire_committed_private_oram_external_recovery_install_guard(
                 collection_name,
@@ -1586,7 +1709,14 @@ pub async fn do_commit_private_oram_external_recovery(
             .await?;
         install_guard.unload_current_collection().await?;
         if transaction.phase() == PrivateOramExternalRecoveryInstallPhase::Loaded {
-            transaction.mark_consensus_committed()?;
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::mark_consensus_committed,
+                )
+                .await?;
+            transaction = updated;
+            result?;
         } else if transaction.phase() != PrivateOramExternalRecoveryInstallPhase::ConsensusCommitted
         {
             return Err(invalid_external_recovery_state());
@@ -1598,7 +1728,7 @@ pub async fn do_commit_private_oram_external_recovery(
             loaded.stop_gracefully().await;
             return Err(error);
         }
-        if let Err(error) = transaction.finalize_committed() {
+        if let Err(error) = io.run(move || transaction.finalize_committed()).await {
             loaded.stop_gracefully().await;
             return Err(error);
         }
@@ -1627,11 +1757,17 @@ pub async fn do_commit_private_oram_external_recovery(
         validate_active_lease(&lease, context.this_peer_id, &operation_id_hash, None)?;
     }
 
-    let (status, checkpoint_bundle) = staging.status_and_checkpoint_bundle_for_consensus_lease(
-        &lease.checkpoint_digest,
-        lease.backup_generation,
-        lease.expires_at_unix,
-    )?;
+    let status_staging = staging.clone();
+    let status_lease = lease.clone();
+    let (status, checkpoint_bundle) = io
+        .run(move || {
+            status_staging.status_and_checkpoint_bundle_for_consensus_lease(
+                &status_lease.checkpoint_digest,
+                status_lease.backup_generation,
+                status_lease.expires_at_unix,
+            )
+        })
+        .await?;
     if status.phase != PrivateOramExternalRecoveryStagingPhase::Verified {
         return Err(invalid_external_recovery_state());
     }
@@ -1650,12 +1786,23 @@ pub async fn do_commit_private_oram_external_recovery(
         )
         .await?;
     install_guard.unload_current_collection().await?;
-    let mut transaction = match staging.prepare_install(collection_name, &lease) {
+    let prepare_staging = staging.clone();
+    let prepare_name = collection_name.to_string();
+    let prepare_lease = lease.clone();
+    let mut transaction = match io
+        .run(move || prepare_staging.prepare_install(&prepare_name, &prepare_lease))
+        .await
+    {
         Ok(transaction) => transaction,
         Err(error) => {
-            if lease.phase == PrivateOramExternalRecoveryLeasePhase::Staging
-                && !staging.install_marker_is_present()?
-            {
+            let restore_live = if lease.phase == PrivateOramExternalRecoveryLeasePhase::Staging {
+                let marker_staging = staging.clone();
+                !io.run(move || marker_staging.install_marker_is_present())
+                    .await?
+            } else {
+                false
+            };
+            if restore_live {
                 let collection = install_guard.load_live_collection_strict().await?;
                 if let Err(validation_error) =
                     validate_loaded_private_oram_recovery_collection(&collection, &context).await
@@ -1675,7 +1822,7 @@ pub async fn do_commit_private_oram_external_recovery(
                 | PrivateOramExternalRecoveryInstallPhase::RollbackComplete
         )
     {
-        transaction.finalize_rolled_back()?;
+        io.run(move || transaction.finalize_rolled_back()).await?;
         let collection = install_guard.load_live_collection_strict().await?;
         if let Err(error) =
             validate_loaded_private_oram_recovery_collection(&collection, &context).await
@@ -1697,7 +1844,8 @@ pub async fn do_commit_private_oram_external_recovery(
         }
         if let Err(error) = ensure_private_oram_owner_readiness_unchanged(dispatcher, &context) {
             drop(transaction);
-            staging.cancel_prepared_install_if_present(collection_name, &lease)?;
+            io.cancel_prepared_install(&staging, collection_name, &lease)
+                .await?;
             let collection = install_guard.load_live_collection_strict().await?;
             if let Err(validation_error) =
                 validate_loaded_private_oram_recovery_collection(&collection, &context).await
@@ -1738,7 +1886,8 @@ pub async fn do_commit_private_oram_external_recovery(
                 .err()
                 .unwrap_or_else(invalid_external_recovery_state);
             drop(transaction);
-            staging.cancel_prepared_install_if_present(collection_name, &lease)?;
+            io.cancel_prepared_install(&staging, collection_name, &lease)
+                .await?;
             let collection = install_guard.load_live_collection_strict().await?;
             if let Err(error) =
                 validate_loaded_private_oram_recovery_collection(&collection, &context).await
@@ -1767,8 +1916,16 @@ pub async fn do_commit_private_oram_external_recovery(
 
     match transaction.phase() {
         PrivateOramExternalRecoveryInstallPhase::Prepared => {
-            if let Err(error) = transaction.move_live_to_backup() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::move_live_to_backup,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1782,8 +1939,16 @@ pub async fn do_commit_private_oram_external_recovery(
                 return Err(error);
             }
             private_oram_external_recovery_crash_at("old_moved");
-            if let Err(error) = transaction.promote_verified_collection() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::promote_verified_collection,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1797,8 +1962,16 @@ pub async fn do_commit_private_oram_external_recovery(
                 return Err(error);
             }
             private_oram_external_recovery_crash_at("new_promoted");
-            if let Err(error) = transaction.mark_load_in_progress() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::mark_load_in_progress,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1814,8 +1987,16 @@ pub async fn do_commit_private_oram_external_recovery(
             private_oram_external_recovery_crash_at("load_in_progress");
         }
         PrivateOramExternalRecoveryInstallPhase::OldMoved => {
-            if let Err(error) = transaction.promote_verified_collection() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::promote_verified_collection,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1829,8 +2010,16 @@ pub async fn do_commit_private_oram_external_recovery(
                 return Err(error);
             }
             private_oram_external_recovery_crash_at("new_promoted");
-            if let Err(error) = transaction.mark_load_in_progress() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::mark_load_in_progress,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1846,8 +2035,16 @@ pub async fn do_commit_private_oram_external_recovery(
             private_oram_external_recovery_crash_at("load_in_progress");
         }
         PrivateOramExternalRecoveryInstallPhase::NewPromoted => {
-            if let Err(error) = transaction.mark_load_in_progress() {
+            let (updated, result) = io
+                .update_install(
+                    transaction,
+                    PrivateOramExternalRecoveryInstallTransaction::mark_load_in_progress,
+                )
+                .await?;
+            transaction = updated;
+            if let Err(error) = result {
                 rollback_installing_private_oram_recovery(
+                    &io,
                     dispatcher,
                     &context,
                     collection_name,
@@ -1867,6 +2064,7 @@ pub async fn do_commit_private_oram_external_recovery(
         PrivateOramExternalRecoveryInstallPhase::RollbackInProgress
         | PrivateOramExternalRecoveryInstallPhase::RollbackComplete => {
             rollback_installing_private_oram_recovery(
+                &io,
                 dispatcher,
                 &context,
                 collection_name,
@@ -1888,6 +2086,7 @@ pub async fn do_commit_private_oram_external_recovery(
             if transaction.phase() == PrivateOramExternalRecoveryInstallPhase::LoadInProgress =>
         {
             rollback_installing_private_oram_recovery(
+                &io,
                 dispatcher,
                 &context,
                 collection_name,
@@ -1906,6 +2105,7 @@ pub async fn do_commit_private_oram_external_recovery(
         loaded.stop_gracefully().await;
         if transaction.phase() == PrivateOramExternalRecoveryInstallPhase::LoadInProgress {
             rollback_installing_private_oram_recovery(
+                &io,
                 dispatcher,
                 &context,
                 collection_name,
@@ -1919,22 +2119,30 @@ pub async fn do_commit_private_oram_external_recovery(
         }
         return Err(error);
     }
-    if transaction.phase() == PrivateOramExternalRecoveryInstallPhase::LoadInProgress
-        && let Err(error) = transaction.mark_ready_to_commit()
-    {
-        loaded.stop_gracefully().await;
-        rollback_installing_private_oram_recovery(
-            dispatcher,
-            &context,
-            collection_name,
-            &key,
-            &state,
-            &staging,
-            &install_guard,
-            transaction,
-        )
-        .await?;
-        return Err(error);
+    if transaction.phase() == PrivateOramExternalRecoveryInstallPhase::LoadInProgress {
+        let (updated, result) = io
+            .update_install(
+                transaction,
+                PrivateOramExternalRecoveryInstallTransaction::mark_ready_to_commit,
+            )
+            .await?;
+        transaction = updated;
+        if let Err(error) = result {
+            loaded.stop_gracefully().await;
+            rollback_installing_private_oram_recovery(
+                &io,
+                dispatcher,
+                &context,
+                collection_name,
+                &key,
+                &state,
+                &staging,
+                &install_guard,
+                transaction,
+            )
+            .await?;
+            return Err(error);
+        }
     }
     private_oram_external_recovery_crash_at("loaded");
     if let Err(error) = validate_loaded_private_oram_recovery_collection(&loaded, &context).await {
@@ -1974,12 +2182,19 @@ pub async fn do_commit_private_oram_external_recovery(
     }
     private_oram_external_recovery_crash_at("post_consensus");
 
-    if let Err(error) = transaction.mark_consensus_committed() {
+    let (updated, result) = io
+        .update_install(
+            transaction,
+            PrivateOramExternalRecoveryInstallTransaction::mark_consensus_committed,
+        )
+        .await?;
+    transaction = updated;
+    if let Err(error) = result {
         loaded.stop_gracefully().await;
         return Err(error);
     }
     private_oram_external_recovery_crash_at("pre_finalize");
-    if let Err(error) = transaction.finalize_committed() {
+    if let Err(error) = io.run(move || transaction.finalize_committed()).await {
         loaded.stop_gracefully().await;
         return Err(error);
     }
@@ -2027,12 +2242,12 @@ pub async fn do_abort_private_oram_external_recovery(
         &operation_id_hash,
     )?;
     let Some(expected) = dispatcher.private_oram_consensus_external_recovery(&key)? else {
-        abort_staging_idempotent(&staging)?;
+        abort_staging_idempotent(&staging).await?;
         toc.release_private_oram_external_recovery(&operation_id_hash);
         return Ok(true);
     };
     let Some(lease) = expected.active_lease.as_ref() else {
-        abort_staging_idempotent(&staging)?;
+        abort_staging_idempotent(&staging).await?;
         toc.release_private_oram_external_recovery(&operation_id_hash);
         return Ok(true);
     };
@@ -2040,7 +2255,13 @@ pub async fn do_abort_private_oram_external_recovery(
     if lease.phase != PrivateOramExternalRecoveryLeasePhase::Staging {
         return Err(invalid_external_recovery_state());
     }
-    staging.cancel_prepared_install_if_present(collection_name, lease)?;
+    let cancel_staging = staging.clone();
+    let cancel_name = collection_name.to_string();
+    let cancel_lease = lease.clone();
+    private_oram_external_recovery_io(move || {
+        cancel_staging.cancel_prepared_install_if_present(&cancel_name, &cancel_lease)
+    })
+    .await?;
 
     let new = if expected.committed_backup_generation == 0 {
         None
@@ -2066,12 +2287,13 @@ pub async fn do_abort_private_oram_external_recovery(
     {
         return Err(error);
     }
-    abort_staging_idempotent(&staging)?;
+    abort_staging_idempotent(&staging).await?;
     toc.release_private_oram_external_recovery(&operation_id_hash);
     Ok(true)
 }
 
 async fn rollback_installing_private_oram_recovery(
+    io: &PrivateOramExternalRecoveryIoWorker,
     dispatcher: &Dispatcher,
     context: &PrivateOramExternalRecoveryContext,
     collection_name: &str,
@@ -2081,7 +2303,7 @@ async fn rollback_installing_private_oram_recovery(
     install_guard: &PrivateOramExternalRecoveryCollectionInstallGuard<'_>,
     transaction: PrivateOramExternalRecoveryInstallTransaction,
 ) -> StorageResult<()> {
-    transaction.rollback_uncommitted()?;
+    io.run(move || transaction.rollback_uncommitted()).await?;
     let installing_lease = installing_state
         .active_lease
         .as_ref()
@@ -2111,7 +2333,8 @@ async fn rollback_installing_private_oram_recovery(
             .err()
             .unwrap_or_else(invalid_external_recovery_state));
     }
-    staging.cancel_prepared_install_if_present(collection_name, &staging_lease)?;
+    io.cancel_prepared_install(staging, collection_name, &staging_lease)
+        .await?;
     let collection = install_guard.load_live_collection_strict().await?;
     if let Err(error) = validate_loaded_private_oram_recovery_collection(&collection, context).await
     {
@@ -2321,11 +2544,16 @@ async fn resolve_active_private_oram_external_recovery(
         &context.collection_id,
         &operation_id_hash,
     )?;
-    let status = staging.status_for_consensus_lease(
-        &lease.checkpoint_digest,
-        lease.backup_generation,
-        lease.expires_at_unix,
-    )?;
+    let status_staging = staging.clone();
+    let status_lease = lease.clone();
+    let status = private_oram_external_recovery_io(move || {
+        status_staging.status_for_consensus_lease(
+            &status_lease.checkpoint_digest,
+            status_lease.backup_generation,
+            status_lease.expires_at_unix,
+        )
+    })
+    .await?;
     Ok(ActivePrivateOramExternalRecovery {
         context,
         key,
@@ -2915,11 +3143,15 @@ fn ensure_active_recovery_unchanged(
     )
 }
 
-fn abort_staging_idempotent(staging: &PrivateOramExternalRecoveryStaging) -> StorageResult<()> {
-    match staging.abort() {
+async fn abort_staging_idempotent(
+    staging: &PrivateOramExternalRecoveryStaging,
+) -> StorageResult<()> {
+    let staging = staging.clone();
+    private_oram_external_recovery_io(move || match staging.abort() {
         Ok(()) | Err(StorageError::NotFound { .. }) => Ok(()),
         Err(error) => Err(error),
-    }
+    })
+    .await
 }
 
 fn current_unix_secs() -> StorageResult<u64> {
@@ -2940,6 +3172,35 @@ fn invalid_external_recovery_state() -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_worker_reservation_outlives_a_cancelled_request() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let io = PrivateOramExternalRecoveryIoWorker::new(
+            Arc::clone(&permits).try_acquire_owned().unwrap(),
+        );
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let request = tokio::spawn(async move {
+            io.run(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        running.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(permits.available_permits(), 0);
+
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), permits.acquire())
+            .await
+            .expect("finishing the blocking operation must release the worker reservation")
+            .unwrap();
+        drop(permit);
+    }
 
     #[tokio::test]
     async fn mutation_execution_serializes_only_the_same_collection() {
