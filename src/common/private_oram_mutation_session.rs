@@ -710,6 +710,12 @@ struct PrivateOramMutationCleanupClaimBindingV2 {
     cleanup_evidence_digest: String,
 }
 
+struct PrivateOramMutationRuntimeHistoryV2 {
+    authority: PrivateOramMutationRuntimeAuthorityV2,
+    saw_job: bool,
+    cleanup_tombstone: Option<PrivateOramMutationCleanupClaimBindingV2>,
+}
+
 #[derive(Default)]
 struct PrivateOramMutationSessionRegistryV2 {
     sessions: HashMap<String, PrivateOramMutationSessionV2>,
@@ -718,12 +724,77 @@ struct PrivateOramMutationSessionRegistryV2 {
     append_jobs: HashMap<String, Arc<PrivateOramMutationAppendJobV2>>,
     cleanup_claimed_collections: HashSet<String>,
     cleanup_claims: HashMap<String, PrivateOramMutationCleanupClaimBindingV2>,
-    seen_job_authorities: HashSet<PrivateOramMutationRuntimeAuthorityV2>,
-    cleanup_tombstones:
-        HashMap<PrivateOramMutationRuntimeAuthorityV2, PrivateOramMutationCleanupClaimBindingV2>,
+    // Keep the latest generation even after cleanup so an old claim can never be
+    // mistaken for restart absence after its exact tombstone has been superseded.
+    runtime_history: HashMap<String, PrivateOramMutationRuntimeHistoryV2>,
 }
 
 impl PrivateOramMutationSessionRegistryV2 {
+    fn runtime_history_for(
+        &self,
+        authority: &PrivateOramMutationRuntimeAuthorityV2,
+    ) -> StorageResult<Option<&PrivateOramMutationRuntimeHistoryV2>> {
+        let Some(history) = self.runtime_history.get(&authority.collection_id) else {
+            return Ok(None);
+        };
+        if history.authority.generation > authority.generation
+            || (history.authority.generation == authority.generation
+                && history.authority != *authority)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM mutation runtime authority is stale or changed",
+            ));
+        }
+        Ok((history.authority.generation == authority.generation).then_some(history))
+    }
+
+    // Only call after validating the new job against its consensus lease slot. A
+    // session opening or an append reservation alone must not advance this watermark.
+    fn remember_job_authority(
+        &mut self,
+        authority: PrivateOramMutationRuntimeAuthorityV2,
+    ) -> StorageResult<()> {
+        if self.runtime_history_for(&authority)?.is_some() {
+            return Err(StorageError::service_error(
+                "private ORAM mutation runtime job authority was already observed",
+            ));
+        }
+        self.runtime_history.insert(
+            authority.collection_id.clone(),
+            PrivateOramMutationRuntimeHistoryV2 {
+                authority,
+                saw_job: true,
+                cleanup_tombstone: None,
+            },
+        );
+        Ok(())
+    }
+
+    // A typed cleanup permit is the other authority that can advance the latest
+    // generation after a restart. Preserve exact replay until a later generation
+    // reaches this method or installs its validated job.
+    fn remember_completed_cleanup(
+        &mut self,
+        claim: &PrivateOramMutationCleanupClaimBindingV2,
+    ) -> StorageResult<()> {
+        let history = self.runtime_history_for(&claim.authority)?;
+        if history.is_some_and(|history| history.cleanup_tombstone.is_some()) {
+            return Err(StorageError::service_error(
+                "private ORAM mutation cleanup tombstone changed concurrently",
+            ));
+        }
+        let saw_job = history.is_some_and(|history| history.saw_job);
+        self.runtime_history.insert(
+            claim.authority.collection_id.clone(),
+            PrivateOramMutationRuntimeHistoryV2 {
+                authority: claim.authority.clone(),
+                saw_job,
+                cleanup_tombstone: Some(claim.clone()),
+            },
+        );
+        Ok(())
+    }
+
     fn reserve_open(&mut self, collection_id: &str, _now_unix: u64) -> StorageResult<()> {
         if self.sessions.len() >= PRIVATE_ORAM_MUTATION_MAX_SESSION_COUNT {
             return Err(StorageError::bad_request(
@@ -982,10 +1053,10 @@ impl PrivateOramMutationAppendReservationV2 {
         }
 
         let runtime_authority = private_oram_mutation_job_authority_v2(&job)?;
+        registry.remember_job_authority(runtime_authority)?;
         registry
             .append_jobs
             .insert(job.binding.job_key.clone(), Arc::clone(&job));
-        registry.seen_job_authorities.insert(runtime_authority);
         let session = registry
             .sessions
             .get_mut(&self.session_id)
@@ -2043,7 +2114,8 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
         let mut registry = session_registry().lock().map_err(|_| {
             StorageError::service_error("private ORAM mutation session registry poisoned")
         })?;
-        if let Some(existing) = registry.cleanup_tombstones.get(authority) {
+        let history = registry.runtime_history_for(authority)?;
+        if let Some(existing) = history.and_then(|history| history.cleanup_tombstone.as_ref()) {
             if existing != &claim {
                 return Err(StorageError::service_error(
                     "private ORAM mutation cleanup tombstone binding changed",
@@ -2077,7 +2149,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             .collect::<Vec<_>>();
         match matching.as_slice() {
             [] => {
-                if registry.seen_job_authorities.contains(authority) {
+                if history.is_some_and(|history| history.saw_job) {
                     return Err(StorageError::service_error(
                         "private ORAM mutation cleanup found an unexpectedly missing same-process job",
                     ));
@@ -2164,6 +2236,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
     let mut registry = session_registry().lock().map_err(|_| {
         StorageError::service_error("private ORAM mutation session registry poisoned")
     })?;
+    registry.runtime_history_for(authority)?;
     let matching_job = registry
         .append_jobs
         .iter()
@@ -2207,8 +2280,9 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             return Err(invalid_mutation_session());
         }
         registry.active_by_collection.remove(collection_id);
-    } else if registry.seen_job_authorities.contains(authority)
-        && !registry.cleanup_tombstones.contains_key(authority)
+    } else if registry
+        .runtime_history_for(authority)?
+        .is_some_and(|history| history.saw_job && history.cleanup_tombstone.is_none())
     {
         return Err(StorageError::service_error(
             "private ORAM mutation cleanup lost its claimed same-process job",
@@ -2234,15 +2308,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             "private ORAM mutation cleanup did not preserve exact negative presence",
         ));
     }
-    if registry
-        .cleanup_tombstones
-        .insert(authority.clone(), claim.clone())
-        .is_some()
-    {
-        return Err(StorageError::service_error(
-            "private ORAM mutation cleanup tombstone changed concurrently",
-        ));
-    }
+    registry.remember_completed_cleanup(&claim)?;
     registry.cleanup_claims.remove(collection_id);
     registry.cleanup_claimed_collections.remove(collection_id);
     Ok(PrivateOramMutationQuiescedCleanupV2 {
@@ -4771,6 +4837,24 @@ mod tests {
         BASE64URL_NOPAD.encode(&[fill; 32])
     }
 
+    fn runtime_cleanup_claim(
+        collection_id: &str,
+        generation: u64,
+    ) -> PrivateOramMutationCleanupClaimBindingV2 {
+        PrivateOramMutationCleanupClaimBindingV2 {
+            authority: PrivateOramMutationRuntimeAuthorityV2 {
+                collection_id: collection_id.to_string(),
+                mutation_id: test_digest((generation % 256) as u8),
+                owner_peer_id: 11,
+                generation,
+            },
+            descriptor_digest: test_digest(201),
+            terminal_record_digest: test_digest(202),
+            witness_digest: test_digest(203),
+            cleanup_evidence_digest: test_digest(204),
+        }
+    }
+
     fn external_recovery_state_fixture(
         committed_backup_generation: u64,
         active: bool,
@@ -5165,6 +5249,198 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn runtime_history_is_bounded_per_collection_across_generations() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let unrelated = runtime_cleanup_claim("retained-unrelated-collection", 7);
+        registry.remember_completed_cleanup(&unrelated).unwrap();
+
+        for generation in 1..=4_096 {
+            let claim = runtime_cleanup_claim("retained-long-lived-collection", generation);
+            registry
+                .remember_job_authority(claim.authority.clone())
+                .unwrap();
+            assert_eq!(registry.runtime_history.len(), 2);
+            assert!(
+                registry
+                    .runtime_history_for(&claim.authority)
+                    .unwrap()
+                    .unwrap()
+                    .cleanup_tombstone
+                    .is_none()
+            );
+            registry.remember_completed_cleanup(&claim).unwrap();
+            let history = registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .unwrap();
+            assert!(history.saw_job);
+            assert!(history.cleanup_tombstone.as_ref() == Some(&claim));
+            assert_eq!(registry.runtime_history.len(), 2);
+            assert!(
+                registry
+                    .runtime_history_for(&unrelated.authority)
+                    .unwrap()
+                    .unwrap()
+                    .cleanup_tombstone
+                    .as_ref()
+                    == Some(&unrelated)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_history_rejects_nonmonotonic_job_replacement() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let current = runtime_cleanup_claim("job-history-generation-collection", 2);
+        registry
+            .remember_job_authority(current.authority.clone())
+            .unwrap();
+        let older = runtime_cleanup_claim("job-history-generation-collection", 1);
+        let mut changed_mutation = current.authority.clone();
+        changed_mutation.mutation_id = test_digest(33);
+        let mut changed_owner = current.authority.clone();
+        changed_owner.owner_peer_id += 1;
+        for authority in [
+            older.authority,
+            changed_mutation,
+            changed_owner,
+            current.authority.clone(),
+        ] {
+            assert!(registry.remember_job_authority(authority).is_err());
+            assert_eq!(registry.runtime_history.len(), 1);
+            assert!(
+                registry
+                    .runtime_history_for(&current.authority)
+                    .unwrap()
+                    .unwrap()
+                    .saw_job
+            );
+        }
+        registry.remember_completed_cleanup(&current).unwrap();
+        assert!(
+            registry
+                .remember_job_authority(current.authority.clone())
+                .is_err()
+        );
+        let next = runtime_cleanup_claim("job-history-generation-collection", 3);
+        registry
+            .remember_job_authority(next.authority.clone())
+            .unwrap();
+        assert!(registry.runtime_history_for(&current.authority).is_err());
+        assert_eq!(registry.runtime_history.len(), 1);
+    }
+
+    #[test]
+    fn session_open_and_install_do_not_retire_completed_runtime_history() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let mut session = mutation_session_fixture(
+            "session-history-retention-collection",
+            "00000000-0000-4000-8000-000000000301",
+            PrivateOramServerReadEvidenceRecorderV1::new(),
+        );
+        let collection_id = session.response.collection_id.clone();
+        let claim = runtime_cleanup_claim(&collection_id, 1);
+        registry.remember_completed_cleanup(&claim).unwrap();
+        session.response.mutation_lease_generation = 2;
+        registry.reserve_open(&collection_id, 100).unwrap();
+        registry.release_open(&collection_id);
+        assert!(
+            registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .is_some()
+        );
+        registry.reserve_open(&collection_id, 100).unwrap();
+        registry.install(session).unwrap();
+        assert!(registry.reserve_open(&collection_id, 100).is_err());
+        assert!(
+            registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .unwrap()
+                .cleanup_tombstone
+                .as_ref()
+                == Some(&claim)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_history_rejects_pruned_generation_without_restart_absence() {
+        let collection_id = "cleanup-history-pruned-generation-collection";
+        let first = runtime_cleanup_claim(collection_id, 1);
+        let process_incarnation = "cleanup-history-process".to_string();
+        for _ in 0..2 {
+            let cleanup = complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                first.clone(),
+                process_incarnation.clone(),
+            )
+            .await
+            .unwrap();
+            cleanup
+                .validate_binding(&first, &process_incarnation)
+                .unwrap();
+        }
+        let next = runtime_cleanup_claim(collection_id, 2);
+        session_registry()
+            .lock()
+            .unwrap()
+            .remember_job_authority(next.authority.clone())
+            .unwrap();
+        for claim in [first.clone(), next.clone()] {
+            assert!(
+                complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                    claim,
+                    process_incarnation.clone(),
+                )
+                .await
+                .is_err(),
+                "an old claim or a lost same-process job must not become restart absence"
+            );
+        }
+
+        let restarted = runtime_cleanup_claim(collection_id, 3);
+        let cleanup = complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+            restarted.clone(),
+            process_incarnation.clone(),
+        )
+        .await
+        .unwrap();
+        cleanup
+            .validate_binding(&restarted, &process_incarnation)
+            .unwrap();
+        let mut changed_claim = restarted.clone();
+        changed_claim.witness_digest = test_digest(50);
+        let mut changed_mutation = restarted.clone();
+        changed_mutation.authority.mutation_id = test_digest(51);
+        let mut changed_owner = restarted.clone();
+        changed_owner.authority.owner_peer_id += 1;
+        for claim in [first, next, changed_claim, changed_mutation, changed_owner] {
+            assert!(
+                complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                    claim,
+                    process_incarnation.clone(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+            restarted.clone(),
+            process_incarnation,
+        )
+        .await
+        .unwrap();
+        let mut registry = session_registry().lock().unwrap();
+        let history = registry
+            .runtime_history_for(&restarted.authority)
+            .unwrap()
+            .unwrap();
+        assert!(!history.saw_job);
+        assert!(history.cleanup_tombstone.as_ref() == Some(&restarted));
+        registry.runtime_history.remove(collection_id);
+    }
+
     #[tokio::test]
     async fn cleanup_rejects_same_process_job_loss_and_replays_restart_absence() {
         let collection_id = "cleanup-absence-regression-collection";
@@ -5193,8 +5469,8 @@ mod tests {
         {
             let mut registry = session_registry().lock().unwrap();
             registry
-                .seen_job_authorities
-                .insert(observed_authority.clone());
+                .remember_job_authority(observed_authority.clone())
+                .unwrap();
         }
         assert!(
             complete_private_oram_detached_job_local_cleanup_with_binding_v2(
@@ -5258,8 +5534,7 @@ mod tests {
         );
 
         let mut registry = session_registry().lock().unwrap();
-        registry.seen_job_authorities.remove(&observed_authority);
-        registry.cleanup_tombstones.remove(&restart_claim.authority);
+        registry.runtime_history.remove(collection_id);
         registry.cleanup_claims.remove(collection_id);
         registry.cleanup_claimed_collections.remove(collection_id);
     }
@@ -5336,7 +5611,7 @@ mod tests {
             .unwrap();
 
         let mut registry = session_registry().lock().unwrap();
-        registry.cleanup_tombstones.remove(&authority);
+        registry.runtime_history.remove(&authority.collection_id);
         registry.cleanup_claims.remove(&collection_id);
         registry.cleanup_claimed_collections.remove(&collection_id);
     }
