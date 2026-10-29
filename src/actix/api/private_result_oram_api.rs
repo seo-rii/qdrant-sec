@@ -1900,6 +1900,7 @@ mod private_result_oram_rest_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_common_ops_require_write_access_for_mutations() {
         let _guard = route_e2e_guard();

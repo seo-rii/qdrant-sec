@@ -1296,6 +1296,7 @@ mod private_result_oram_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn grpc_private_result_oram_mutations_require_write_access_without_private_oram_details() {
         let _guard = route_e2e_guard();
