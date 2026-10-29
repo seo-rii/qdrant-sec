@@ -6076,8 +6076,11 @@ mod tests {
             .prefix("private-result-restore-inspect-error")
             .tempdir()
             .unwrap();
-        let collection_path = temp_dir.path().join("collection-file");
-        fs::write(&collection_path, b"not-a-directory").unwrap();
+        // A file used as a parent can report NotFound on Windows. A NUL is an invalid path on
+        // every platform, so inspection must fail rather than look like an absent optional store.
+        let collection_path = temp_dir
+            .path()
+            .join("collection-file\0inspection-path-sentinel");
         let uuid = Uuid::from_u128(7);
         let mut config = private_result_config(uuid);
         config.params.encryption.as_mut().unwrap().rules.clear();
@@ -6092,6 +6095,7 @@ mod tests {
 
         assert!(err.contains("snapshot store root cannot be inspected"));
         assert!(!err.contains(collection_path.to_string_lossy().as_ref()));
+        assert!(!err.contains("inspection-path-sentinel"));
         assert!(!err.contains(PRIVATE_RESULT_ORAM_DIR));
         assert!(!err.contains("os error"));
         assert!(!err.contains("Not a directory"));
