@@ -36,6 +36,11 @@ TOKEN_COLL_R = encode_jwt({"access": [{"collection": COLL_NAME, "access": "r"}]}
 # Collection read-write access token
 TOKEN_COLL_RW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "rw"}]}, SECRET)
 
+# Collection read access with the separate raw snapshot export capability.
+TOKEN_COLL_SNAPSHOT_EXPORT = encode_jwt(
+    {"access": [{"collection": COLL_NAME, "access": "r", "snapshot_export": True}]}, SECRET
+)
+
 # Collection points read-write access token, the one user for serverless
 TOKEN_COLL_PRW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "prw"}]}, SECRET)
 
@@ -88,13 +93,14 @@ def setup(jwt_cluster):
 
 
 class Access:
-    def __init__(self, r, coll_rw, m=True, coll_r=None, everything=None, coll_prw=None):
+    def __init__(self, r, coll_rw, m=True, coll_r=None, everything=None, coll_prw=None, coll_snapshot_export=None):
         self.read = r
         self.coll_rw = coll_rw
         self.manage = m
         self.coll_r = r if coll_r is None else coll_r
         self.coll_prw = coll_prw
         self.everything = everything
+        self.coll_snapshot_export = coll_snapshot_export
 
 
 class EndpointAccess:
@@ -281,12 +287,13 @@ ACTION_ACCESS = {
     ),
     ### Collection Snapshots ###
     "list_collection_snapshots": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/snapshots",
         "qdrant.Snapshots/List",
         coll_prw=False,
+        coll_snapshot_export=True,
     ),
     "create_collection_snapshot": EndpointAccess(
         False,
@@ -305,11 +312,12 @@ ACTION_ACCESS = {
         coll_prw=False,
     ),
     "download_collection_snapshot": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/snapshots/{snapshot_name}",
         coll_prw=False,
+        coll_snapshot_export=True,
     ),
     "upload_collection_snapshot": EndpointAccess(
         False, False, True, "POST /collections/{collection_name}/snapshots/upload"
@@ -353,10 +361,11 @@ ACTION_ACCESS = {
         "DELETE /collections/{collection_name}/shards/{shard_id}/snapshots/{snapshot_name}",
     ),
     "download_shard_snapshot": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/shards/{shard_id}/snapshots/{snapshot_name}",
+        coll_snapshot_export=True,
     ),
     "stream_shard_snapshot": EndpointAccess(
         False,
@@ -366,12 +375,13 @@ ACTION_ACCESS = {
     ),
     ### Full Snapshots ###
     "list_full_snapshots": EndpointAccess(
-        True,
+        False,
         False,
         True,
         "GET /snapshots",
         "qdrant.Snapshots/ListFull",
         coll_r=False,
+        coll_snapshot_export=False,
     ),
     "create_full_snapshot": EndpointAccess(
         False, False, True, "POST /snapshots", "qdrant.Snapshots/CreateFull"
@@ -380,7 +390,8 @@ ACTION_ACCESS = {
         False, False, True, "DELETE /snapshots/{snapshot_name}", "qdrant.Snapshots/DeleteFull"
     ),
     "download_full_snapshot": EndpointAccess(
-        True, False, True, "GET /snapshots/{snapshot_name}", coll_r=False
+        False, False, True, "GET /snapshots/{snapshot_name}", coll_r=False,
+        coll_snapshot_export=False
     ),
     ### Cluster ###
     "get_cluster": EndpointAccess(True, False, True, "GET /cluster", coll_r=False),
@@ -734,6 +745,10 @@ class GrpcClients:
             GRPC_URI,
             interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_COLL_RW}")])],
         )
+        self.coll_snapshot_export = grpc_requests.Client(
+            GRPC_URI,
+            interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_COLL_SNAPSHOT_EXPORT}")])],
+        )
         self.m = grpc_requests.Client(
             GRPC_URI, interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_M}")])]
         )
@@ -812,6 +827,17 @@ def check_access(
             rest_req_kwargs,
         )
 
+    if allowed_for.coll_snapshot_export is not None:
+        check_rest_access(
+            method,
+            path,
+            rest_request,
+            allowed_for.coll_snapshot_export,
+            TOKEN_COLL_SNAPSHOT_EXPORT,
+            path_params,
+            rest_req_kwargs,
+        )
+
     check_rest_access(
         method, path, rest_request, allowed_for.manage, TOKEN_M, path_params, rest_req_kwargs
     )
@@ -850,6 +876,11 @@ def check_access(
         check_grpc_access(grpc.r, service, method, grpc_request, allowed_for.read)
         check_grpc_access(grpc.coll_r, service, method, grpc_request, allowed_for.coll_r)
         check_grpc_access(grpc.coll_rw, service, method, grpc_request, allowed_for.coll_rw)
+        if allowed_for.coll_snapshot_export is not None:
+            check_grpc_access(
+                grpc.coll_snapshot_export, service, method, grpc_request,
+                allowed_for.coll_snapshot_export,
+            )
         check_grpc_access(grpc.m, service, method, grpc_request, allowed_for.manage)
 
         # Check that API key is the same as manage token
