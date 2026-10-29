@@ -342,8 +342,22 @@ def _wait_until_state_opens(peer_urls: list[str], current_open: dict, stale_open
     wait_for(current_state_opens, wait_for_timeout=300, wait_for_interval=0.5)
     leader_url = reopened["leader_url"]
     assert_http_ok(_mutation_post(leader_url, "close", {"session_id": reopened["session_id"]}))
-    stale = _mutation_post(leader_url, "open", stale_open)
-    assert stale.status_code == 400, stale.text
+
+    def stale_state_is_rejected() -> bool:
+        leader_url = _leader_url(peer_urls)
+        if leader_url is None:
+            return False
+        stale = _mutation_post(leader_url, "open", stale_open)
+        # Leadership can change after discovery or while the newly opened session closes.
+        # Only the explicit routing failure is retried; the stale state must still get 400.
+        if stale.status_code == 500 and stale.json().get("status", {}).get("error") == (
+            "Pre-condition failure: private ORAM mutation must be coordinated by the current leader"
+        ):
+            return False
+        assert stale.status_code == 400, stale.text
+        return True
+
+    wait_for(stale_state_is_rejected, wait_for_timeout=30, wait_for_interval=0.5)
     return reopened["old_state_digest"]
 
 
