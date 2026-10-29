@@ -440,22 +440,29 @@ impl ChannelService {
         term: u64,
         timeout: Duration,
     ) -> CollectionResult<()> {
-        let response = self
-            .with_qdrant_client(peer_id, |mut client| async move {
+        let response = tokio::time::timeout(
+            timeout,
+            self.with_qdrant_client(peer_id, |mut client| async move {
                 let request = WaitOnConsensusCommitRequest {
                     commit: commit as i64,
                     term: term as i64,
                     timeout: timeout.as_secs() as i64,
                 };
                 client.wait_on_consensus_commit(Request::new(request)).await
-            })
-            .await
-            .map_err(|err| {
-                CollectionError::service_error(format!(
-                    "Failed to wait for consensus commit on peer {peer_id}: {err}"
-                ))
-            })?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| CollectionError::Timeout {
+            description: format!(
+                "Failed to wait for consensus commit on peer {peer_id}, timed out."
+            ),
+        })?
+        .map_err(|err| {
+            CollectionError::service_error(format!(
+                "Failed to wait for consensus commit on peer {peer_id}: {err}"
+            ))
+        })?
+        .into_inner();
 
         // Create error if wait request failed
         if !response.ok {
