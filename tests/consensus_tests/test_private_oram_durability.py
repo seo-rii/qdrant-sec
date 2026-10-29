@@ -711,12 +711,14 @@ def _verify_next_generation_read_proofs(
 
 def _assert_recovered_exact_new(peer_urls: list[str], paused: PausedMutation) -> None:
     peer_dirs = paused.prepared["peer_dirs"]
+    # Restart reconciliation must finish the admitted mutation before its new
+    # epochs can be checked; the supervisor barrier also waits for durable cleanup.
+    _wait_for_supervisors_ready(peer_urls)
     private_oram._wait_for_private_oram_epochs(
         peer_dirs,
         paused.new.hnsw.index_epoch,
         2,
     )
-    _wait_for_supervisors_ready(peer_urls)
     observed_name = _assert_exact_old_or_new(
         peer_dirs[0],
         paused.old,
