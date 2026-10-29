@@ -4124,6 +4124,45 @@ fn state_record_file_name(sequence: u64) -> Result<String, PrivateOramMutationJo
     Ok(format!("{sequence:020}{STATE_RECORD_FILE_SUFFIX}"))
 }
 
+#[cfg(test)]
+mod platform_tests {
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pinned_primitives_reject_unsupported_platforms_before_accessing_entries() {
+        use super::*;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = temp.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        // A regular file cannot be a directory handle: the platform guard must run first.
+        let parent = std::fs::File::open(&sentinel).unwrap();
+        let name = std::ffi::OsStr::new("missing-entry");
+        assert!(matches!(
+            PrivateOramPinnedFileV2::open_at(&parent, name, 1024),
+            Err(PrivateOramMutationJournalError::Unsupported)
+        ));
+        assert!(matches!(
+            PrivateOramPinnedDirectoryV2::open_at(&parent, name),
+            Err(PrivateOramMutationJournalError::Unsupported)
+        ));
+        assert!(matches!(
+            read_private_oram_pinned_file_v2(&parent, 1024),
+            Err(PrivateOramMutationJournalError::Unsupported)
+        ));
+        assert!(matches!(
+            rename_private_oram_entry_at_v2(&parent, name, &parent, name, true),
+            Err(PrivateOramMutationJournalError::Unsupported)
+        ));
+        let pinned_parent = PrivateOramPinnedDirectoryV2 { file: parent };
+        assert!(matches!(
+            create_private_oram_directory_at_v2(&pinned_parent, name),
+            Err(PrivateOramMutationJournalError::Unsupported)
+        ));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod fd_relative_tests {
     use super::*;

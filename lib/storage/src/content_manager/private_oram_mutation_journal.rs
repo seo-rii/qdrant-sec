@@ -7541,6 +7541,7 @@ mod tests {
         (encoded, package, fixture)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn admission_recovery_manifest_v2_binds_durable_recovery_envelope() {
         let (encoded, expected_package, fixture) = admission_recovery_manifest_v2_fixture();
@@ -7580,6 +7581,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn admitted_recovery_reconstructs_plan_against_precommit_consensus_state() {
         let (encoded, package, fixture) = admission_recovery_manifest_v2_fixture();
@@ -7692,6 +7694,28 @@ mod tests {
                 fixture.old_consensus.clone(),
             )
             .unwrap()
+    }
+
+    // Protocol and codec tests need the canonical initial image, without publishing a journal.
+    fn initial_snapshot(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        owners: &[PeerId],
+    ) -> PrivateOramMutationJournalSnapshotV1 {
+        let descriptor = journal
+            .build_descriptor(
+                11,
+                owners,
+                fixture.mutation_bundle.clone(),
+                fixture.preparing_lease.clone(),
+                fixture.old_consensus.clone(),
+            )
+            .unwrap();
+        let mut snapshot = v1_snapshot_for_descriptor(&descriptor);
+        snapshot.state.record_digest =
+            state_record_digest(&descriptor.descriptor_digest, &snapshot.state).unwrap();
+        validate_state(&descriptor, &snapshot.state).unwrap();
+        snapshot
     }
 
     fn owner_prepares(
@@ -8190,6 +8214,32 @@ mod tests {
         derive_private_oram_mutation_parent_watermark_expectation_v2(&snapshot).unwrap()
     }
 
+    fn v2_parent_watermark_expectation_in_memory(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        decision_kind: PrivateOramMutationDecisionKindV2,
+        target_phase: PrivateOramMutationJournalPhaseV2,
+    ) -> PrivateOramMutationParentWatermarkExpectationV2 {
+        let initial = initial_snapshot(journal, fixture, &[11]);
+        let state = v2_no_server_terminal_state_for_descriptor(
+            &initial.descriptor,
+            fixture,
+            decision_kind,
+            target_phase,
+        );
+        let history =
+            canonical_private_oram_mutation_state_history_v2(&initial.descriptor, &state).unwrap();
+        private_oram_mutation_parent_watermark_expectation_for_test(
+            &initial.descriptor.preparing_lease,
+            initial.descriptor.descriptor_digest.clone(),
+            history
+                .into_iter()
+                .map(|record| record.record_digest)
+                .collect(),
+        )
+        .unwrap()
+    }
+
     fn cleanup_lifecycle_at_terminal_parent(
         journal: &PrivateOramMutationJournal,
         fixture: &Fixture,
@@ -8224,7 +8274,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             journal,
             fixture,
             decision_kind,
@@ -8846,6 +8896,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_store_retains_successive_generations() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8937,6 +8988,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_requires_point_stage_durable_parent() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8952,6 +9004,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_install_is_insert_only_and_exactly_replayable() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8998,6 +9051,7 @@ mod tests {
         assert!(!debug.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_legacy_file_is_generation_exact() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -9041,6 +9095,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_wrong_owner_authority_and_tampering() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -9078,6 +9133,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_a_conflicting_valid_package() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -9117,6 +9173,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_non_old_physical_pair_before_publication() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -9140,6 +9197,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_fuses_consensus_authority_and_paired_recovery() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -9375,6 +9433,7 @@ mod tests {
         assert_eq!(replayed, terminal);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_persists_exact_new_decision_as_actual_history() {
         let temp = tempfile::tempdir().unwrap();
@@ -9457,6 +9516,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_terminal_claims_require_exact_peer_set_and_replay_exactly() {
         let temp = tempfile::tempdir().unwrap();
@@ -9508,6 +9568,7 @@ mod tests {
         assert!(!rendered.contains(&evidence.terminal_evidence_digest));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_terminal_claims_reject_identity_kind_digest_and_duplicates() {
         let temp = tempfile::tempdir().unwrap();
@@ -9587,6 +9648,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_owner_recovery_requires_exact_persisted_material_and_request_binding() {
         let temp = tempfile::tempdir().unwrap();
@@ -9729,6 +9791,7 @@ mod tests {
         assert!(!rendered.contains(&request.challenge_nonce));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_fuses_exact_new_and_revalidates_child_on_replay() {
         let temp = tempfile::tempdir().unwrap();
@@ -9777,6 +9840,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_hnsw_published_before_result() {
         let temp = tempfile::tempdir().unwrap();
@@ -9840,6 +9904,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_both_stores_published_before_child() {
         let temp = tempfile::tempdir().unwrap();
@@ -9884,6 +9949,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_fuses_exact_old_pair_recovery() {
         let temp = tempfile::tempdir().unwrap();
@@ -9930,6 +9996,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_exact_old_replays_child_terminal_before_parent() {
         let temp = tempfile::tempdir().unwrap();
@@ -9983,6 +10050,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_exact_old_replays_parent_before_lock_release() {
         let temp = tempfile::tempdir().unwrap();
@@ -10030,6 +10098,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_classifies_parent_failure_after_child_terminal_as_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
@@ -10087,6 +10156,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_parent_published_before_lock_release() {
         let temp = tempfile::tempdir().unwrap();
@@ -10134,6 +10204,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rolls_forward_exact_pending_sequence_six() {
         let expected_temp = tempfile::tempdir().unwrap();
@@ -10203,6 +10274,7 @@ mod tests {
         assert!(rolled.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rejects_pending_remotes_before_child_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -10254,6 +10326,7 @@ mod tests {
         assert!(child.terminal.is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rejects_cross_collection_store_resources_before_mutation() {
         let local_temp = tempfile::tempdir().unwrap();
@@ -10333,6 +10406,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_requires_abort_decision_for_exact_old() {
         let temp = tempfile::tempdir().unwrap();
@@ -10383,6 +10457,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_point_resolution_requires_exact_local_terminal_token() {
         let temp = tempfile::tempdir().unwrap();
@@ -10421,6 +10496,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rolls_forward_only_the_exact_pending_point_resolution() {
         let temp = tempfile::tempdir().unwrap();
@@ -10466,6 +10542,7 @@ mod tests {
         assert!(resolved.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_validates_visible_point_receipt_under_live_stage_lock() {
         let temp = tempfile::tempdir().unwrap();
@@ -10605,6 +10682,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_phase_tokens_reject_cross_descriptor_reuse_and_replay_exactly() {
         let first_temp = tempfile::tempdir().unwrap();
@@ -10672,6 +10750,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_accepts_only_durable_visible_point_stage_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -10712,6 +10791,7 @@ mod tests {
         assert_eq!(decision.kind(), PrivateOramMutationDecisionKindV2::ExactNew);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_legacy_and_mixed_active_layouts() {
         let temp = tempfile::tempdir().unwrap();
@@ -10749,6 +10829,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_parent_progress_starts_next_generation_after_retained_terminal() {
         let first_temp = tempfile::tempdir().unwrap();
@@ -10895,6 +10976,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_opaque_resume_facade_advances_no_server_terminal_sequence() {
         let temp = tempfile::tempdir().unwrap();
@@ -11498,6 +11580,7 @@ mod tests {
         assert_eq!(acknowledged.pending_acknowledgement_owner().unwrap(), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_opaque_resume_rejects_ids_visible_before_terminal_side_effects() {
         let temp = tempfile::tempdir().unwrap();
@@ -11543,6 +11626,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_resumes_only_an_exact_pending_typed_transition() {
         let temp = tempfile::tempdir().unwrap();
@@ -11576,6 +11660,7 @@ mod tests {
         assert!(resumed.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_resumes_a_pending_decision_durable_record() {
         // A crash between publishing the DecisionDurable record and moving the pointer leaves
@@ -11674,6 +11759,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_different_evidence_for_pending_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -11710,6 +11796,7 @@ mod tests {
         assert_eq!(observed.pending_next_for_test(), Some(&pending));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_structurally_invalid_pending_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -11742,6 +11829,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_bounds_history_directory_iteration() {
         let temp = tempfile::tempdir().unwrap();
@@ -11764,6 +11852,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_history_gap_pointer_ahead_and_missing_format() {
         let gap_temp = tempfile::tempdir().unwrap();
@@ -11813,6 +11902,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_classifies_missing_mandatory_artifacts_as_corrupt() {
         let descriptor_temp = tempfile::tempdir().unwrap();
@@ -11856,6 +11946,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_tampered_or_cross_bound_immutable_manifest() {
         let tampered_temp = tempfile::tempdir().unwrap();
@@ -11892,6 +11983,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_restart_returns_exact_immutable_manifest_authority() {
         let temp = tempfile::tempdir().unwrap();
@@ -11907,12 +11999,14 @@ mod tests {
         assert!(!debug.contains(&fixture.immutable_manifest.signature.sig));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_journal_persists_exact_seven_phase_progression() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(17, 1);
         let journal = journal(&temp, &fixture);
         let initial = begin(&journal, &fixture, &[11, 12]);
+        assert_eq!(initial, initial_snapshot(&journal, &fixture, &[11, 12]));
         assert_eq!(
             initial.state.phase,
             PrivateOramMutationJournalPhaseV1::LeaseAcquired
@@ -11973,7 +12067,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(41, 31);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
 
         for decision_kind in [
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -12007,6 +12101,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_parent_watermark_candidate_binds_the_complete_canonical_prefix() {
         let temp = tempfile::tempdir().unwrap();
@@ -12024,6 +12119,16 @@ mod tests {
             .unwrap();
         let expectation =
             derive_private_oram_mutation_parent_watermark_expectation_v2(&snapshot).unwrap();
+        assert_eq!(
+            expectation.watermark(),
+            v2_parent_watermark_expectation_in_memory(
+                &journal,
+                &fixture,
+                PrivateOramMutationDecisionKindV2::ExactNew,
+                PrivateOramMutationJournalPhaseV2::PointResolved,
+            )
+            .watermark()
+        );
         let watermark = expectation.watermark();
 
         validate_private_oram_mutation_parent_watermark_v2_shape(watermark).unwrap();
@@ -12084,7 +12189,7 @@ mod tests {
         let first_fixture = fixture(79, 93);
         let first_journal = journal(&temp, &first_fixture);
         let watermark_at = |phase| {
-            v2_parent_watermark_expectation(
+            v2_parent_watermark_expectation_in_memory(
                 &first_journal,
                 &first_fixture,
                 PrivateOramMutationDecisionKindV2::ExactNew,
@@ -12163,7 +12268,7 @@ mod tests {
         let other_temp = tempfile::tempdir().unwrap();
         let other_fixture = fixture(80, 95);
         let other_journal = journal(&other_temp, &other_fixture);
-        let other = v2_parent_watermark_expectation(
+        let other = v2_parent_watermark_expectation_in_memory(
             &other_journal,
             &other_fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -12195,7 +12300,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(81, 97);
         let journal = journal(&temp, &fixture);
-        let expectation = v2_parent_watermark_expectation(
+        let expectation = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactOldAbort,
@@ -12409,6 +12514,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_point_stage_parent_progress_proposals_bootstrap_admitted_authority_in_order() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -12463,6 +12569,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_authority_terminal_decision_requires_exact_seq3_recovery_capsule_readiness() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -12674,6 +12781,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_authority_retains_acknowledged_gc_obligation_and_clears_next_generation() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -13804,7 +13912,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -13932,7 +14040,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -14136,7 +14244,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(42, 33);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let state = v2_no_server_terminal_state(
             &initial,
             &fixture,
@@ -14276,7 +14384,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture_at_sequence(45, 38, 0, true);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
 
         for outcome in [
             PrivateOramPointResolutionOutcomeV2::PublishedExactNew,
@@ -14359,7 +14467,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(46, 39);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11, 12, 13]);
+        let initial = initial_snapshot(&journal, &fixture, &[11, 12, 13]);
         let mut prepared = empty_v2_state(PrivateOramMutationJournalPhaseV2::OwnersPrepared);
         prepared.owner_prepares = owner_prepares(&initial);
         prepared.owner_journals = owner_journals_for_prepares(&prepared.owner_prepares);
@@ -14446,6 +14554,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dual_state_decoder_keeps_v1_complete_distinct_from_v2_point_resolved() {
         let temp = tempfile::tempdir().unwrap();
@@ -14525,7 +14634,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(47, 40);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let encoded = String::from_utf8(serde_json::to_vec(&initial.state).unwrap()).unwrap();
         assert_eq!(
             encoded,
@@ -14543,7 +14652,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(44, 37);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let state = v2_no_server_terminal_state(
             &initial,
             &fixture,
@@ -14561,7 +14670,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(68, 73);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let prepares = owner_prepares(&initial);
         let mut abort_decided = fixture.preparing_lease.clone();
         abort_decided.phase = PrivateOramMutationLeasePhase::AbortDecided;
@@ -14620,6 +14729,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_server_stage_binds_exact_owners_prepared_chain_tip() {
         let temp = tempfile::tempdir().unwrap();
@@ -14672,6 +14782,7 @@ mod tests {
         assert!(journal.load().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconciliation_context_classifies_only_valid_old_and_new_authority() {
         let temp = tempfile::tempdir().unwrap();
@@ -14770,6 +14881,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_recovery_authority_binds_owner_and_is_stable_across_parent_progress() {
         let temp = tempfile::tempdir().unwrap();
@@ -14899,6 +15011,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_recovery_authority_digest_has_known_answer() {
         let temp = tempfile::tempdir().unwrap();
@@ -14922,6 +15035,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_owner_recovery_authority_holds_and_revalidates_parent_lock() {
         let temp = tempfile::tempdir().unwrap();
@@ -15015,6 +15129,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconciliation_context_rejects_mixed_ambiguous_and_aba_state() {
         let temp = tempfile::tempdir().unwrap();
@@ -15113,6 +15228,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn begin_is_exactly_idempotent_and_rejects_another_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -15140,7 +15256,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(41, 130);
         let journal = journal(&temp, &fixture);
-        let snapshot = begin(&journal, &fixture, &[11, 12]);
+        let snapshot = initial_snapshot(&journal, &fixture, &[11, 12]);
 
         assert_eq!(
             (
@@ -15173,6 +15289,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn single_owner_records_empty_remote_finalize_phase() {
         let temp = tempfile::tempdir().unwrap();
@@ -15194,6 +15311,7 @@ mod tests {
         assert_eq!(committed.state.remote_finalizations, Vec::new());
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_journal_binds_non_genesis_consensus_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -15220,6 +15338,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn visible_point_phase_requires_private_staging_token() {
         let temp = tempfile::tempdir().unwrap();
@@ -15307,6 +15426,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn changed_consensus_receipt_or_owner_evidence_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
@@ -15335,6 +15455,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn recomputed_parent_digest_cannot_replace_consensus_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -15364,6 +15485,7 @@ mod tests {
         assert!(journal.load().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn on_disk_state_digest_and_signature_tampering_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
