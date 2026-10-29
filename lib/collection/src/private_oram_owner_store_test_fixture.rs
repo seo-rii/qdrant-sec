@@ -1494,6 +1494,7 @@ mod prestage_tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn consensus_prepared_genesis_enrollment_is_durable_and_idempotent() {
         let temp = tempfile::tempdir().unwrap();
@@ -1536,6 +1537,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_reservation_fence_blocks_owner_state_mutations() {
         let temp = tempfile::tempdir().unwrap();
@@ -1600,6 +1602,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn finalized_reservation_fence_hands_off_only_to_the_reserved_intent() {
         let temp = tempfile::tempdir().unwrap();
@@ -1737,6 +1740,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancelled_reservation_fence_releases_after_durable_resolution() {
         let temp = tempfile::tempdir().unwrap();
@@ -1794,6 +1798,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancelled_reservation_without_fence_records_absence_and_replays() {
         let temp = tempfile::tempdir().unwrap();
@@ -1863,6 +1868,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn finalized_uninstalled_reservation_requires_durable_abort_release_marker() {
         let temp = tempfile::tempdir().unwrap();
@@ -1947,6 +1953,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn finalized_abort_release_rejects_durable_intent_before_fence_consumption() {
         let temp = tempfile::tempdir().unwrap();
@@ -2020,6 +2027,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn finalized_install_rejects_durable_abort_marker_before_fence_consumption() {
         let temp = tempfile::tempdir().unwrap();
@@ -2102,6 +2110,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_signed_cleanup_quarantines_replays_and_fences_stale_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -2207,6 +2216,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_signed_absent_cleanup_tombstones_and_rejects_admission_absence() {
         let temp = tempfile::tempdir().unwrap();
@@ -2281,6 +2291,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_signed_cleanup_chain_gap_blocks_ordinary_open() {
         let temp = tempfile::tempdir().unwrap();
@@ -2337,6 +2348,7 @@ mod prestage_tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_signed_cleanup_cannot_cross_adoption_pending() {
         let temp = tempfile::tempdir().unwrap();
@@ -2395,6 +2407,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_signed_cleanup_recovers_terminal_before_superblock_crash() {
         let temp = tempfile::tempdir().unwrap();
@@ -2489,6 +2502,7 @@ mod prestage_tests {
         assert_eq!(after["lifecycle_generation"], 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_self_signed_terminal_cannot_advance_or_relocate_payload() {
         let temp = tempfile::tempdir().unwrap();
@@ -2569,6 +2583,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_store_replays_coexists_and_adopts_exact_bytes() {
         let temp = tempfile::tempdir().unwrap();
@@ -2673,6 +2688,7 @@ mod prestage_tests {
         assert!(!rendered.contains(&first.package.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_terminal_quarantine_is_immutable_and_moves_payload() {
         let temp = tempfile::tempdir().unwrap();
@@ -2768,6 +2784,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_adoption_pending_rolls_forward_after_restart_boundary() {
         let temp = tempfile::tempdir().unwrap();
@@ -2823,6 +2840,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_pending_after_canonical_is_irrevocable_and_rolls_forward() {
         let temp = tempfile::tempdir().unwrap();
@@ -2894,6 +2912,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_canonical_lock_contention_does_not_publish_pending() {
         let temp = tempfile::tempdir().unwrap();
@@ -2997,6 +3016,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_conflicting_canonical_adoption_quarantines_intent() {
         let temp = tempfile::tempdir().unwrap();
@@ -3051,6 +3071,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_store_fails_closed_after_superblock_tampering() {
         let temp = tempfile::tempdir().unwrap();
@@ -3094,6 +3115,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_store_fails_closed_after_adoption_marker_tampering() {
         let temp = tempfile::tempdir().unwrap();
@@ -3140,6 +3162,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_store_fails_closed_after_terminal_marker_tampering() {
         let temp = tempfile::tempdir().unwrap();
@@ -3188,6 +3211,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_terminal_rejects_wrong_or_missing_payload_location() {
         let temp = tempfile::tempdir().unwrap();
@@ -3224,6 +3248,7 @@ mod prestage_tests {
         assert!(store.inspect_lifecycle_v2(receipt.intent_key()).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prestage_store_fails_closed_after_installed_body_tampering() {
         let temp = tempfile::tempdir().unwrap();
@@ -3262,6 +3287,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonical_parent_grant_is_required_before_child_archive() {
         let temp = tempfile::tempdir().unwrap();
@@ -3288,6 +3314,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonical_parent_grant_binds_exact_terminal_bytes() {
         let temp = tempfile::tempdir().unwrap();
@@ -3315,6 +3342,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonical_parent_grant_rejects_relative_storage_root_without_child_mutation() {
         let cwd = std::env::current_dir().unwrap();
@@ -3353,6 +3381,7 @@ mod prestage_tests {
         assert_eq!(archived.generation(), parent.generation);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonical_parent_grant_rejects_cross_incarnation_replay_without_child_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -3401,6 +3430,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_readiness_requires_retained_canonical_parent_grant() {
         let temp = tempfile::tempdir().unwrap();
@@ -3428,6 +3458,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_snapshot_guard_rejects_unexpected_owner_and_parent_entries() {
         let temp = tempfile::tempdir().unwrap();
@@ -3456,6 +3487,7 @@ mod prestage_tests {
         assert!(store.acquire_snapshot_guard_v2(&readiness).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_snapshot_guard_rejects_archive_pending_consensus_ack() {
         let temp = tempfile::tempdir().unwrap();
@@ -3484,6 +3516,7 @@ mod prestage_tests {
         assert!(store.acquire_snapshot_guard_v2(&pending_ack).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_snapshot_guard_fences_concurrent_archive_publication() {
         let temp = tempfile::tempdir().unwrap();
@@ -3536,6 +3569,7 @@ mod prestage_tests {
         worker.join().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn committed_owner_archive_replays_and_fences_stale_install() {
         let temp = tempfile::tempdir().unwrap();
@@ -3625,6 +3659,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_readiness_rejects_missing_completed_and_retired_pair() {
         let temp = tempfile::tempdir().unwrap();
@@ -3658,6 +3693,7 @@ mod prestage_tests {
         assert!(!fixture.owner_journal().root_path().join("active").exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_readiness_rejects_missing_older_pair_when_newer_pair_matches() {
         let temp = tempfile::tempdir().unwrap();
@@ -3730,6 +3766,7 @@ mod prestage_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn committed_owner_archive_repairs_missing_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -3785,6 +3822,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn committed_owner_archive_record_fences_unretired_adopted_intent() {
         let temp = tempfile::tempdir().unwrap();
@@ -3858,6 +3896,7 @@ mod prestage_tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn compacted_owner_archive_history_survives_reopen_and_snapshot_but_rejects_pair_rollback() {
         let temp = tempfile::tempdir().unwrap();
@@ -3961,6 +4000,7 @@ mod prestage_tests {
         assert!(reopened.acquire_snapshot_guard_v2(&compacted).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn completed_generation_allows_next_generation_active() {
         let temp = tempfile::tempdir().unwrap();

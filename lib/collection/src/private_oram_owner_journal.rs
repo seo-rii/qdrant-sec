@@ -12751,8 +12751,11 @@ mod tests {
 
     #[test]
     fn reservation_prepare_does_not_create_an_unenrolled_store() {
-        let fixture = fixture();
-        let store = PrivateOramOwnerPrestageStoreV2::new(&fixture.hnsw_root);
+        let temp = TempDir::new().unwrap();
+        let hnsw_root = temp.path().join("private-hnsw-root");
+        fs::create_dir(&hnsw_root).unwrap();
+        fs::create_dir(hnsw_root.join(OWNER_STORE_TEMP_DIR)).unwrap();
+        let store = PrivateOramOwnerPrestageStoreV2::new(&hnsw_root);
         let lifecycle = private_oram_owner_lifecycle_genesis_state_v1(digest(20)).unwrap();
         let challenge = reservation_challenge(&lifecycle, 21);
 
@@ -12763,6 +12766,33 @@ mod tests {
         assert!(!store.root_path().exists());
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn structural_inspection_rejects_unsupported_platform_before_path_access() {
+        let temp = TempDir::new().unwrap();
+        let absent_root = temp.path().join("missing-hnsw-root");
+        let journal = PrivateOramOwnerJournal::new(&absent_root);
+
+        assert!(matches!(
+            journal.inspect_structural(),
+            Err(PrivateOramOwnerJournalError::Unsupported)
+        ));
+        assert!(!absent_root.exists());
+
+        // A file cannot contain the owner namespace. The platform rejection must
+        // precede both a missing-path result and any filesystem inspection error.
+        let file_root = temp.path().join("not-a-directory");
+        fs::write(&file_root, b"unchanged").unwrap();
+        let journal = PrivateOramOwnerJournal::new(&file_root);
+
+        assert!(matches!(
+            journal.inspect_structural(),
+            Err(PrivateOramOwnerJournalError::Unsupported)
+        ));
+        assert_eq!(fs::read(&file_root).unwrap(), b"unchanged");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn bounded_directory_scan_rejects_before_collecting_beyond_the_limit() {
         let temp = TempDir::new().unwrap();
@@ -12783,6 +12813,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn reservation_prepare_requires_durable_exclusive_fence_before_signing() {
         let fixture = fixture();
@@ -13151,6 +13182,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prepare_reopen_and_exact_replay_return_same_token() {
         let fixture = fixture();
@@ -13170,6 +13202,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn conflicting_prepare_never_replaces_active() {
         let fixture = fixture();
@@ -13188,6 +13221,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_indexes_publish_as_one_active_artifact() {
         let fixture = fixture();
@@ -13240,6 +13274,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stranded_candidate_is_never_adopted() {
         let fixture = fixture();
@@ -13257,6 +13292,7 @@ mod tests {
         assert!(active_path(&fixture).exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prepare_does_not_modify_canonical_store_files() {
         let fixture = fixture();
@@ -13277,6 +13313,7 @@ mod tests {
         assert_eq!(fs::read(epoch_sentinel).unwrap(), b"old-epoch");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_file_tamper_fails_closed() {
         let fixture = fixture();
@@ -13295,6 +13332,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pinned_file_detects_same_inode_content_rewrite() {
         let fixture = fixture();
@@ -13315,6 +13353,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_prepared_store_binding_requires_exact_token_and_holds_shared_lock() {
         let fixture = fixture();
@@ -13384,6 +13423,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_rebind_recomputes_exact_pair_and_holds_shared_lock() {
         let fixture = fixture();
@@ -13482,6 +13522,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_rebind_requires_hnsw_result_pair() {
         let fixture = fixture();
@@ -13498,6 +13539,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_exclusive_binding_records_and_replays_finalized_terminal() {
         let fixture = fixture();
@@ -13557,6 +13599,7 @@ mod tests {
         assert_eq!(token, replayed);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_terminal_continuation_runs_before_child_lock_release() {
         let fixture = fixture();
@@ -13611,6 +13654,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_exclusive_root_replacement_cannot_expose_terminal_token() {
         let fixture = fixture();
@@ -13658,6 +13702,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_exclusive_callback_error_releases_lock_without_terminal() {
         let fixture = fixture();
@@ -13694,6 +13739,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_exclusive_terminal_replay_rejects_phase_substitution() {
         let fixture = fixture();
@@ -13764,6 +13810,7 @@ mod tests {
         assert_eq!(token, replayed);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_terminal_recorder_rejects_shared_root_guard() {
         let fixture = fixture();
@@ -13805,6 +13852,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn finalized_terminal_reopens_and_exact_replay_returns_same_token() {
         let fixture = fixture();
@@ -13849,6 +13897,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn aborted_old_terminal_replays_and_rejects_finalize_substitution() {
         let fixture = fixture();
@@ -13898,6 +13947,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_requires_exact_descriptor_parent_and_authenticated_owner() {
         let fixture = fixture();
@@ -13955,6 +14005,7 @@ mod tests {
         assert!(!terminal_path(&fixture).exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_requires_exact_authorities_and_canonical_index_states() {
         let fixture = fixture();
@@ -14058,6 +14109,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stranded_terminal_candidate_is_preserved_but_never_adopted() {
         let fixture = fixture();
@@ -14091,6 +14143,7 @@ mod tests {
         assert!(terminal_path(&fixture).exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_record_tamper_fails_closed() {
         let fixture = fixture();
@@ -14156,7 +14209,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn symlink_hardlink_and_bad_mode_fail_closed() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -14204,7 +14257,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_symlink_hardlink_bad_mode_and_oversize_fail_closed() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -14257,7 +14310,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_candidate_allows_partial_record_but_rejects_unknown_entry() {
         use fs_err::os::unix::fs::OpenOptionsExt as _;
@@ -14295,6 +14348,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unknown_root_entry_fails_closed() {
         let fixture = fixture();

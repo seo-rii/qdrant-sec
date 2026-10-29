@@ -2354,6 +2354,7 @@ mod tests {
         assert!(!error.contains(temp.path().to_string_lossy().as_ref()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_old_pair_binds_signed_mutation_prepared_journal_and_both_stores() {
         let fixture = pair_fixture();
@@ -2381,6 +2382,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_projection_rebinds_the_live_prepared_pair() {
         let fixture = pair_fixture();
@@ -2402,6 +2404,7 @@ mod tests {
         assert!(called);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_projection_constructor_rejects_noncanonical_pair_order() {
         let fixture = pair_fixture();
@@ -2444,6 +2447,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_classifier_covers_all_store_state_combinations() {
         use PrivateOramOwnerRecoveryStoreDispositionV1::{AllNew, AllOld, PartialNew, ThirdState};
@@ -2483,6 +2487,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_classifier_errors_when_an_exact_pointer_has_corrupt_evidence() {
         let manifest_fixture = pair_fixture();
@@ -2574,6 +2579,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_classifier_errors_when_result_exact_pointer_has_corrupt_evidence() {
         let manifest_fixture = pair_fixture();
@@ -2665,6 +2671,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_classifier_rejects_hnsw_and_child_lock_contention() {
         let fixture = pair_fixture();
@@ -2712,6 +2719,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_classifier_releases_hnsw_when_result_lock_is_contended() {
         let fixture = pair_fixture();
@@ -2742,6 +2750,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_old_pair_rejects_mutation_signature_substitution_before_callback() {
         let fixture = pair_fixture();
@@ -2770,6 +2779,7 @@ mod tests {
         assert!(!error.contains(&tampered_mutation.signature.sig));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_old_pair_rejects_signed_v2_to_physical_hnsw_mismatch() {
         let fixture = pair_fixture_with_immutable_dim(3);
@@ -2791,6 +2801,7 @@ mod tests {
         assert!(!error.contains(HNSW_KEY));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_old_pair_rejects_signed_v2_to_physical_result_mismatch() {
         let fixture = pair_fixture_with_immutable_params(2, "tenant-a/substituted-result-rk");
@@ -2812,6 +2823,7 @@ mod tests {
         assert!(!error.contains("substituted-result-rk"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_new_pair_binds_both_digest_commits_and_final_bucket_bodies() {
         let fixture = pair_fixture();
@@ -2849,6 +2861,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn mixed_old_new_pair_mints_neither_phase_token() {
         let fixture = pair_fixture();
@@ -2966,6 +2979,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_rolls_forward_both_stores_and_replays_finalized() {
         let fixture = pair_fixture();
@@ -3016,6 +3030,7 @@ mod tests {
         assert_eq!(replay, evidence);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_continuation_keeps_store_and_child_locks() {
         let fixture = pair_fixture();
@@ -3067,6 +3082,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_finalized_replay_rejects_historical_commit_replacement() {
         let fixture = pair_fixture();
@@ -3105,6 +3121,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_replays_fault_after_hnsw_publication() {
         let fixture = pair_fixture();
@@ -3144,6 +3161,7 @@ mod tests {
         assert_eq!(replayed, recovered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_replays_fault_after_result_publication() {
         let fixture = pair_fixture();
@@ -3183,6 +3201,7 @@ mod tests {
         assert_eq!(replayed, recovered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_resumes_result_only_after_hnsw_is_exact_new() {
         let fixture = pair_fixture();
@@ -3203,6 +3222,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_rejects_result_first_before_hnsw_mutation() {
         let fixture = pair_fixture();
@@ -3231,6 +3251,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_observes_then_aborts_and_replays_exact_old() {
         let fixture = pair_fixture();
@@ -3276,6 +3297,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn paired_recovery_rejects_mismatched_parent_bridge_before_locks() {
         let fixture = pair_fixture();
