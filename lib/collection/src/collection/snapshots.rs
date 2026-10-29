@@ -2371,6 +2371,11 @@ fn validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
                 "{label} snapshot store contains a symlink",
             )));
         }
+        if !metadata.file_type().is_dir() && !metadata.file_type().is_file() {
+            return Err(CollectionError::bad_request(format!(
+                "{label} snapshot store contains an unsupported file type",
+            )));
+        }
         let archive_path = archive_dir.join(entry.file_name());
         if private_oram_snapshot_entry_is_unrecognized_retained_temp_state(
             dir_name,
@@ -2407,10 +2412,6 @@ fn validate_private_oram_snapshot_restore_tree_has_no_client_owned_state(
                 dir_name,
                 depth + 1,
             )?;
-        } else if !metadata.file_type().is_file() {
-            return Err(CollectionError::bad_request(format!(
-                "{label} snapshot store contains an unsupported file type",
-            )));
         }
     }
 
@@ -5745,11 +5746,13 @@ mod tests {
             &config,
             temp_dir.path(),
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
 
+        assert!(matches!(&err, CollectionError::BadRequest { .. }), "{err}");
+        let err = err.to_string();
         assert!(
-            err.contains("private result ORAM snapshot store contains an unsupported file type")
+            err.contains("private result ORAM snapshot store contains an unsupported file type"),
+            "{err}"
         );
         assert!(!err.contains(temp_dir.path().to_string_lossy().as_ref()));
         assert!(!err.contains(PRIVATE_RESULT_ORAM_DIR));
@@ -7418,10 +7421,14 @@ mod tests {
             &config,
             temp_dir.path(),
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
 
-        assert!(err.contains("private HNSW ORAM snapshot store contains an unsupported file type"));
+        assert!(matches!(&err, CollectionError::BadRequest { .. }), "{err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("private HNSW ORAM snapshot store contains an unsupported file type"),
+            "{err}"
+        );
         assert!(!err.contains(temp_dir.path().to_string_lossy().as_ref()));
         assert!(!err.contains(PRIVATE_HNSW_ORAM_DIR));
         assert!(!err.contains("text"));
