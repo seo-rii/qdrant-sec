@@ -1987,12 +1987,18 @@ impl StorageVersion for CollectionVersion {
 mod tests {
     use super::*;
 
+    fn nonce_replay_cache_temp_dir() -> tempfile::TempDir {
+        // Resolve platform temp-root aliases before adding any deliberate symlinks.
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::Builder::new()
+            .prefix("nonce-replay-path-sentinel-")
+            .tempdir_in(temp_root)
+            .unwrap()
+    }
+
     #[test]
     fn client_payload_nonce_replay_cache_rejects_oversized_entries() {
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(
             &cache_path,
@@ -2016,7 +2022,7 @@ mod tests {
 
     #[test]
     fn client_payload_nonce_replay_cache_rejects_oversized_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         let mut options = std::fs::OpenOptions::new();
         options.create(true).write(true).truncate(true);
@@ -2036,10 +2042,7 @@ mod tests {
 
     #[test]
     fn client_payload_nonce_replay_cache_rejects_malformed_entries() {
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(&cache_path, "not-a-valid-cache-key\n").unwrap();
         #[cfg(unix)]
@@ -2850,7 +2853,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
 
         append_client_payload_nonce_replay_cache(&cache_path, &["nonce-a".to_string()]).unwrap();
@@ -2873,10 +2876,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_load_rejects_group_world_accessible_files() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(
             &cache_path,
@@ -2895,10 +2895,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_group_world_writable_parent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
 
@@ -2923,7 +2920,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_group_world_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let writable_ancestor = dir.path().join("writable-ancestor");
         let collection_dir = writable_ancestor.join("collection");
         std::fs::create_dir(&writable_ancestor).unwrap();
@@ -2953,7 +2950,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_symlink_paths() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         let target_path = dir.path().join("target");
         std::fs::write(&target_path, "target-before\n").unwrap();
@@ -2995,7 +2992,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_symlink_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let real_parent = dir.path().join("real-parent");
         let symlink_parent = dir.path().join("symlink-parent");
         std::fs::create_dir(&real_parent).unwrap();
