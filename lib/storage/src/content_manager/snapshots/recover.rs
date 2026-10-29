@@ -572,7 +572,7 @@ async fn _do_recover_from_snapshot(
         // Staging delay: Allow observing Partial state before activation
         #[cfg(feature = "staging")]
         {
-            let delay_secs: f64 = std::env::var("QDRANT__STAGING__SNAPSHOT_RECOVERY_DELAY")
+            let delay_secs: f64 = std::env::var("QDRANT_STAGING_SNAPSHOT_RECOVERY_DELAY")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
