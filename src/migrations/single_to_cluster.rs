@@ -25,7 +25,16 @@ where
     Fut: Future<Output = Result<bool, StorageError>>,
 {
     for operation in operations {
-        submit(operation).await?;
+        let announces_existing_collection =
+            matches!(&operation, CollectionMetaOperations::CreateCollection(_));
+        match submit(operation).await {
+            Ok(_) => {}
+            // These collections are already loaded locally. Their creation still needs to
+            // be committed for other peers, but its local application reports AlreadyExists.
+            // Only acknowledge that specific receipt; all other migration failures are fatal.
+            Err(StorageError::AlreadyExists { .. }) if announces_existing_collection => {}
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(())
@@ -244,6 +253,78 @@ mod tests {
             CollectionMetaOperations::SetShardReplicaState(_) => "set_shard_replica_state",
             _ => "other",
         }
+    }
+
+    #[tokio::test]
+    async fn migration_submission_accepts_existing_collection_announcement() {
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let operations = vec![
+            create_collection_operation(),
+            create_shard_key_operation(),
+            replica_state_operation(),
+        ];
+
+        let result = submit_migration_meta_ops(operations, |operation| {
+            let submitted = Arc::clone(&submitted);
+            async move {
+                let label = operation_label(&operation);
+                submitted.lock().unwrap().push(label);
+
+                if label == "create_collection" {
+                    Err(StorageError::already_exists(
+                        "Collection `docs` already exists!",
+                    ))
+                } else {
+                    Ok(true)
+                }
+            }
+        })
+        .await;
+
+        result.unwrap();
+        assert_eq!(
+            submitted.lock().unwrap().as_slice(),
+            [
+                "create_collection",
+                "create_shard_key",
+                "set_shard_replica_state"
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_submission_does_not_ignore_existing_shard_key() {
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let operations = vec![
+            create_collection_operation(),
+            create_shard_key_operation(),
+            replica_state_operation(),
+        ];
+
+        let result = submit_migration_meta_ops(operations, |operation| {
+            let submitted = Arc::clone(&submitted);
+            async move {
+                let label = operation_label(&operation);
+                submitted.lock().unwrap().push(label);
+
+                if label == "create_shard_key" {
+                    Err(StorageError::already_exists("injected shard key conflict"))
+                } else {
+                    Ok(true)
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            StorageError::AlreadyExists { description }
+                if description == "injected shard key conflict"
+        ));
+        assert_eq!(
+            submitted.lock().unwrap().as_slice(),
+            ["create_collection", "create_shard_key"],
+        );
     }
 
     #[tokio::test]
