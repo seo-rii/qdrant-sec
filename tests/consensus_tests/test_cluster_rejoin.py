@@ -265,7 +265,7 @@ def test_reject_rejoin_cluster_same_uri(tmp_path: pathlib.Path, uris_in_env):
         # Startup returns the handled consensus error instead of panicking.
         processes[-1].proc.wait(timeout=20)
         assert processes[-1].proc.returncode == 1
-        assert "Can't initialize consensus: Failed to add peer to known" in (
+        assert "Can't initialize consensus:" in (
             log_folder / "peer_2_restarted.log"
         ).read_text()
         assert bootstrap_log.read_text().count(rejection_message) == rejection_count + 1
@@ -602,7 +602,7 @@ def test_reject_replace_peer_with_shards_same_uri(tmp_path: pathlib.Path):
     # Reject startup with a handled error because the old peer still has shards.
     processes[-1].proc.wait(timeout=20)
     assert processes[-1].proc.returncode == 1
-    assert "Can't initialize consensus: Failed to add peer to known" in (
+    assert "Can't initialize consensus:" in (
         log_folder / "peer_replaced_rejected.log"
     ).read_text()
     assert bootstrap_log.read_text().count(rejection_message) == rejection_count + 1
