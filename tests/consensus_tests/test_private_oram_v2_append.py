@@ -601,11 +601,27 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
     after admission until another peer has taken over leadership, then resumed: as the lease
     owner it must still drive the append to commit and cleanup under the new term, while the
     new leader coordinates the next mutation session."""
+    pause_file = tmp_path / "private-oram-v2-post-admission.pause"
+    pause_file.write_text("pause")
     peer_urls, peer_dirs, leader_url, _, _ = _start_tls_append_cluster(
-        tmp_path, append_client, "v2_leader_change"
+        tmp_path,
+        append_client,
+        "v2_leader_change",
+        coordinator_env={
+            "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE": str(
+                pause_file
+            ),
+        },
     )
     genesis_state_digest = _enroll(leader_url, append_client)
     appended = _append_one_point(leader_url, append_client, genesis_state_digest)
+    # Hold the admitted job before owner adoption so the leadership change cannot accidentally
+    # exercise an append that has already committed and cleaned up.
+    status = _mutation_post(
+        leader_url, "status", {"session_id": appended["session"]["session_id"]}
+    )
+    assert_http_ok(status)
+    assert status.json()["result"]["append_phase"] == "admitted_ack_pending", status.text
 
     old_leader = get_cluster_info(leader_url)["peer_id"]
     (coordinator,) = [
@@ -624,6 +640,7 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
     try:
         wait_for(followers_elected_another_leader, wait_for_timeout=30)
     finally:
+        pause_file.unlink()
         coordinator.proc.send_signal(signal.SIGCONT)
 
     _wait_for_appended_state(peer_urls, append_client, genesis_state_digest)
