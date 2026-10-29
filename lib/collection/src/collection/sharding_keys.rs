@@ -111,10 +111,18 @@ impl Collection {
         private_oram_consensus_authorized: bool,
     ) -> CollectionResult<()> {
         let state = self.state().await;
+        let private_oram_initial_bootstrap = state.shards.is_empty()
+            && init_state == ReplicaState::Active
+            && state
+                .config
+                .params
+                .effective_encryption()
+                .as_ref()
+                .is_some_and(collection_encryption_uses_private_oram_bucket_store);
         self.validate_private_oram_shard_key_change_authorization(
             "create shard key",
             private_oram_consensus_authorized,
-            state.shards.is_empty() && init_state == ReplicaState::Active,
+            private_oram_initial_bootstrap,
         )
         .await?;
 
