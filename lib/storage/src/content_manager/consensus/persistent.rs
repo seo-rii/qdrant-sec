@@ -8348,6 +8348,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_mutation_genesis_enrollment_atomically_binds_unbound_epochs() {
         let temp = tempfile::tempdir().unwrap();
@@ -8402,6 +8403,7 @@ mod tests {
         assert!(error.to_string().contains("precondition failed"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_legacy_recovery_and_v2_enrollment_cross_fence_in_both_orders() {
         let fixture = private_oram_mutation_fixture();
@@ -8529,6 +8531,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_mutation_genesis_enrollment_rejects_stale_epoch_and_missing_capability_floor() {
         let fixture = private_oram_mutation_fixture();
@@ -8584,6 +8587,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_mutation_genesis_enrollment_exact_replay_survives_active_capability_floor() {
         let temp = tempfile::tempdir().unwrap();
@@ -8734,6 +8738,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_authority_upgrades_an_actual_legacy_wire_7_floor_without_rewriting_it() {
         use crate::content_manager::consensus::private_oram_mutation_cleanup::format::{
@@ -8917,6 +8922,7 @@ mod tests {
         fs::write(&state_path, saved).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_authority_capability_upgrade_survives_restart_before_prepare() {
         let (authority_key, trust_anchor, genesis) =
@@ -9056,6 +9062,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_authority_capability_rotation_requires_an_older_protocol_floor() {
         let (authority_key, trust_anchor, genesis) =
@@ -9740,6 +9747,7 @@ mod tests {
         Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn enrollment_after_activation_initializes_and_activates_the_collection_authority() {
         let fixture = private_oram_mutation_fixture();
@@ -9835,6 +9843,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleting_a_collection_retains_records_pinned_by_an_authority_floor() {
         let temp = tempfile::tempdir().unwrap();
@@ -9909,6 +9918,7 @@ mod tests {
         Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn tagged_mutation_authority_survives_persistence_and_fences_legacy_reducers() {
         let temp = tempfile::tempdir().unwrap();
@@ -10050,6 +10060,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mutation_local_floor_rejects_raft_state_rollback_and_snapshot_downgrade() {
         let temp = tempfile::tempdir().unwrap();
@@ -10131,6 +10142,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mutation_local_floor_pending_recovers_exact_old_and_new_raft_images() {
         for publish_new_state in [false, true] {
@@ -10662,6 +10674,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_two_phase_activation_is_atomic_restart_safe_and_irreversible() {
         let temp = tempfile::tempdir().unwrap();
@@ -10864,6 +10877,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_material_admission_manifest_is_one_replayable_patch() {
         let temp = tempfile::tempdir().unwrap();
@@ -11130,6 +11144,7 @@ mod tests {
         assert_eq!(reloaded.last_applied_entry(), Some(barrier.base_index + 7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_rejected_admission_wins_exact_cas_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -11349,6 +11364,7 @@ mod tests {
         assert_eq!(reloaded.last_applied_entry(), Some(barrier.base_index + 7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_reservation_fences_other_transitions_and_abort_replays_after_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -11545,6 +11561,7 @@ mod tests {
         assert_eq!(reloaded.current_unapplied_entry(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_enrollment_steps_walk_the_layout_roster_to_reservable_checkpoints() {
         use qdrant_sec::{
@@ -11715,6 +11732,7 @@ mod tests {
         assert!(private_oram_owner_enrollment_next_step_v1(&table, &[7]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v3_reservation_challenge_finalizes_after_restart() {
         use qdrant_sec::{
@@ -12068,6 +12086,7 @@ mod tests {
         assert_eq!(durable.last_applied_entry(), Some(barrier.base_index + 8));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_recovery_readiness_apply_requires_authority_pinned_owner_signers() {
         fn apply_readiness_with_peer_11_seed(
@@ -12602,6 +12621,7 @@ mod tests {
         assert_eq!(reloaded.last_applied_entry(), Some(52));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_consensus_commit_publication_fault_never_exposes_a_mixed_pair() {
         let prepare_commit = || {
@@ -14750,6 +14770,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_external_recovery_waits_for_durable_archive_acknowledgement() {
         let temp = tempfile::tempdir().unwrap();

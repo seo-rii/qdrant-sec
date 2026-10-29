@@ -1283,6 +1283,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn store_rolls_back_pending_when_raft_state_is_still_old() {
         let temp = tempfile::tempdir().unwrap();
@@ -1298,6 +1299,7 @@ mod tests {
         assert!(!path_entry_exists(&store.root.join(STABLE_FLOOR_FILE)).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn store_rolls_forward_pending_when_raft_state_is_new() {
         let temp = tempfile::tempdir().unwrap();
@@ -1316,6 +1318,7 @@ mod tests {
         assert_eq!(store.recover(&digest(71)).unwrap(), Some(checkpoint));
     }
 
+    #[cfg(unix)]
     #[test]
     fn transition_guard_holds_cross_process_lock_until_publish_outcome_is_known() {
         let temp = tempfile::tempdir().unwrap();
@@ -1344,6 +1347,7 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn store_cleans_pending_after_stable_was_already_promoted() {
         let temp = tempfile::tempdir().unwrap();
@@ -1362,6 +1366,7 @@ mod tests {
         assert!(!path_entry_exists(&store.root.join(PENDING_FLOOR_FILE)).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn store_preserves_intent_and_floor_on_unrelated_state_image() {
         let temp = tempfile::tempdir().unwrap();
@@ -1385,6 +1390,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn store_rejects_unknown_entries_and_cleans_private_temp_files() {
         let temp = tempfile::tempdir().unwrap();
@@ -1429,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wire_7_checkpoint_preserves_hash_and_recovers_without_rewriting() {
+    fn legacy_wire_7_checkpoint_preserves_hash_and_rejects_rollback() {
         use super::super::format::LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON;
 
         let checkpoint: PrivateOramMutationLocalFloorCheckpointV2 =
@@ -1452,23 +1458,6 @@ mod tests {
             .unwrap(),
             checkpoint
         );
-        let temp = tempfile::tempdir().unwrap();
-        let store = store(&temp);
-        {
-            let lock = store.acquire_lock(true).unwrap().unwrap();
-            write_json_atomic(&lock, STABLE_FLOOR_FILE, &checkpoint, None).unwrap();
-        }
-        let before = fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                store.recover(&digest(70)).unwrap(),
-                Some(checkpoint.clone())
-            );
-            assert_eq!(
-                fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap(),
-                before
-            );
-        }
         let mut forged: serde_json::Value =
             serde_json::from_str(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON).unwrap();
         forged["enrollment_floors"] = serde_json::json!({});
@@ -1495,6 +1484,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_wire_7_checkpoint_recovers_without_rewriting() {
+        use super::super::format::LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON;
+
+        let checkpoint: PrivateOramMutationLocalFloorCheckpointV2 =
+            serde_json::from_str(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(&temp);
+        {
+            let lock = store.acquire_lock(true).unwrap().unwrap();
+            write_json_atomic(&lock, STABLE_FLOOR_FILE, &checkpoint, None).unwrap();
+        }
+        let before = fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store.recover(&digest(70)).unwrap(),
+                Some(checkpoint.clone())
+            );
+            assert_eq!(
+                fs::read(store.root.join(STABLE_FLOOR_FILE)).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]
