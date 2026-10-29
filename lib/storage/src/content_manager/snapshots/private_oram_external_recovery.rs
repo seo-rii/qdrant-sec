@@ -483,6 +483,7 @@ impl PrivateOramExternalRecoveryVerification {
             &self.snapshot_path,
             true,
             Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES),
+            false,
         )?;
         if file_identity(&file)? != self.archive_identity {
             return Err(invalid_staging_state());
@@ -600,7 +601,7 @@ fn reconcile_private_oram_external_recovery_initialization(
             .and_then(|value| value.to_str())
             .ok_or_else(invalid_staging_state)?;
         if name == PRIVATE_ORAM_EXTERNAL_RECOVERY_SNAPSHOT_FILE {
-            open_regular_file(&path, true, Some(0))?;
+            open_regular_file(&path, true, Some(0), false)?;
             snapshot_path = Some(path);
         } else {
             let suffix = name
@@ -618,6 +619,7 @@ fn reconcile_private_oram_external_recovery_initialization(
                 &path,
                 true,
                 Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+                false,
             )?;
             temp_path = Some(path);
         }
@@ -627,10 +629,13 @@ fn reconcile_private_oram_external_recovery_initialization(
         if snapshot_path.is_none() {
             return Err(invalid_staging_state());
         }
+        // Publishing a complete interrupted state requires a writable handle for the
+        // Windows flush; ordinary validation reads remain read-only.
         let mut file = open_regular_file(
             temp_path,
             true,
             Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+            cfg!(windows),
         )?;
         let len = file.metadata().map_err(|_| invalid_staging_state())?.len();
         let mut bytes = Vec::with_capacity(len as usize);
@@ -995,7 +1000,7 @@ impl PrivateOramExternalRecoveryStaging {
         }
         let expected_len =
             (total_size - expected_offset).min(PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES);
-        let mut chunk = open_regular_file(chunk_path, false, None)?;
+        let mut chunk = open_regular_file(chunk_path, false, None, false)?;
         let chunk_identity = file_identity(&chunk)?;
         if chunk_identity.len != expected_len {
             return Err(invalid_staging_request());
@@ -1502,6 +1507,7 @@ impl PrivateOramExternalRecoveryStaging {
             &self.snapshot_path(),
             true,
             Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES),
+            false,
         )
         .and_then(|file| {
             if write {
@@ -2349,6 +2355,7 @@ fn read_install_marker(
         marker_path,
         true,
         Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_BYTES),
+        false,
     )
     .map_err(|_| invalid_install_state())?;
     let opened = file.metadata().map_err(|_| invalid_install_state())?;
@@ -2616,8 +2623,8 @@ fn update_install_tree_digest(
             hasher.update(b"f");
             update_length_prefixed(hasher, relative_bytes);
             hasher.update(metadata.len().to_be_bytes());
-            let mut file =
-                open_regular_file(&path, false, None).map_err(|_| invalid_install_state())?;
+            let mut file = open_regular_file(&path, false, None, false)
+                .map_err(|_| invalid_install_state())?;
             let opened = file.metadata().map_err(|_| invalid_install_state())?;
             ensure_same_file(&metadata, &opened).map_err(|_| invalid_install_state())?;
             let mut remaining = metadata.len();
@@ -2752,6 +2759,7 @@ fn read_private_oram_external_recovery_state_file(
         state_path,
         true,
         Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+        false,
     )?;
     let opened = file.metadata().map_err(|_| invalid_staging_state())?;
     ensure_same_file(&metadata, &opened)?;
@@ -2885,6 +2893,7 @@ fn open_regular_file(
     path: &Path,
     require_private: bool,
     max_bytes: Option<u64>,
+    write: bool,
 ) -> Result<File, StorageError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| invalid_staging_state())?;
     if let Some(max_bytes) = max_bytes {
@@ -2893,7 +2902,7 @@ fn open_regular_file(
         return Err(invalid_staging_state());
     }
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(write);
     secure_open_options(&mut options, false);
     let file = options.open(path).map_err(|_| invalid_staging_state())?;
     let opened = file.metadata().map_err(|_| invalid_staging_state())?;

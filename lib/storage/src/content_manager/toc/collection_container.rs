@@ -248,6 +248,7 @@ fn write_private_oram_snapshot_recovery_operation(
     }
     OpenOptions::new()
         .read(true)
+        .write(cfg!(windows))
         .open(&marker_path)
         .and_then(|file| file.sync_all())
         .map_err(|_| invalid_private_oram_snapshot_recovery_marker())?;

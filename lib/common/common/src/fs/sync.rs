@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use fs_err::File;
+use fs_err::{File, OpenOptions};
 
 /// Commits filesystem caches for the given directory.
 ///
@@ -31,10 +31,41 @@ fn sync_dir_with_fsync(dir: &Path) -> io::Result<()> {
         if entry.file_type()?.is_dir() {
             sync_dir_with_fsync(&entry.path())?;
         } else {
-            File::open(entry.path())?.sync_all()?;
+            // Windows FlushFileBuffers requires a handle opened for writing.
+            OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(entry.path())?
+                .sync_all()?;
         }
     }
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recursive_file_sync_preserves_nested_file_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs_err::create_dir(&nested).unwrap();
+        let files = [
+            (root.path().join("root.bin"), b"root data".as_slice()),
+            (nested.join("child.bin"), b"nested data".as_slice()),
+        ];
+        for (path, bytes) in &files {
+            fs_err::write(path, bytes).unwrap();
+        }
+
+        // Exercise the fallback even on platforms where bulk_sync_dir uses syncfs.
+        sync_dir_with_fsync(root.path()).unwrap();
+
+        for (path, bytes) in files {
+            assert_eq!(fs_err::read(path).unwrap(), bytes);
+        }
+    }
 }

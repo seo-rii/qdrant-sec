@@ -298,7 +298,11 @@ impl SnapshotStorageLocalFS {
         drop(file);
 
         move_file(&source_path, &target_path_tmp).await?;
-        tokio_fs::File::open(&target_path_tmp)
+        // Windows FlushFileBuffers requires a handle opened for writing.
+        tokio_fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(&target_path_tmp)
             .await?
             .sync_all()
             .await?;
