@@ -746,7 +746,10 @@ fn main() -> anyhow::Result<()> {
         //     toc_arc.resume_resharding_tasks().await;
         // });
 
-        let collections_to_recover_in_consensus = if is_new_deployment {
+        // Reinitialized followers start with an empty Raft state, but their collections
+        // already belong to the cluster and are restored by the bootstrap peer's snapshot.
+        // Re-proposing them as standalone migrations would create duplicates and abort startup.
+        let collections_to_recover_in_consensus = if is_new_deployment && !args.reinit {
             let existing_collections =
                 runtime_handle.block_on(toc_arc.all_collections(&FULL_ACCESS));
             existing_collections
