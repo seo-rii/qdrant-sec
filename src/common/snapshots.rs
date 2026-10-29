@@ -1520,7 +1520,13 @@ mod tests {
                     "openfhe_local".to_string(),
                     crate::settings::CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(
+                            std::env::current_dir()
+                                .unwrap()
+                                .join("openfhe-bridge")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -1623,7 +1629,13 @@ mod tests {
                     "openfhe_local".to_string(),
                     crate::settings::CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(
+                            std::env::current_dir()
+                                .unwrap()
+                                .join("openfhe-bridge")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
