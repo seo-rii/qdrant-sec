@@ -961,6 +961,18 @@ async fn resolve_private_oram_owner_reservation_fences_v3(
             )
             .await?
         } else {
+            // The disposition is committed locally; the owner must apply it before resolving
+            // its fence. Use the current commit/term pair, not the disposition's historical term.
+            let state = consensus.hard_state();
+            toc.get_channel_service()
+                .await_commit_on_peer(
+                    challenge.owner_peer_id,
+                    state.commit,
+                    state.term,
+                    PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                )
+                .await
+                .map_err(|_| invalid_owner_prestage())?;
             toc.get_channel_service()
                 .resolve_private_oram_mutation_owner_reservation_v3(
                     challenge.owner_peer_id,
@@ -2740,19 +2752,34 @@ pub(crate) async fn coordinate_private_oram_owner_prestage_v2(
                 )
                 .await
             } else {
-                toc.get_channel_service()
-                    .prepare_private_oram_mutation_owner_reservation_v3(
-                        *owner_peer_id,
-                        validated.collection_name(),
-                        validated.vector_name(),
-                        owner_signing_key_id,
-                        context.challenge(),
-                        context.expected_owner_signer(),
-                        context.expected_lifecycle_state(),
-                    )
-                    .await
-                    .map(|response| response.into_verified().prepare().clone())
-                    .map_err(|_| invalid_owner_prestage())
+                async {
+                    // The remote prepare validates its own committed challenge. Synchronize
+                    // this owner first, keeping wait failures in the cancellation path below.
+                    let state = consensus.hard_state();
+                    toc.get_channel_service()
+                        .await_commit_on_peer(
+                            *owner_peer_id,
+                            state.commit,
+                            state.term,
+                            PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                        )
+                        .await
+                        .map_err(|_| invalid_owner_prestage())?;
+                    toc.get_channel_service()
+                        .prepare_private_oram_mutation_owner_reservation_v3(
+                            *owner_peer_id,
+                            validated.collection_name(),
+                            validated.vector_name(),
+                            owner_signing_key_id,
+                            context.challenge(),
+                            context.expected_owner_signer(),
+                            context.expected_lifecycle_state(),
+                        )
+                        .await
+                        .map(|response| response.into_verified().prepare().clone())
+                        .map_err(|_| invalid_owner_prestage())
+                }
+                .await
             };
         match prepare_result {
             Ok(prepare) => owner_reservation_prepares.push(prepare),
