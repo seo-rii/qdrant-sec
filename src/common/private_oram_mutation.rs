@@ -369,7 +369,26 @@ pub(crate) async fn run_private_oram_owner_enrollment_v2(
 ) -> StorageResult<()> {
     let coordinator_peer_id = identity.peer_id();
     for _ in 0..PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS {
-        let operation = match consensus.private_oram_mutation_v2_owner_enrollment_step(key)? {
+        let step = consensus.private_oram_mutation_v2_owner_enrollment_step(key)?;
+        if let PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id }
+        | PrivateOramOwnerEnrollmentStepV2::Activate { owner_peer_id } = &step
+        {
+            if *owner_peer_id != coordinator_peer_id {
+                // Local proposal completion does not mean this owner has applied the
+                // enrollment authority yet. Its next RPC validates that exact state.
+                let state = consensus.hard_state();
+                toc.get_channel_service()
+                    .await_commit_on_peer(
+                        *owner_peer_id,
+                        state.commit,
+                        state.term,
+                        PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                    )
+                    .await
+                    .map_err(|_| owner_enrollment_unreachable(*owner_peer_id))?;
+            }
+        }
+        let operation = match step {
             PrivateOramOwnerEnrollmentStepV2::Complete => return Ok(()),
             PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id } => {
                 let (owner_signer, lifecycle_state) = if owner_peer_id == coordinator_peer_id {

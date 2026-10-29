@@ -424,7 +424,7 @@ impl ChannelService {
         Ok(())
     }
 
-    /// Wait until the given peer reaches the given commit
+    /// Wait until the given peer has applied the given commit
     ///
     /// # Errors
     ///
@@ -433,7 +433,7 @@ impl ChannelService {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    async fn await_commit_on_peer(
+    pub async fn await_commit_on_peer(
         &self,
         peer_id: PeerId,
         commit: u64,
