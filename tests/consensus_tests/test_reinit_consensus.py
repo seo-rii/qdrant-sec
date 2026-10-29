@@ -44,9 +44,9 @@ def compare_points(uri):
     original_points = POINTS_JSON["points"]
     fetched_points = get_collection_points(uri)
     original_points, fetched_points = [sorted(l, key=itemgetter('id')) for l in (original_points, fetched_points)]
-    pairs = zip(original_points, fetched_points)
-    diff = [(x, y) for x, y in pairs if x != y]
-    assert len(diff) == 0, f'Original and final points are not equal, diff: "{diff}"'
+    assert fetched_points == original_points, (
+        f"Original and final points differ: expected {original_points}, got {fetched_points}"
+    )
 
 
 def test_reinit_consensus(tmp_path: pathlib.Path):
