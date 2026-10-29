@@ -1624,7 +1624,6 @@ async fn complete_private_oram_admitted_handoff_v2(
     .await?;
     detached.mark_admitted_ack_complete()?;
     detached.mark_deciding()?;
-    storage::dispatcher::private_oram_crash_point("mutation_v2_before_consensus_commit");
     decide_private_oram_admitted_mutation_v2(dispatcher, coordinated.admission()).await
 }
 
@@ -1649,7 +1648,15 @@ async fn decide_private_oram_admitted_mutation_v2(
         .filter(|lease| lease.generation == admission.lease().generation)
     {
         Some(lease) => match lease.phase {
-            PrivateOramMutationLeasePhase::Preparing => lease.expires_at_unix,
+            PrivateOramMutationLeasePhase::Preparing => {
+                // Both the live handoff and admitted recovery reach this boundary after durable
+                // recovery readiness and reservation ACK. A live handoff failure must not let
+                // recovery bypass the test's pre-decision crash, including an expired lease.
+                storage::dispatcher::private_oram_crash_point(
+                    "mutation_v2_before_consensus_commit",
+                );
+                lease.expires_at_unix
+            }
             PrivateOramMutationLeasePhase::ConsensusCommitted { .. } => {
                 // Confirm the exact paired state and receipt even when a prior proposal won.
                 return commit_private_oram_admitted_mutation_v2(dispatcher, admission).await;
