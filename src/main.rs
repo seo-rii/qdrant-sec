@@ -658,6 +658,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("initialize consensus manager: {err}"))?
         .into();
         let is_new_deployment = consensus_state.is_new_deployment();
+        let reinitializing_follower = args.reinit && bootstrap.is_some();
 
         dispatcher =
             dispatcher.with_consensus(consensus_state.clone(), settings.cluster.resharding_enabled);
@@ -749,7 +750,7 @@ fn main() -> anyhow::Result<()> {
         // Reinitialized followers start with an empty Raft state, but their collections
         // already belong to the cluster and are restored by the bootstrap peer's snapshot.
         // Re-proposing them as standalone migrations would create duplicates and abort startup.
-        let collections_to_recover_in_consensus = if is_new_deployment && !args.reinit {
+        let collections_to_recover_in_consensus = if is_new_deployment && !reinitializing_follower {
             let existing_collections =
                 runtime_handle.block_on(toc_arc.all_collections(&FULL_ACCESS));
             existing_collections
