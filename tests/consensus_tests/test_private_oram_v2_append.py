@@ -482,7 +482,13 @@ def _start_tls_append_cluster(
     """Three pinned peers with internal TLS and V2 active; a paired collection with a replica of
     both indexes on every peer, uploaded and written back once. The first peer leads Raft and so
     coordinates appends; `coordinator_env` is added to its environment."""
-    tls_env = _generate_tls_certs(tmp_path / "tls")
+    tls_env = {
+        **_generate_tls_certs(tmp_path / "tls"),
+        # Applying the real client's large recovery entries can occupy the debug consensus
+        # thread for several seconds. Keep the initial leader until the intended fault; use
+        # the same tick on followers and restarted peers, as in the large session fixtures.
+        "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000",
+    }
     peer_dirs = make_peer_folders(tmp_path, len(TLS_PEER_IDS))
     base_ports = [_free_port_triple() for _ in TLS_PEER_IDS]
     identities = [
@@ -652,7 +658,8 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
 
     coordinator.proc.send_signal(signal.SIGSTOP)
     try:
-        wait_for(followers_elected_another_leader, wait_for_timeout=30)
+        # The 1 s fixture tick gives Raft's randomized 20-40 tick election interval up to 40 s.
+        wait_for(followers_elected_another_leader, wait_for_timeout=60)
     finally:
         pause_file.unlink()
         coordinator.proc.send_signal(signal.SIGCONT)
