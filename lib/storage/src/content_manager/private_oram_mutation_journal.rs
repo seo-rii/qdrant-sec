@@ -15093,7 +15093,16 @@ mod tests {
                 set_private_directory_permissions(&journal.root).unwrap();
             })
             .unwrap_err();
+        // Linux reads through the pinned descriptor before checking root identity.
+        // Other Unix platforms read the replacement path and reject its missing active tree.
+        #[cfg(target_os = "linux")]
         assert!(matches!(error, PrivateOramMutationJournalError::Corrupt));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            error,
+            PrivateOramMutationJournalError::Io(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
         fs::remove_dir(&journal.root).unwrap();
         fs::rename(displaced_root, &journal.root).unwrap();
         assert!(journal.load().unwrap().is_some());
