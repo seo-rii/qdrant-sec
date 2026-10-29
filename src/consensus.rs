@@ -344,28 +344,36 @@ impl Consensus {
         config: &ConsensusConfig,
         tls_config: Option<ClientTlsConfig>,
     ) -> anyhow::Result<AllPeers> {
-        // Use dedicated transport channel for bootstrapping because of specific timeout
-        let channel = make_grpc_channel(
-            Duration::from_secs(config.bootstrap_timeout_sec),
-            Duration::from_secs(config.bootstrap_timeout_sec),
-            cluster_uri,
-            tls_config,
-        )
+        let timeout = Duration::from_secs(config.bootstrap_timeout_sec);
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Connection, retries and RPC execution share the original bootstrap budget.
+        tokio::time::timeout_at(deadline, async {
+            let channel = make_grpc_channel(timeout, timeout, cluster_uri, tls_config)
+                .await
+                .context("Failed to create timeout channel")?;
+            let mut client = RaftClient::new(channel);
+            let peer = api::grpc::qdrant::AddPeerToKnownMessage {
+                uri: current_uri,
+                port: Some(u32::from(p2p_port)),
+                id: this_peer_id,
+            };
+            loop {
+                let mut request = tonic::Request::new(peer.clone());
+                request
+                    .set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                match client.add_peer_to_known(request).await {
+                    Ok(response) => return Ok(response.into_inner()),
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        // A proposal can be refused while Raft is catching up. Reuse the exact
+                        // identity; the receiver rechecks both the URI and committed membership.
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => return Err(error).context("Failed to add peer to known"),
+                }
+            }
+        })
         .await
-        .context("Failed to create timeout channel")?;
-        let mut client = RaftClient::new(channel);
-        let all_peers = client
-            .add_peer_to_known(tonic::Request::new(
-                api::grpc::qdrant::AddPeerToKnownMessage {
-                    uri: current_uri,
-                    port: Some(u32::from(p2p_port)),
-                    id: this_peer_id,
-                },
-            ))
-            .await
-            .context("Failed to add peer to known")?
-            .into_inner();
-        Ok(all_peers)
+        .context("Failed to add peer to known within bootstrap timeout")?
     }
 
     // Re-attach peer to the consensus:
@@ -643,6 +651,14 @@ impl Consensus {
     fn advance_node_impl(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::FromClient(ConsensusOperations::AddPeer { peer_id, uri }) => {
+                let peer_uri = uri.parse::<Uri>().context("peer URI is not a valid URI")?;
+                if self
+                    .broker
+                    .consensus_state
+                    .complete_registered_peer_add(peer_id, &peer_uri)
+                {
+                    return Ok(());
+                }
                 self.ensure_private_oram_topology_proposal_allowed(TopologyChange::AddPeer)?;
                 let existing_uris = self
                     .broker
@@ -656,8 +672,7 @@ impl Consensus {
                 // - new URIs can always join
                 // - existing URIs can re-join with the same peer ID
                 // See: <https://github.com/qdrant/qdrant/pull/7375>
-                if let Some(registered_peer_id) =
-                    existing_uris.get(&uri.parse::<Uri>().context("peer URI is not a valid URI")?)
+                if let Some(registered_peer_id) = existing_uris.get(&peer_uri)
                     && registered_peer_id != &peer_id
                 {
                     log::warn!(
@@ -1687,6 +1702,160 @@ impl fmt::Debug for RedactedRaftMessage<'_> {
 fn is_heartbeat(message: &RaftMessage) -> bool {
     message.msg_type == raft::eraftpb::MessageType::MsgHeartbeat as i32
         || message.msg_type == raft::eraftpb::MessageType::MsgHeartbeatResponse as i32
+}
+
+#[cfg(test)]
+mod bootstrap_retry_tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use api::grpc::qdrant::raft_server::{Raft, RaftServer};
+    use api::grpc::qdrant::{AddPeerToKnownMessage, AllPeers, Peer, PeerId, RaftMessage, Uri};
+    use tonic::{Request, Response, Status};
+
+    use super::Consensus;
+    use crate::settings::ConsensusConfig;
+
+    struct BootstrapService {
+        requests: Arc<Mutex<Vec<AddPeerToKnownMessage>>>,
+        responses: Mutex<VecDeque<Result<AllPeers, Status>>>,
+    }
+
+    #[tonic::async_trait]
+    impl Raft for BootstrapService {
+        async fn send(&self, _: Request<RaftMessage>) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn who_is(&self, _: Request<PeerId>) -> Result<Response<Uri>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn add_peer_to_known(
+            &self,
+            request: Request<AddPeerToKnownMessage>,
+        ) -> Result<Response<AllPeers>, Status> {
+            self.requests.lock().unwrap().push(request.into_inner());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(Status::unavailable("still catching up")))
+                .map(Response::new)
+        }
+
+        async fn add_peer_as_participant(
+            &self,
+            _: Request<PeerId>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+    }
+
+    async fn run_bootstrap(
+        responses: Vec<Result<AllPeers, Status>>,
+    ) -> (
+        anyhow::Result<AllPeers>,
+        Vec<AddPeerToKnownMessage>,
+        Duration,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let service = BootstrapService {
+            requests: requests.clone(),
+            responses: Mutex::new(responses.into()),
+        };
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let connection = listener.accept().await.map(|(stream, _)| stream);
+            Some((connection, listener))
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(RaftServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Consensus::add_peer_to_known_for(
+                17,
+                format!("http://{address}").parse().unwrap(),
+                Some("http://joining-peer:6335".to_string()),
+                6335,
+                &ConsensusConfig {
+                    bootstrap_timeout_sec: 1,
+                    ..Default::default()
+                },
+                None,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+        let _ = server.await;
+        let result = result.expect("bootstrap must honor its own one-second deadline");
+        let requests = requests.lock().unwrap().clone();
+        (result, requests, elapsed)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retries_unavailable_with_the_same_peer_identity() {
+        let expected = AllPeers {
+            all_peers: vec![Peer {
+                id: 11,
+                uri: "http://bootstrap-peer:6335".to_string(),
+            }],
+            first_peer_id: 11,
+        };
+        let (result, requests, _) = run_bootstrap(vec![
+            Err(Status::unavailable("proposal was not observed")),
+            Ok(expected.clone()),
+        ])
+        .await;
+        assert_eq!(result.unwrap(), expected);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0].id, 17);
+        assert_eq!(requests[0].uri.as_deref(), Some("http://joining-peer:6335"));
+        assert_eq!(requests[0].port, Some(6335));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_retry_a_permanent_peer_refusal() {
+        let (result, requests, _) = run_bootstrap(vec![Err(Status::failed_precondition(
+            "peer URI is already used by a peer with shards",
+        ))])
+        .await;
+        assert_eq!(requests.len(), 1);
+        let error = result.unwrap_err();
+        let status = error.downcast_ref::<Status>().unwrap();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "peer URI is already used by a peer with shards"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_repeated_unavailability_uses_one_deadline() {
+        let (result, requests, elapsed) = run_bootstrap(Vec::new()).await;
+        let error = result.unwrap_err();
+        // The RPC deadline and the overall deadline share the same remaining budget; either
+        // can win the final wakeup without permitting another bootstrap attempt.
+        assert!(
+            error.to_string().contains("bootstrap timeout")
+                || error
+                    .downcast_ref::<Status>()
+                    .is_some_and(|status| { status.code() == tonic::Code::DeadlineExceeded }),
+            "{error:#}"
+        );
+        assert!(requests.len() >= 2);
+        assert!(requests.len() <= 11);
+        assert!(elapsed >= Duration::from_millis(900));
+        assert!(elapsed < Duration::from_secs(3));
+    }
 }
 
 #[cfg(test)]

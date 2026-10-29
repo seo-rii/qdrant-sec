@@ -4128,6 +4128,39 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.persistent.write().insert_peer(peer_id, uri)
     }
 
+    /// Completes an exact AddPeer retry that is already present in stable committed membership.
+    /// No Raft entry or configuration change is needed: re-adding a voter as a learner would
+    /// demote it. An address by itself is insufficient, since bootstrap preloads peer addresses.
+    pub fn complete_registered_peer_add(&self, peer_id: PeerId, uri: &Uri) -> bool {
+        let persistent = self.persistent.read();
+        let configuration = &persistent.state().conf_state;
+        let is_member =
+            configuration.voters.contains(&peer_id) || configuration.learners.contains(&peer_id);
+        if !configuration.voters_outgoing.is_empty()
+            || !configuration.learners_next.is_empty()
+            || !is_member
+            || persistent.peer_address_by_id.read().get(&peer_id) != Some(uri)
+        {
+            return false;
+        }
+        let operation = ConsensusOperations::AddPeer {
+            peer_id,
+            uri: uri.to_string(),
+        };
+        let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
+        drop(persistent);
+        if let Some(on_apply) = on_apply
+            && on_apply
+                .send(Ok(ConsensusApplyReceipt::configuration_change(true)))
+                .is_err()
+        {
+            log::warn!(
+                "Failed to notify on consensus operation completion: channel receiver is dropped"
+            );
+        }
+        true
+    }
+
     pub fn remove_peer(&self, peer_id: PeerId) -> Result<(), StorageError> {
         // We sincerely apologize for this piece of code.
         // The `id_to_address` is shared between `channel_pool` and `persistent`,
@@ -6739,6 +6772,108 @@ mod tests {
         mem_storage.wl().append(entries.as_ref()).unwrap();
         consensus_state.append_entries(entries).unwrap();
         (consensus_state, mem_storage)
+    }
+
+    #[test]
+    fn registered_peer_add_completes_exact_members_without_rewriting_membership() {
+        let dir = Builder::new()
+            .prefix("registered_peer_add")
+            .tempdir()
+            .unwrap();
+        let (manager, _) = setup_storages(Vec::new(), dir.path());
+        let voter_uri: tonic::transport::Uri = "http://voter:6335".parse().unwrap();
+        let learner_uri: tonic::transport::Uri = "http://learner:6335".parse().unwrap();
+        let address_only_uri: tonic::transport::Uri = "http://address-only:6335".parse().unwrap();
+        manager.add_peer(11, voter_uri.clone()).unwrap();
+        manager.add_peer(12, learner_uri.clone()).unwrap();
+        manager.add_peer(13, address_only_uri.clone()).unwrap();
+        manager
+            .set_conf_state(ConfState {
+                voters: vec![11],
+                learners: vec![12],
+                ..Default::default()
+            })
+            .unwrap();
+        let configuration = manager.conf_state();
+        let state_bytes = std::fs::read(dir.path().join("raft_state.json")).unwrap();
+        let last_index = manager.last_index().unwrap();
+
+        for (peer_id, uri) in [(11, &voter_uri), (12, &learner_uri)] {
+            for _ in 0..2 {
+                let operation = ConsensusOperations::AddPeer {
+                    peer_id,
+                    uri: uri.to_string(),
+                };
+                let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+                manager
+                    .on_consensus_op_apply
+                    .lock()
+                    .insert(operation.clone(), sender);
+                assert!(manager.complete_registered_peer_add(peer_id, uri));
+                let receipt = receiver.try_recv().unwrap().unwrap();
+                assert!(receipt.applied());
+                assert_eq!(receipt.local_applied_index, None);
+                assert!(
+                    !manager
+                        .on_consensus_op_apply
+                        .lock()
+                        .contains_key(&operation)
+                );
+            }
+        }
+        for (peer_id, uri) in [
+            (11, &learner_uri),
+            (13, &address_only_uri),
+            (14, &voter_uri),
+        ] {
+            let operation = ConsensusOperations::AddPeer {
+                peer_id,
+                uri: uri.to_string(),
+            };
+            let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+            manager
+                .on_consensus_op_apply
+                .lock()
+                .insert(operation.clone(), sender);
+            assert!(!manager.complete_registered_peer_add(peer_id, uri));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            assert!(
+                manager
+                    .on_consensus_op_apply
+                    .lock()
+                    .contains_key(&operation)
+            );
+        }
+        assert_eq!(manager.conf_state(), configuration);
+        assert_eq!(manager.last_index().unwrap(), last_index);
+        assert_eq!(
+            std::fs::read(dir.path().join("raft_state.json")).unwrap(),
+            state_bytes
+        );
+
+        // A retiring voter is still in the outgoing half of a joint configuration, but an
+        // AddPeer retry must not claim completion just before the removal becomes final.
+        manager
+            .set_conf_state(ConfState {
+                voters: vec![12],
+                voters_outgoing: vec![11, 12],
+                auto_leave: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let joint_configuration = manager.conf_state();
+        let joint_state_bytes = std::fs::read(dir.path().join("raft_state.json")).unwrap();
+        assert!(!manager.complete_registered_peer_add(11, &voter_uri));
+        assert!(!manager.complete_registered_peer_add(12, &learner_uri));
+        assert_eq!(manager.conf_state(), joint_configuration);
+        assert_eq!(manager.last_index().unwrap(), last_index);
+        assert_eq!(
+            std::fs::read(dir.path().join("raft_state.json")).unwrap(),
+            joint_state_bytes
+        );
     }
 
     #[test]
