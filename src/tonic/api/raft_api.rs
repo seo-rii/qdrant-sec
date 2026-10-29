@@ -276,11 +276,14 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .into_inner();
-                assert!(
-                    response
-                        .all_peers
-                        .iter()
-                        .any(|peer| peer.id == id && peer.uri == uri)
+                let registered_peer = response
+                    .all_peers
+                    .iter()
+                    .find(|peer| peer.id == id)
+                    .expect("bootstrap response must retain the registered peer");
+                assert_eq!(
+                    registered_peer.uri.parse::<Uri>().unwrap(),
+                    uri.parse::<Uri>().unwrap(),
                 );
                 assert_eq!(state.conf_state(), before);
                 assert!(matches!(
