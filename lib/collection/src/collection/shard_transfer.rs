@@ -196,8 +196,10 @@ fn write_private_oram_fixed_transfer_preinstall_intent(
         }
         if existing.reservation_lease_id_hash == intent.reservation_lease_id_hash {
             let intent_path = private_oram_fixed_transfer_preinstall_intent_path(collection_path);
+            // Windows FlushFileBuffers, used by sync_all, requires write access.
             OpenOptions::new()
                 .read(true)
+                .write(cfg!(windows))
                 .open(&intent_path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
@@ -223,8 +225,10 @@ fn write_private_oram_fixed_transfer_preinstall_intent(
         fs_err::set_permissions(&intent_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
     }
+    // Windows FlushFileBuffers, used by sync_all, requires write access.
     OpenOptions::new()
         .read(true)
+        .write(cfg!(windows))
         .open(&intent_path)
         .and_then(|file| file.sync_all())
         .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
