@@ -16262,15 +16262,16 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         let dir = tempfile::Builder::new()
-            .prefix("qdrant-sec-material-socket-symlink-")
+            // Keep the complete socket path below macOS's sockaddr_un path limit.
+            .prefix("qs-")
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let mut dir_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
         dir_permissions.set_mode(0o700);
         std::fs::set_permissions(dir.path(), dir_permissions).unwrap();
 
-        let socket_path = dir.path().join("payload.key.sock.target");
-        let symlink_path = dir.path().join("payload.key.sock");
+        let socket_path = dir.path().join("target.sock");
+        let symlink_path = dir.path().join("link.sock");
         let _listener = UnixListener::bind(&socket_path).unwrap();
         let mut socket_permissions = std::fs::symlink_metadata(&socket_path)
             .unwrap()
