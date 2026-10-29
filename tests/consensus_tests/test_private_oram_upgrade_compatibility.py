@@ -882,7 +882,9 @@ def test_mixed_version_voter_blocks_wire_9_activation_and_enrollment(
         port_bases[0],
         "mixed-current-0.log",
         bootstrap_url=current_peer_2.p2p_url,
-        tick_period_ms=10,
+        # Use the other follower's tick: a 10 ms tick can elect this peer during
+        # activation checks, but the valid enrollment fixture lives on leader peer 103.
+        tick_period_ms=1000,
     )
     mixed_peers = [current_peer_0, old_peers[1], current_peer_2]
     mixed_urls = [peer.api_url for peer in mixed_peers]
