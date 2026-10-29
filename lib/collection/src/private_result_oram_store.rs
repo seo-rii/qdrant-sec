@@ -7375,6 +7375,7 @@ mod tests {
     /// Fault injection (PLAN V2-D5): a commit on a store whose directories are not writable
     /// must fail closed (old epoch and buckets intact, no pending write-back) and succeed on
     /// retry once permissions are restored.
+    #[cfg(unix)]
     #[test]
     fn writeback_commit_fails_closed_on_read_only_store_and_retries_cleanly() {
         use std::os::unix::fs::PermissionsExt;
