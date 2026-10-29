@@ -2040,14 +2040,18 @@ def test_private_oram_mutation_v2_owner_follower_resumes_after_leader_change(
 ):
     pause_file = tmp_path / "private-oram-v2-post-admission.pause"
     pause_file.write_text("pause")
+    # Large recovery entries can occupy the debug consensus thread for seconds.
+    # Keep elections tied to the deliberate owner stop, including after restart.
+    consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
     pause_env = {
+        **consensus_env,
         "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE": str(
             pause_file
         )
     }
     prepared = _prepare_private_oram_mutation_v2_collection(
         tmp_path,
-        [pause_env, {}, {}],
+        [pause_env, consensus_env, consensus_env],
     )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
