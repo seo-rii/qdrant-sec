@@ -1052,10 +1052,18 @@ async fn test_snapshot_private_oram_store_files_are_archived() {
     let snapshot_path = snapshots_path.path().join(&snapshot_description.name);
     let snapshot_file = std::fs::File::open(&snapshot_path).unwrap();
     let mut archive = tar::Archive::new(snapshot_file);
+    let hnsw_temp_dir = format!("{PRIVATE_HNSW_ORAM_DIR}/{vector_name}/temp");
     let mut archive_paths = HashSet::new();
     for entry in archive.entries().unwrap() {
         let entry = entry.unwrap();
-        archive_paths.insert(entry.path().unwrap().to_string_lossy().replace('\\', "/"));
+        let path = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+        if path == hnsw_temp_dir {
+            assert!(
+                entry.header().entry_type().is_dir(),
+                "snapshot HNSW owner archive parent must be a directory: {path}",
+            );
+        }
+        archive_paths.insert(path);
     }
 
     let expected_paths = [
@@ -1158,17 +1166,19 @@ async fn test_snapshot_private_oram_store_files_are_archived() {
             "snapshot archive contains client-owned private ORAM state marker {forbidden}: {archive_paths:?}",
         );
     }
-    let forbidden_temp_prefixes = [
-        format!("{PRIVATE_RESULT_ORAM_DIR}/temp"),
-        format!("{PRIVATE_HNSW_ORAM_DIR}/{vector_name}/temp"),
-    ];
-    for forbidden_temp_prefix in forbidden_temp_prefixes {
+    let result_temp_dir = format!("{PRIVATE_RESULT_ORAM_DIR}/temp");
+    assert!(
+        !archive_paths.contains(&result_temp_dir),
+        "snapshot archive contains private result ORAM temp directory: {archive_paths:?}",
+    );
+    // HNSW temp is retained as the parent of durable owner archives. This fixture
+    // has no owner archive, so the directory must be empty; result temp is omitted.
+    for temp_dir in [result_temp_dir, hnsw_temp_dir] {
         assert!(
             !archive_paths
                 .iter()
-                .any(|path| path == &forbidden_temp_prefix
-                    || path.starts_with(&format!("{forbidden_temp_prefix}/"))),
-            "snapshot archive contains private ORAM temp subtree {forbidden_temp_prefix}: {archive_paths:?}",
+                .any(|path| path.starts_with(&format!("{temp_dir}/"))),
+            "snapshot archive contains private ORAM temp contents under {temp_dir}: {archive_paths:?}",
         );
     }
 
