@@ -2327,7 +2327,11 @@ def test_private_oram_mutation_v2_terminal_resume_waits_for_owner_execution_guar
     supervisor_pause_file = tmp_path / "private-oram-v2-supervisor-scan.pause"
     pause_file.write_text("pause")
     supervisor_pause_file.write_text("pause")
+    # Applying the recovery material can exceed the default two-second election
+    # floor in debug CI. Keep the owner leader until the deliberate stop below.
+    consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
     pause_env = {
+        **consensus_env,
         "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_PRE_COMMIT_PROJECTION_PAUSE_FILE": str(
             pause_file
         ),
@@ -2338,7 +2342,7 @@ def test_private_oram_mutation_v2_terminal_resume_waits_for_owner_execution_guar
     }
     prepared = _prepare_private_oram_mutation_v2_collection(
         tmp_path,
-        [pause_env, {}, {}],
+        [pause_env, consensus_env, consensus_env],
     )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
@@ -2875,10 +2879,13 @@ def test_private_oram_mutation_v2_post_clear_crash_restarts_archive_and_ack(
 ):
     pause_file = tmp_path / "private-oram-v2-post-clear.pause"
     pause_file.write_text("pause")
-    pause_env = {pause_env_name: str(pause_file)}
+    # Reach the archive barrier before testing owner loss. Debug consensus apply
+    # can outlast the default election floor while materializing the recovery entry.
+    consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
+    pause_env = {**consensus_env, pause_env_name: str(pause_file)}
     prepared = _prepare_private_oram_mutation_v2_collection(
         tmp_path,
-        [pause_env, {}, {}],
+        [pause_env, consensus_env, consensus_env],
     )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
