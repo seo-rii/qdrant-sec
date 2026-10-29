@@ -404,6 +404,7 @@ async fn test_snapshot_private_hnsw_unconfigured_store_fails_before_archive() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_result_oram_missing_bucket_fails_before_archive() {
     init_logger();
@@ -541,6 +542,7 @@ async fn test_snapshot_private_result_oram_missing_bucket_fails_before_archive()
     assert!(!err.contains(&manifest.root_hash));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_hnsw_missing_bucket_fails_before_archive() {
     init_logger();
@@ -951,6 +953,7 @@ fn write_snapshot_private_result_store(
         .unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_oram_store_files_are_archived() {
     init_logger();

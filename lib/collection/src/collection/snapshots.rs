@@ -4119,6 +4119,7 @@ mod tests {
         assert!(!rendered.contains(temp_dir.path().to_string_lossy().as_ref()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_oram_snapshot_source_dir_accepts_valid_epoch_files() {
         let temp_dir = tempfile::Builder::new()
@@ -5576,6 +5577,7 @@ mod tests {
         assert!(!err.contains(PRIVATE_RESULT_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_client_owned_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5611,6 +5613,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_json_hash_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5645,6 +5648,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_json_hashes_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5679,7 +5683,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_nested_symlink_without_target_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5719,7 +5723,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_fifo_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5760,6 +5764,7 @@ mod tests {
         assert!(!err.contains("fifo-sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_extra_bucket_file_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5835,6 +5840,7 @@ mod tests {
         assert!(!err.contains(&manifest.root_hash), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_extra_layout_files_without_path_leak() {
         for relative_path in [
@@ -5846,6 +5852,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_accepts_canonical_epoch_commit_file() {
         let temp_dir = tempfile::Builder::new()
@@ -5896,6 +5903,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_malformed_epoch_commit_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -5932,6 +5940,7 @@ mod tests {
         assert!(!err.contains(&manifest.root_hash), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_non_empty_temp_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -6108,7 +6117,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_RESULT_ORAM_DIR));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_bucket_symlink() {
         let temp_dir = tempfile::Builder::new()
@@ -6139,7 +6148,7 @@ mod tests {
         assert!(!rendered.contains(&manifest.root_hash));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_world_readable_bucket_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -6169,6 +6178,7 @@ mod tests {
         assert!(!rendered.contains(&manifest.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_accepts_manifest_epoch_and_buckets() {
         let temp_dir = tempfile::Builder::new()
@@ -6188,6 +6198,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_accepts_signed_mixed_epoch_buckets() {
         let temp_dir = tempfile::Builder::new()
@@ -6208,6 +6219,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_future_epoch_bucket() {
         let temp_dir = tempfile::Builder::new()
@@ -6241,6 +6253,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_rebound_stale_bucket_epoch() {
         let temp_dir = tempfile::Builder::new()
@@ -6275,6 +6288,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_mixed_epoch_merkle_leaf_tamper() {
         let temp_dir = tempfile::Builder::new()
@@ -6307,6 +6321,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_accepts_missing_temp_dir() {
         let temp_dir = tempfile::Builder::new()
@@ -6327,6 +6342,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_context_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6351,6 +6367,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_signature_key_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6393,6 +6410,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_manifest_key_id_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6423,6 +6441,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_manifest_rk_id_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6453,6 +6472,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_manifest_rk_epoch_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6480,6 +6500,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_current_epoch_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6517,6 +6538,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_bucket_commitment_root_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6580,6 +6602,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_bucket_fixed_size_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6705,6 +6728,7 @@ mod tests {
         assert!(!rendered.contains(&bucket.ciphertext), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_bucket_commitment_context_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6783,21 +6807,25 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_missing_bucket_zero() {
         assert_private_result_oram_restore_preflight_rejects_missing_bucket(0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_missing_last_bucket() {
         assert_private_result_oram_restore_preflight_rejects_missing_bucket(2);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_restore_preflight_rejects_missing_middle_bucket() {
         assert_private_result_oram_restore_preflight_rejects_missing_bucket(1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_storage_restore_runs_sanitized_layout_preflight() {
         let snapshot_dir = tempfile::Builder::new()
@@ -6839,6 +6867,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_storage_restore_sanitizes_unexpected_layout_file() {
         let snapshot_dir = tempfile::Builder::new()
@@ -6888,6 +6917,7 @@ mod tests {
         assert_private_result_restore_error_redacts_common(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_accepts_manifest_epoch_and_bucket() {
         let temp_dir = tempfile::Builder::new()
@@ -6907,6 +6937,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_accepts_missing_temp_dir() {
         let temp_dir = tempfile::Builder::new()
@@ -6934,6 +6965,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_manifest_key_id_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6960,6 +6992,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_manifest_rk_id_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -6986,6 +7019,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_manifest_rk_epoch_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7194,6 +7228,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_HNSW_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_store_without_binding() {
         let temp_dir = tempfile::Builder::new()
@@ -7220,6 +7255,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_HNSW_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_unconfigured_vector_store() {
         let temp_dir = tempfile::Builder::new()
@@ -7243,6 +7279,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_HNSW_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_client_owned_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7279,6 +7316,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_json_hash_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7315,6 +7353,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_json_hashes_state_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7351,7 +7390,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_nested_symlink_without_target_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7393,7 +7432,7 @@ mod tests {
         assert!(!err.contains("sentinel"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_fifo_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7436,6 +7475,7 @@ mod tests {
         assert!(!err.contains("fifo-sentinel"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_non_empty_temp_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -7500,7 +7540,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_HNSW_ORAM_DIR));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_bucket_symlink() {
         let temp_dir = tempfile::Builder::new()
@@ -7530,7 +7570,7 @@ mod tests {
         assert!(!rendered.contains(&manifest.root_hash));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_world_readable_bucket_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -7560,6 +7600,7 @@ mod tests {
         assert!(!rendered.contains(&manifest.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_result_private_manifest() {
         let temp_dir = tempfile::Builder::new()
@@ -7584,6 +7625,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_accepts_result_private_with_result_oram_binding() {
         let temp_dir = tempfile::Builder::new()
@@ -7615,6 +7657,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_result_oram_signature_key_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7659,6 +7702,7 @@ mod tests {
         assert!(!rendered.contains(PRIVATE_RESULT_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_result_oram_batch_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7693,7 +7737,7 @@ mod tests {
         assert!(!rendered.contains("2"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_symlinked_result_oram_store() {
         let temp_dir = tempfile::Builder::new()
@@ -7764,6 +7808,7 @@ mod tests {
         assert!(!err.to_string().contains(PRIVATE_HNSW_ORAM_DIR));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_signature_key_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7806,6 +7851,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_context_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7830,6 +7876,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_vector_metadata_mismatch() {
         let uuid = Uuid::from_u128(7);
@@ -7893,6 +7940,7 @@ mod tests {
         assert!(!rendered.contains("text"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_current_epoch_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7931,6 +7979,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_bucket_commitment_root_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -7993,6 +8042,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_bucket_fixed_size_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -8082,6 +8132,7 @@ mod tests {
         assert!(!rendered.contains(&bucket.ciphertext), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_bucket_commitment_context_mismatch() {
         let temp_dir = tempfile::Builder::new()
@@ -8130,6 +8181,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_extra_bucket_file_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -8207,6 +8259,7 @@ mod tests {
         assert!(!err.contains(&manifest.root_hash), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_extra_layout_files_without_path_leak() {
         for relative_path in [
@@ -8218,6 +8271,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_accepts_canonical_epoch_commit_file() {
         let temp_dir = tempfile::Builder::new()
@@ -8250,6 +8304,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_malformed_epoch_commit_without_path_leak() {
         let temp_dir = tempfile::Builder::new()
@@ -8287,6 +8342,7 @@ mod tests {
         assert!(!err.contains(&manifest.root_hash), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_missing_bucket_zero() {
         let temp_dir = tempfile::Builder::new()
@@ -8333,6 +8389,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_storage_restore_runs_sanitized_layout_preflight() {
         let snapshot_dir = tempfile::Builder::new()
@@ -8392,6 +8449,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_storage_restore_sanitizes_unexpected_layout_file() {
         let snapshot_dir = tempfile::Builder::new()
@@ -8442,6 +8500,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&err);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_missing_last_bucket() {
         let temp_dir = tempfile::Builder::new()
@@ -8502,6 +8561,7 @@ mod tests {
         assert_private_hnsw_restore_error_redacts_common(&rendered);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_restore_preflight_rejects_missing_middle_bucket() {
         let temp_dir = tempfile::Builder::new()
