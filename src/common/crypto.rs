@@ -10323,9 +10323,12 @@ mod tests {
             private_oram_mutation_v2_binary_capability_digest(),
             "476bxEnworZ3LqmqqKrsc1Udw7AjtJdwjNq_gyPsxok",
         );
+        // Wire 9 adds owner-archive-history=1 to the release capability descriptor.
+        // The previous-binary upgrade fixture retains its separate wire-7 known answer.
+        assert_eq!(PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION, 9);
         assert_eq!(
             private_oram_mutation_v3_binary_capability_digest(),
-            "L4bvm-MmPi0OJ8VB3qyYuBiDYuZXFW51gAcmXdu2agY",
+            "9lVhunXiPul1X0wJpDapumHTMBPpg7jlnc2NHGwsODg",
         );
     }
 
