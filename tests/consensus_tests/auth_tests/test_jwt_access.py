@@ -1,4 +1,5 @@
 import json
+import re
 from inspect import isfunction
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -603,6 +604,73 @@ ACTION_ACCESS = {
 }
 
 
+# These encrypted APIs require populated signed manifests and sessions. Their read/write
+# permission matrix lives with those fixtures; list every endpoint explicitly so new APIs
+# still fail the inventory checks below until they have coverage.
+PRIVATE_ORAM_ACCESS_COVERAGE = [
+    {
+        "tests": [
+            ("src/actix/api/private_hnsw_api.rs", "private_hnsw_common_ops_require_write_access_for_mutations"),
+            ("src/tonic/api/private_hnsw_api.rs", "grpc_private_hnsw_mutations_require_write_access_without_private_oram_details"),
+        ],
+        "endpoints": [
+            ("GET /collections/{collection_name}/private-hnsw/{vector_name}/manifest", "qdrant.PrivateHnswOram/GetPrivateHnswManifest"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/manifest", "qdrant.PrivateHnswOram/UploadPrivateHnswManifest"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/buckets", "qdrant.PrivateHnswOram/UploadPrivateHnswBuckets"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/session", "qdrant.PrivateHnswOram/OpenPrivateHnswSession"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/oram/read_paths", "qdrant.PrivateHnswOram/ReadPrivateHnswPaths"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/oram/commit", "qdrant.PrivateHnswOram/CommitPrivateHnswPaths"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/session/{session_id}/close", "qdrant.PrivateHnswOram/ClosePrivateHnswSession"),
+        ],
+    },
+    {
+        "tests": [
+            ("src/actix/api/private_result_oram_api.rs", "private_result_oram_common_ops_require_write_access_for_mutations"),
+            ("src/tonic/api/private_result_oram_api.rs", "grpc_private_result_oram_mutations_require_write_access_without_private_oram_details"),
+        ],
+        "endpoints": [
+            ("GET /collections/{collection_name}/private-result-oram/manifest", "qdrant.PrivateResultOram/GetPrivateResultOramManifest"),
+            ("POST /collections/{collection_name}/private-result-oram/manifest", "qdrant.PrivateResultOram/UploadPrivateResultOramManifest"),
+            ("POST /collections/{collection_name}/private-result-oram/buckets", "qdrant.PrivateResultOram/UploadPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/session", "qdrant.PrivateResultOram/OpenPrivateResultOramSession"),
+            ("POST /collections/{collection_name}/private-result-oram/oram/read_buckets", "qdrant.PrivateResultOram/ReadPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/oram/commit", "qdrant.PrivateResultOram/CommitPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/session/{session_id}/close", "qdrant.PrivateResultOram/ClosePrivateResultOramSession"),
+        ],
+    },
+]
+
+
+def dedicated_private_oram_access_endpoints():
+    endpoints = []
+    for coverage in PRIVATE_ORAM_ACCESS_COVERAGE:
+        for source_path, test_name in coverage["tests"]:
+            source = (PROJECT_ROOT / source_path).read_text()
+            assert re.search(rf"(?m)^\s*fn {re.escape(test_name)}\(", source), (
+                f"Dedicated access test {test_name} is missing from {source_path}"
+            )
+        endpoints.extend(coverage["endpoints"])
+    return endpoints
+
+
+@pytest.mark.parametrize(
+    "rest_endpoint,grpc_endpoint",
+    [endpoint for coverage in PRIVATE_ORAM_ACCESS_COVERAGE for endpoint in coverage["endpoints"]],
+)
+def test_private_oram_endpoints_require_credentials(rest_endpoint, grpc_endpoint):
+    # Exercise the transport boundary here in addition to the populated-fixture
+    # read-only/write tests referenced above. Empty bodies must not bypass auth.
+    method, path = rest_endpoint.split(" ")
+    path = path.format(collection_name=COLL_NAME, vector_name="text", session_id="no-auth-session")
+    response = requests.request(method, f"{REST_URI}{path}", json={}, timeout=5)
+    assert response.status_code == 401, response.text
+
+    with grpc.insecure_channel(GRPC_URI) as channel:
+        with pytest.raises(grpc.RpcError) as error:
+            channel.unary_unary(f"/{grpc_endpoint}")(b"", timeout=5)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
 def test_all_actions_have_tests():
     # for each action
     for action_name in ACTION_ACCESS.keys():
@@ -627,6 +695,7 @@ def test_all_rest_endpoints_are_covered():
 
     # check that all endpoints are covered in ACTION_ACCESS
     covered_endpoints = set(v.rest_endpoint for v in ACTION_ACCESS.values())
+    covered_endpoints.update(rest for rest, _ in dedicated_private_oram_access_endpoints())
     for endpoint in endpoint_paths:
         assert (
                 endpoint in covered_endpoints
@@ -653,6 +722,7 @@ def test_all_grpc_endpoints_are_covered():
 
     # check that all endpoints are covered in ACTION_ACCESS
     covered_endpoints = set(v.grpc_endpoint for v in ACTION_ACCESS.values())
+    covered_endpoints.update(grpc for _, grpc in dedicated_private_oram_access_endpoints())
 
     for service_name in client.service_names:
         service = client.service(service_name)
