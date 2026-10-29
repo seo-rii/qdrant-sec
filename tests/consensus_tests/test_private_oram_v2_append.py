@@ -478,6 +478,7 @@ def _start_tls_append_cluster(
     append_client: AppendClient,
     log_prefix: str,
     coordinator_env: dict[str, str] | None = None,
+    follower_tick_period_ms: tuple[int, int] = (1000, 1000),
 ) -> TlsAppendCluster:
     """Three pinned peers with internal TLS and V2 active; a paired collection with a replica of
     both indexes on every peer, uploaded and written back once. The first peer leads Raft and so
@@ -485,8 +486,8 @@ def _start_tls_append_cluster(
     tls_env = {
         **_generate_tls_certs(tmp_path / "tls"),
         # Applying the real client's large recovery entries can occupy the debug consensus
-        # thread for several seconds. Keep the initial leader until the intended fault; use
-        # the same tick on followers and restarted peers, as in the large session fixtures.
+        # thread for several seconds. Keep the initial leader until the intended fault,
+        # as in the large session fixtures; a test can stagger the followers' election ticks.
         "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000",
     }
     peer_dirs = make_peer_folders(tmp_path, len(TLS_PEER_IDS))
@@ -534,7 +535,13 @@ def _start_tls_append_cluster(
                 f"{log_prefix}_peer_{index}.log",
                 bootstrap_uri,
                 port=base_ports[index],
-                extra_env={**tls_env, "QDRANT__CLUSTER__PEER_ID": str(TLS_PEER_IDS[index])},
+                extra_env={
+                    **tls_env,
+                    "QDRANT__CLUSTER__PEER_ID": str(TLS_PEER_IDS[index]),
+                    "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": str(
+                        follower_tick_period_ms[index - 1]
+                    ),
+                },
                 p2p_tls=True,
             )
         )
@@ -632,6 +639,9 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
                 pause_file
             ),
         },
+        # Campaign windows of 20-40 s and 60-120 s leave time for the first follower's
+        # vote to reach the other over a new TLS channel, avoiding a split vote.
+        follower_tick_period_ms=(1000, 3000),
     )
     genesis_state_digest = _enroll(leader_url, append_client)
     appended = _append_one_point(leader_url, append_client, genesis_state_digest)
@@ -658,7 +668,6 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
 
     coordinator.proc.send_signal(signal.SIGSTOP)
     try:
-        # The 1 s fixture tick gives Raft's randomized 20-40 tick election interval up to 40 s.
         wait_for(followers_elected_another_leader, wait_for_timeout=60)
     finally:
         pause_file.unlink()
