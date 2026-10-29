@@ -15408,7 +15408,22 @@ esac
                     .and_then(Value::as_str),
                 Some(metadata_sentinel),
             );
+
+            let collection_pass = Auth::new_internal(Access::full("For test"))
+                .check_collection_access("metadata_docs", AccessRequirements::new(), "test")
+                .unwrap();
+            toc.get_collection(&collection_pass)
+                .await
+                .unwrap()
+                .stop_gracefully()
+                .await;
         });
+
+        // Windows enforces database/WAL locks on reads. Finish and close storage
+        // before inspecting every persisted file, without skipping locked files.
+        drop(dispatcher);
+        drop(toc);
+        drop(runtime);
 
         let sentinel = metadata_sentinel.as_bytes();
         for root in [storage_dir.path(), temp_dir.path()] {
