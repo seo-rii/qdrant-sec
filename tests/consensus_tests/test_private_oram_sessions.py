@@ -4284,6 +4284,13 @@ def test_private_oram_snapshots_reject_active_external_recovery(
         is True
     )
 
+    # Collection snapshot names use whole-second UTC timestamps. Avoid replacing
+    # the checkpoint snapshot when recovery begins and aborts within that second.
+    def snapshot_timestamp_is_unused() -> bool:
+        suffix = time.strftime("-%Y-%m-%d-%H-%M-%S.snapshot", time.gmtime())
+        return not any(name.endswith(suffix) for name in baseline_collection)
+
+    wait_for(snapshot_timestamp_is_unused, wait_for_timeout=30)
     resumed = requests.post(f"{collection_snapshots_url}?wait=true", timeout=60)
     assert_http_ok(resumed)
     assert len(snapshot_names(collection_snapshots_url)) == len(baseline_collection) + 1
