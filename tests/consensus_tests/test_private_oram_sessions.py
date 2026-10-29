@@ -2718,27 +2718,52 @@ def test_private_oram_mutation_v2_stale_preparing_reconcile_revalidates_after_gu
     journal_root = _private_oram_mutation_v2_journal_root(peer_dirs[0])
     journal_at_commit = _private_oram_mutation_v2_file_tree(journal_root)
     assert journal_at_commit
+    journal_state_at_commit = json.loads(
+        (journal_root / "active/state.json").read_text()
+    )
+    assert journal_state_at_commit["phase"] == "point_stage_durable"
     assert owner_log.read_text(errors="replace").count(admitted_failure_marker) == (
         admitted_failure_count
     )
 
     commit_pause_file.unlink()
     wait_for(
-        lambda: owner_log.read_text(errors="replace").count(admitted_failure_marker)
-        == admitted_failure_count + 1,
-        wait_for_timeout=30,
-    )
-    wait_for(
         lambda: owner_log.read_text(errors="replace").count(scan_pause_marker)
         > scan_pause_count_after_attempt,
         wait_for_timeout=30,
+    )
+    # After acquiring the guard, the stale Preparing attempt sees the committed
+    # lease and returns successfully. Terminal resume records that exact decision.
+    assert owner_log.read_text(errors="replace").count(admitted_failure_marker) == (
+        admitted_failure_count
     )
     assert all(
         _private_oram_consensus_protocol_projection(peer_dir)
         == committed_projection["value"]
         for peer_dir in peer_dirs
     )
-    assert _private_oram_mutation_v2_file_tree(journal_root) == journal_at_commit
+    journal_after_reconcile = _private_oram_mutation_v2_file_tree(journal_root)
+    next_sequence = journal_state_at_commit["sequence"] + 1
+    decision_record = f"active/state_records/{next_sequence:020d}.json"
+    assert set(journal_after_reconcile) == set(journal_at_commit) | {decision_record}
+    for path, digest in journal_at_commit.items():
+        if path != "active/state.json":
+            assert journal_after_reconcile[path] == digest, path
+    assert journal_after_reconcile["active/state.json"] == (
+        journal_after_reconcile[decision_record]
+    )
+    decision_state = json.loads((journal_root / decision_record).read_text())
+    assert decision_state["sequence"] == next_sequence
+    assert decision_state["phase"] == "decision_durable"
+    assert decision_state["decision"]["kind"] == "exact_new"
+    assert decision_state["predecessor"] == {
+        "kind": "previous_v2",
+        "record": {
+            "sequence": journal_state_at_commit["sequence"],
+            "phase": journal_state_at_commit["phase"],
+            "record_digest": journal_state_at_commit["record_digest"],
+        },
+    }
 
     supervisor_pause_file.unlink()
     terminal_projection: dict[str, dict] = {}
@@ -2791,7 +2816,7 @@ def test_private_oram_mutation_v2_stale_preparing_reconcile_revalidates_after_gu
     assert terminal_projection["value"] != committed_projection["value"]
     assert owner_log.read_text(errors="replace").count(admitted_attempt_marker) == 1
     assert owner_log.read_text(errors="replace").count(admitted_failure_marker) == (
-        admitted_failure_count + 1
+        admitted_failure_count
     )
 
     def all_supervisors_are_ready() -> bool:
