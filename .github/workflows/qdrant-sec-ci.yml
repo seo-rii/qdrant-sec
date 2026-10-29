@@ -266,6 +266,16 @@ jobs:
           fi
           exit "$status"
 
+      - name: Upload private ORAM cluster logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: private-oram-cluster-logs
+          path: |
+            private-oram-e2e.log
+            consensus_test_logs
+          retention-days: 10
+
   private-oram-upgrade-compatibility:
     name: Private ORAM previous-binary upgrade compatibility
     runs-on: ubuntu-latest
