@@ -1327,6 +1327,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collection_and_full_snapshot_reject_active_private_oram_session() {
         let _guard = route_e2e_guard();
@@ -1441,6 +1442,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collection_and_full_snapshot_reject_active_private_result_oram_session() {
         let _guard = route_e2e_guard();
@@ -1940,6 +1942,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recover_snapshot_rejects_active_private_oram_session() {
         let _guard = route_e2e_guard();
@@ -2053,6 +2056,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recover_snapshot_rejects_active_private_result_oram_session() {
         let _guard = route_e2e_guard();

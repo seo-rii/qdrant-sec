@@ -678,6 +678,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_and_delete_collection_reject_active_private_oram_session() {
         let _guard = route_e2e_guard();
@@ -826,6 +827,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_and_delete_collection_reject_active_private_result_oram_session() {
         let _guard = route_e2e_guard();

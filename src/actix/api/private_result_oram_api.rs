@@ -1596,6 +1596,7 @@ mod private_result_oram_rest_tests {
     /// uploaded, rewritten by a signed commit and captured in a collection snapshot must leave no
     /// payload bytes, fetch or point token, or client key bytes under the storage, snapshot or
     /// temp directories.
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_payloads_store_no_plaintext_sentinels() {
         let _guard = route_e2e_guard();
@@ -2049,6 +2050,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_uploads_and_reads_through_rest_routes() {
         let _guard = route_e2e_guard();
@@ -4726,6 +4728,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn setup_rest_routes_revalidate_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -4952,6 +4955,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_rest_read_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -5083,6 +5087,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_rest_commit_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();

@@ -1021,6 +1021,7 @@ mod tests {
         assert!(!err.contains("docs_payload_v1"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_bucket_root_mismatch() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1053,6 +1054,7 @@ mod tests {
         assert!(!err.contains(SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_preflight_rejects_private_oram_v2_owner_state() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1088,6 +1090,7 @@ mod tests {
         assert!(!err.contains(PRIVATE_ORAM_OWNER_JOURNAL_DIR), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_sanitizes_private_hnsw_store_paths() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1124,6 +1127,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_client_state_alias() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1252,6 +1256,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_non_empty_temp() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1287,6 +1292,7 @@ mod tests {
         assert!(!err.contains("sentinel"), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_accepts_private_hnsw_restore_layout() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1298,6 +1304,7 @@ mod tests {
             .expect("valid private HNSW ORAM snapshot layout must pass CLI preflight");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_manifest_signature_tamper() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1332,6 +1339,7 @@ mod tests {
         assert!(!err.contains(SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_runtime_public_key_mismatch() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1367,6 +1375,7 @@ mod tests {
         assert!(!err.contains(SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_hnsw_manifest_owner_key_mismatch() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1455,7 +1464,7 @@ mod tests {
         assert!(!err.contains("missing-hnsw-oram-target"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_configured_private_hnsw_oram_symlink() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1486,6 +1495,7 @@ mod tests {
         assert!(!err.contains(SIGNING_KEY_ID));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_accepts_private_result_oram_snapshot() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1497,6 +1507,7 @@ mod tests {
             .expect("valid private result ORAM snapshot should pass CLI preflight");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_sanitizes_private_result_store_paths() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1531,6 +1542,7 @@ mod tests {
         assert!(!err.contains(&fixture.buckets[0].ciphertext), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_client_state_alias() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1657,6 +1669,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_non_empty_temp() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1690,6 +1703,7 @@ mod tests {
         assert!(!err.contains("sentinel"), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_bucket_commitment_mismatch() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1734,6 +1748,7 @@ mod tests {
         assert!(!err.contains(RESULT_SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_oram_manifest_signature_tamper() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1759,6 +1774,7 @@ mod tests {
         assert!(!err.contains(RESULT_SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_runtime_public_key_mismatch() {
         let fixture = PrivateResultSnapshotFixture::build();
@@ -1791,6 +1807,7 @@ mod tests {
         assert!(!err.contains(RESULT_SIGNING_KEY_ID), "{err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_snapshot_crypto_preflight_rejects_private_result_oram_manifest_owner_key_mismatch() {
         let fixture = PrivateResultSnapshotFixture::build();

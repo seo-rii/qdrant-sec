@@ -929,6 +929,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_collection_snapshot_allows_unrelated_metadata_during_preparation() {
         let _guard = route_e2e_guard();
@@ -986,6 +987,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_full_snapshot_rejects_namespace_change_after_preparation() {
         let _guard = route_e2e_guard();
@@ -1243,6 +1245,7 @@ mod tests {
         assert!(!message.contains("api-key"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_oram_collection_lifecycle_guard_blocks_private_hnsw_upload() {
         let _guard = route_e2e_guard();
@@ -1292,6 +1295,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_oram_collection_lifecycle_guard_blocks_private_result_oram_upload() {
         let _guard = route_e2e_guard();

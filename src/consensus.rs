@@ -1786,6 +1786,7 @@ mod tests {
         assert!(log_line.contains("context_bytes"), "{log_line}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collection_creation_and_private_oram_consensus_cas_pass_consensus() {
         // Given

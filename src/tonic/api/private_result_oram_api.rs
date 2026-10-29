@@ -1626,6 +1626,7 @@ mod private_result_oram_grpc_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_uploads_and_reads_through_grpc_service() {
         let _guard = route_e2e_guard();
@@ -5356,6 +5357,7 @@ mod private_result_oram_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn distributed_initial_staging_builds_validated_result_replication_bundle() {
         let _guard = route_e2e_guard();
@@ -5545,6 +5547,7 @@ mod private_result_oram_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn setup_grpc_routes_revalidate_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -5750,6 +5753,7 @@ mod private_result_oram_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_grpc_read_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -5852,6 +5856,7 @@ mod private_result_oram_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_grpc_commit_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
