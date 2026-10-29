@@ -2000,12 +2000,35 @@ def test_private_oram_mutation_v2_append_commits_and_cleans_up(
         expected_roots["result"],
     )
 
-    replayed = requests.post(
-        f"{leader_url}/collections/{COLLECTION}/private-oram/v2/mutation/append",
-        json=append_body,
-        timeout=30,
-    )
-    assert 400 <= replayed.status_code < 500, replayed.text
+    replayed: requests.Response | None = None
+
+    def replay_is_rejected_by_current_leader() -> bool:
+        nonlocal replayed
+        infos = {peer_url: get_cluster_info(peer_url) for peer_url in peer_urls}
+        leader_id = infos[peer_urls[0]]["raft_info"]["leader"]
+        if leader_id is None or any(
+            info["raft_info"]["leader"] != leader_id for info in infos.values()
+        ):
+            return False
+        current_leader_url = next(
+            peer_url for peer_url, info in infos.items() if info["peer_id"] == leader_id
+        )
+        response = requests.post(
+            f"{current_leader_url}/collections/{COLLECTION}/private-oram/v2/mutation/append",
+            json=append_body,
+            timeout=30,
+        )
+        # Leadership can move again after discovery; only that precondition is retryable.
+        if response.status_code == 500 and response.json()["status"]["error"] == (
+            "Pre-condition failure: private ORAM mutation must be coordinated by the current leader"
+        ):
+            return False
+        assert 400 <= response.status_code < 500, response.text
+        replayed = response
+        return True
+
+    wait_for(replay_is_rejected_by_current_leader, wait_for_timeout=30)
+    assert replayed is not None
     sensitive_ciphertext = append_body["owner_prepare"]["indexes"][0][
         "ordered_encrypted_buckets"
     ]["buckets"][0]["ciphertext"]
