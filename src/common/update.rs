@@ -8135,7 +8135,7 @@ esac
         ensure_encrypted_vector_update_sidecar_fanout_is_atomic("docs", 0).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_moves_dense_vector_into_encrypted_sidecar() {
         let bridge = fake_openfhe_bridge();
@@ -8178,7 +8178,7 @@ esac
         assert!(!serialized.contains("-42.5"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_plaintext_query_without_opt_in() {
         let bridge = fake_openfhe_bridge();
@@ -8222,7 +8222,7 @@ esac
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_preflights_client_encrypted_query_metadata() {
         let bridge = fake_openfhe_bridge();
@@ -8520,7 +8520,7 @@ esac
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_sparse_encrypted_vector() {
         let bridge = fake_openfhe_bridge();
@@ -8551,7 +8551,7 @@ esac
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_reserved_sidecar_collision() {
         let bridge = fake_openfhe_bridge();
@@ -8722,7 +8722,7 @@ esac
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_moves_batch_vectors_into_encrypted_sidecars() {
         let bridge = fake_openfhe_bridge();
@@ -8768,7 +8768,7 @@ esac
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_batch_vector_count_mismatch() {
         let bridge = fake_openfhe_bridge();
@@ -8800,7 +8800,7 @@ esac
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_keeps_point_input_on_encryption_failure() {
         let bridge = fake_openfhe_bridge();
@@ -8841,7 +8841,7 @@ esac
         assert_eq!(payload, original_payload);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_keeps_batch_input_on_partial_encryption_failure() {
         let bridge = fake_openfhe_bridge();
@@ -8894,7 +8894,7 @@ esac
         assert_eq!(payloads, original_payloads);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn combined_payload_and_vector_write_provenance_keeps_both_proofs() {
         let bridge = fake_openfhe_bridge();
@@ -9054,7 +9054,7 @@ esac
         assert!(!serialized_payload.contains("-0.125"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn ckks_vector_search_groups_uses_sidecar_scores() {
         let runtime = Runtime::new().unwrap();
@@ -15479,7 +15479,7 @@ esac
         .unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn do_upsert_points_encrypts_payload_before_storage() {
         if std::env::var_os("QDRANT_SEC_LONG_UPDATE_TEST_STACK").is_none() {

@@ -10076,6 +10076,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn ckks_score_query_source_batch_forwards_query_rk_id_not_key_id() {
         let bridge_dir = tempfile::Builder::new()

@@ -18815,6 +18815,7 @@ mod tests {
         assert!(!rendered.contains("signature_b64"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_tracks_crypto_material_env_names() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -18901,6 +18902,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_reuses_cached_pool_for_matching_backend_policy() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -18956,6 +18958,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_evicts_only_lru_pool_when_cache_is_full() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -24206,6 +24209,7 @@ mod tests {
         assert_bad_input_redacted(sidecar_err, "client CKKS vector sidecar entry is invalid");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_redacts_client_ckks_query_validation_errors() {
         let (_bridge_dir, bridge_program, bridge_sha256_b64) = test_bridge_program();
@@ -24616,6 +24620,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_client_ckks_query_envelopes_in_clustered_mode() {
         let (_bridge_dir, bridge_program, bridge_sha256_b64) = test_bridge_program();
