@@ -86,6 +86,13 @@ use crate::common::{
     load_local_collection, new_local_collection, simple_collection_fixture,
 };
 
+fn canonical_collection_tempdir() -> tempfile::TempDir {
+    Builder::new()
+        .prefix("collection")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap()
+}
+
 fn runtime_verified_client_envelopes_for_operation(
     operation: &CollectionUpdateOperations,
     collection_crypto_id: &str,
@@ -2134,7 +2141,7 @@ async fn server_encrypted_collection_load_ignores_malformed_client_nonce_cache()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_encrypted_collection_load_rejects_malformed_client_nonce_cache() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let snapshots_path = collection_dir.path().join("snapshots");
     let collection =
         encrypted_collection_fixture(collection_dir.path(), 1, client_payload_encryption_config())
@@ -2359,7 +2366,7 @@ async fn crypto_migration_rewrites_payload_when_closure_underreports_change() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crypto_migration_rejects_client_envelope_mutation() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection =
         encrypted_collection_fixture(collection_dir.path(), 1, client_payload_encryption_config())
             .await;
@@ -4425,7 +4432,7 @@ async fn client_encrypted_payload_rejects_unbound_blind_index_token_writes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_encrypted_payload_accepts_bound_blind_index_token_writes() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection = encrypted_collection_fixture(
         collection_dir.path(),
         1,
@@ -5658,7 +5665,7 @@ async fn peer_update_rejects_client_envelope_replay_without_verifier_manifest() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_encrypted_payload_marker_must_match_collection_guard() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection =
         encrypted_collection_fixture(collection_dir.path(), 1, client_payload_encryption_config())
             .await;
@@ -6392,7 +6399,7 @@ async fn client_encrypted_payload_marker_must_match_collection_guard() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_encrypted_payload_nonce_replay_survives_collection_reload() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection_path = collection_dir.path().to_path_buf();
     let snapshot_path = collection_path.join("snapshots");
     let collection =
@@ -6502,7 +6509,7 @@ async fn client_encrypted_payload_nonce_replay_survives_collection_reload() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_encrypted_payload_nonce_replay_cache_backfills_from_stored_payloads() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection_path = collection_dir.path().to_path_buf();
     let snapshot_path = collection_path.join("snapshots");
     let collection =
@@ -8973,7 +8980,7 @@ async fn encrypted_vector_segment_snapshot_recovers_unindexed_sidecars_after_rel
 
 #[tokio::test(flavor = "multi_thread")]
 async fn encrypted_vector_segment_snapshot_treats_optimizer_candidate_graph_as_residual() {
-    let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
+    let collection_dir = canonical_collection_tempdir();
     let collection_path = collection_dir.path().to_path_buf();
     let snapshot_path = collection_path.join("snapshots");
     let mut optimizer_config = TEST_OPTIMIZERS_CONFIG.clone();
