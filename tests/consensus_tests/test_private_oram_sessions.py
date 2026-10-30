@@ -3272,9 +3272,15 @@ def test_private_oram_mutation_v2_post_clear_crash_restarts_archive_and_ack(
     # can outlast the default election floor while materializing the recovery entry.
     consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
     pause_env = {**consensus_env, pause_env_name: str(pause_file)}
+    # Give the surviving followers distinct election windows after the owner is
+    # stopped, so a split vote cannot consume the bounded failover wait.
     prepared = _prepare_private_oram_mutation_v2_collection(
         tmp_path,
-        [pause_env, consensus_env, consensus_env],
+        [
+            pause_env,
+            consensus_env,
+            {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "3000"},
+        ],
     )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
