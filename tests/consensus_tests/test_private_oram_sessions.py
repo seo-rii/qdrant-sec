@@ -32,6 +32,7 @@ from .utils import (
     get_cluster_info,
     get_collection_cluster_info,
     get_collection_info,
+    get_p2p_uri,
     get_port,
     get_qdrant_exec,
     get_uri,
@@ -628,6 +629,7 @@ def _private_oram_activation_fixture(
     peer_ids: tuple[int, ...],
     peer_port_bases: list[int],
     identities: list[dict],
+    p2p_tls: bool = False,
 ) -> dict:
     assert len(peer_ids) == len(peer_port_bases) == len(identities)
     binary_capability_digest = identities[0]["binary_capability_digest"]
@@ -640,7 +642,7 @@ def _private_oram_activation_fixture(
         "peers": [
             {
                 "peer_id": peer_id,
-                "p2p_uri": get_uri(port_base),
+                "p2p_uri": get_p2p_uri(port_base, p2p_tls),
                 "signer": identity["public_key"],
             }
             for peer_id, port_base, identity in zip(
@@ -861,6 +863,7 @@ def _start_private_oram_mutation_v2_cluster(
     tmp_path: pathlib.Path,
     extra_env_by_peer: list[dict[str, str]] | None = None,
     create_auto_collection_before_followers: bool = False,
+    p2p_tls: bool = False,
 ) -> tuple[list[str], list[pathlib.Path], dict, int]:
     peer_ids = PRIVATE_ORAM_MUTATION_V2_PEER_IDS
     if extra_env_by_peer is None:
@@ -878,7 +881,7 @@ def _start_private_oram_mutation_v2_cluster(
     ]
     assert tuple(identity["peer_id"] for identity in identities) == peer_ids
     activation = _private_oram_activation_fixture(
-        peer_ids, peer_port_bases, identities
+        peer_ids, peer_port_bases, identities, p2p_tls=p2p_tls
     )
     for peer_dir, peer_id in zip(peer_dirs, peer_ids, strict=True):
         _write_private_oram_mutation_v2_runtime_config(
@@ -890,6 +893,7 @@ def _start_private_oram_mutation_v2_cluster(
         "private_oram_mutation_v2_peer_0.log",
         port=peer_port_bases[0],
         extra_env=extra_env_by_peer[0],
+        p2p_tls=p2p_tls,
         capture_stderr=True,
     )
     leader = wait_peer_added(bootstrap_api)
@@ -915,6 +919,7 @@ def _start_private_oram_mutation_v2_cluster(
                 bootstrap_uri,
                 port=peer_port_bases[index],
                 extra_env=extra_env_by_peer[index],
+                p2p_tls=p2p_tls,
                 capture_stderr=True,
             )
         )
@@ -1715,12 +1720,14 @@ def _prepare_private_oram_mutation_v2_collection(
     extra_env_by_peer: list[dict[str, str]] | None = None,
     fixture_logical_capacity: int = 2,
     sharding_method: str = "custom",
+    p2p_tls: bool = False,
 ) -> dict:
     peer_urls, peer_dirs, bootstrap_fixture, leader = (
         _start_private_oram_mutation_v2_cluster(
             tmp_path,
             extra_env_by_peer,
             create_auto_collection_before_followers=sharding_method == "auto",
+            p2p_tls=p2p_tls,
         )
     )
     leader_url = peer_urls[0]
@@ -2042,6 +2049,10 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
     tmp_path: pathlib.Path,
     restart_coordinator: bool,
 ):
+    # Import after module loading: the enrollment fixtures also use session helpers.
+    from .test_private_oram_v2_enrollment import _generate_tls_certs
+
+    tls_env = _generate_tls_certs(tmp_path / "tls")
     prepared_pause = tmp_path / "private-oram-v2-post-prepared.pause"
     scan_pause = tmp_path / "private-oram-v2-prepared-supervisor.pause"
     ack_pause = tmp_path / "private-oram-v2-rejection-pre-ack.pause"
@@ -2055,6 +2066,7 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
     # leadership changes are explicit and must cross the durable prepared boundary.
     peer_env = [
         {
+            **tls_env,
             "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": str(tick),
             "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_SUPERVISOR_SCAN_PAUSE_FILE": str(
                 scan_pause
@@ -2068,7 +2080,9 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
     peer_env[0]["QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE"] = str(
         prepared_pause
     )
-    prepared = _prepare_private_oram_mutation_v2_collection(tmp_path, peer_env)
+    prepared = _prepare_private_oram_mutation_v2_collection(
+        tmp_path, peer_env, p2p_tls=True
+    )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
     owner_id, successor_id, _ = PRIVATE_ORAM_MUTATION_V2_PEER_IDS
@@ -2140,9 +2154,10 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
         peer_urls[index] = start_peer(
             peer_dirs[index],
             peer_logs[index].name,
-            get_uri(peer_processes[bootstrap_index].p2p_port),
+            get_p2p_uri(peer_processes[bootstrap_index].p2p_port, True),
             port=port,
             extra_env=peer_env[index],
+            p2p_tls=True,
             capture_stderr=True,
         )
         peer_processes[index] = next(
@@ -2412,7 +2427,10 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
             assert current["active_append_attempt"] is None
             return True
 
-        wait_for(fresh_mutation_is_committed_and_cleaned, wait_for_timeout=120)
+        # Fresh append includes commit, parent cleanup, clear and its acknowledgement.
+        # A debug run reached ClearPending after 119s of uninterrupted Raft progress;
+        # use the existing full-generation cleanup budget for the remaining stages.
+        wait_for(fresh_mutation_is_committed_and_cleaned, wait_for_timeout=300)
         _wait_for_private_oram_epochs(peer_dirs, NEXT_EPOCH, 2)
         _assert_private_oram_mutation_v2_archive_chain(peer_dirs[0], 1)
     finally:
