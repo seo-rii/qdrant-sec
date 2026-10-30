@@ -9,7 +9,7 @@
 //!   three points and returns them, with one signed V1 write-back per index, in the
 //!   `private_oram_cluster_fixture` shape. Each write-back re-seals the root bucket under the
 //!   next epoch, so every stored bucket stays readable by this client. An optional
-//!   `"tree_height"` (1-16, default 2) sets both indexes' Path ORAM tree height.
+//!   `"tree_height"` (2-16, default 2) sets both indexes' Path ORAM tree height.
 //! - `{"cmd": "enroll", "template": ...}` (after both write-backs) signs the V2 immutable
 //!   manifest of both indexes and a genesis state whose client state digest is that of the
 //!   sealed append checkpoint built from the real position maps.
@@ -229,8 +229,8 @@ impl Client {
                 if let Some(tree_height) = command.get("tree_height").and_then(Value::as_u64) {
                     self.tree_height = u32::try_from(tree_height)
                         .ok()
-                        .filter(|height| (1..=16).contains(height))
-                        .ok_or("tree_height must be between 1 and 16")?;
+                        .filter(|height| (2..=16).contains(height))
+                        .ok_or("tree_height must be between 2 and 16")?;
                 }
                 self.build(collection_id)
             }
