@@ -9084,7 +9084,12 @@ async fn encrypted_vector_segment_snapshot_treats_optimizer_candidate_graph_as_r
                 continue;
             };
             if metadata.is_dir() {
-                for entry in fs::read_dir(&path).unwrap() {
+                // Optimizers can remove a temporary directory after the metadata check.
+                let entries = match fs::read_dir(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    entries => entries.unwrap(),
+                };
+                for entry in entries {
                     pending.push(entry.unwrap().path());
                 }
                 continue;
