@@ -101,6 +101,43 @@ pub fn private_oram_crash_point(name: &str) {
 #[inline(always)]
 pub fn private_oram_crash_point(_name: &str) {}
 
+/// Environment variable naming the private ORAM fault point at which an operation fails.
+#[cfg(feature = "private-oram-crash-points")]
+pub const PRIVATE_ORAM_FAULT_POINT_ENV: &str = "QDRANT_PRIVATE_ORAM_FAULT_POINT";
+
+/// Test-only failure point (feature `private-oram-crash-points`): returns a service error the
+/// first time it is reached in a process when `QDRANT_PRIVATE_ORAM_FAULT_POINT` names it, so a test
+/// can fail a step the way a timed-out proposal or a leader change does, without killing the
+/// process; recovery that runs the same step again passes it. `Ok` in every other build.
+#[cfg(feature = "private-oram-crash-points")]
+pub fn private_oram_fault_point(name: &str) -> Result<(), StorageError> {
+    static FIRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if std::env::var(PRIVATE_ORAM_FAULT_POINT_ENV).is_ok_and(|point| point == name)
+        && let Ok(mut fired) = FIRED.lock()
+        && !fired.iter().any(|point| point == name)
+    {
+        fired.push(name.to_string());
+        log::error!("failing at private ORAM fault point {name}");
+        return Err(StorageError::service_error(format!(
+            "private ORAM fault point {name}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "private-oram-crash-points"))]
+#[inline(always)]
+pub fn private_oram_fault_point(_name: &str) -> Result<(), StorageError> {
+    Ok(())
+}
+
+/// A test-only kill point and failure point of the same name.
+#[inline(always)]
+pub fn private_oram_test_point(name: &str) -> Result<(), StorageError> {
+    private_oram_crash_point(name);
+    private_oram_fault_point(name)
+}
+
 /// How many times an unresolved private ORAM epoch CAS is re-proposed before the writeback is
 /// left prepared for recovery.
 const PRIVATE_ORAM_EPOCH_CAS_RESOLVE_ATTEMPTS: usize = 3;

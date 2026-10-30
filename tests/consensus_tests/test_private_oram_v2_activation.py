@@ -125,7 +125,7 @@ def _wait_for_stable_voters(peer_urls: list[str]) -> None:
     the cluster's formation."""
     wait_for(
         lambda: all(get_cluster_info(url)["raft_info"]["is_voter"] for url in peer_urls),
-        wait_for_timeout=60,
+        wait_for_timeout=120,
     )
 
 

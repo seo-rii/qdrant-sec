@@ -1566,7 +1566,7 @@ async fn complete_private_oram_admitted_handoff_v2(
     // the sole replacement for reservation retention.
     detached.mark_admitted_ack_pending()?;
     require_exact_admitted_recovery_manifest_v2(dispatcher, coordinated)?;
-    storage::dispatcher::private_oram_crash_point("mutation_v2_after_admission");
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_admission")?;
     private_oram_mutation_pause_v2(
         PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV,
         "Private ORAM staging mutation append post-admission pause reached",
@@ -1576,6 +1576,7 @@ async fn complete_private_oram_admitted_handoff_v2(
         materialize_private_oram_admitted_parent_v2(dispatcher, settings, detached, coordinated)
             .await?;
     detached.mark_parent_sequence1()?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_parent_materialized")?;
     detached.begin_owner_adoption()?;
     let owners_prepared = coordinate_private_oram_owner_adoption_v2(
         dispatcher,
@@ -1587,6 +1588,7 @@ async fn complete_private_oram_admitted_handoff_v2(
     )
     .await?;
     detached.mark_parent_sequence2()?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_owner_adoption")?;
     detached.begin_point_staging()?;
     let _point_stage = stage_private_oram_mutation_point_v2(
         dispatcher,
@@ -1614,6 +1616,7 @@ async fn complete_private_oram_admitted_handoff_v2(
         &detached.immutable_manifest().manifest.owner_signing_key_id,
     )
     .await?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_before_outcome_acknowledgement")?;
     acknowledge_detached_reservation_outcome_v3(
         dispatcher,
         settings,
@@ -1652,9 +1655,9 @@ async fn decide_private_oram_admitted_mutation_v2(
                 // Both the live handoff and admitted recovery reach this boundary after durable
                 // recovery readiness and reservation ACK. A live handoff failure must not let
                 // recovery bypass the test's pre-decision crash, including an expired lease.
-                storage::dispatcher::private_oram_crash_point(
+                storage::dispatcher::private_oram_test_point(
                     "mutation_v2_before_consensus_commit",
-                );
+                )?;
                 lease.expires_at_unix
             }
             PrivateOramMutationLeasePhase::ConsensusCommitted { .. } => {
@@ -3826,6 +3829,7 @@ pub(crate) async fn coordinate_private_oram_recovery_readiness_v2(
         owner_evidence.push(evidence);
     }
 
+    storage::dispatcher::private_oram_test_point("mutation_v2_readiness_after_capsules")?;
     repin_all_owners(
         consensus,
         identity,
