@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -2034,6 +2035,388 @@ def test_private_oram_mutation_v2_append_commits_and_cleans_up(
         "ordered_encrypted_buckets"
     ]["buckets"][0]["ciphertext"]
     assert sensitive_ciphertext not in replayed.text
+
+
+@pytest.mark.parametrize("restart_coordinator", [False, True], ids=["live", "restart"])
+def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
+    tmp_path: pathlib.Path,
+    restart_coordinator: bool,
+):
+    prepared_pause = tmp_path / "private-oram-v2-post-prepared.pause"
+    scan_pause = tmp_path / "private-oram-v2-prepared-supervisor.pause"
+    ack_pause = tmp_path / "private-oram-v2-rejection-pre-ack.pause"
+    prepared_pause.write_text("pause")
+    scan_pause.write_text("pause")
+    if restart_coordinator:
+        ack_pause.write_text("pause")
+
+    # Keep the coordinator at the default tick. The followers' 5-10s and 20-40s
+    # election windows select 102 on its loss, then 101 when 102 is stopped. Both
+    # leadership changes are explicit and must cross the durable prepared boundary.
+    peer_env = [
+        {
+            "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": str(tick),
+            "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_SUPERVISOR_SCAN_PAUSE_FILE": str(
+                scan_pause
+            ),
+            "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_REJECTION_PRE_ACK_PAUSE_FILE": str(
+                ack_pause
+            ),
+        }
+        for tick in (100, 250, 1000)
+    ]
+    peer_env[0]["QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE"] = str(
+        prepared_pause
+    )
+    prepared = _prepare_private_oram_mutation_v2_collection(tmp_path, peer_env)
+    peer_urls = prepared["peer_urls"]
+    peer_dirs = prepared["peer_dirs"]
+    owner_id, successor_id, _ = PRIVATE_ORAM_MUTATION_V2_PEER_IDS
+    assert prepared["leader"] == owner_id
+    log_dir = pathlib.Path(init_pytest_log_folder())
+    peer_logs = [log_dir / f"private_oram_mutation_v2_peer_{i}.log" for i in range(3)]
+    peer_processes = [
+        next(process for process in processes if get_uri(process.http_port) == url)
+        for url in peer_urls
+    ]
+    paused_processes = []
+
+    def uniform_projection():
+        projections = [
+            _private_oram_consensus_protocol_projection(peer_dir)
+            for peer_dir in peer_dirs
+        ]
+        if projections[0] is None or any(
+            projection != projections[0] for projection in projections[1:]
+        ):
+            return None
+        return projections[0]
+
+    def authority(projection):
+        slots = projection["private_oram_mutation_lease_slots"]
+        assert len(slots) == 1
+        envelope = next(iter(slots.values()))["authority"]
+        assert envelope["mode"] == "activated"
+        return envelope["state"]
+
+    def marker_reached(peer_index, marker):
+        path = peer_logs[peer_index]
+        return path.exists() and marker in path.read_text(errors="replace")
+
+    def cluster_info(index):
+        response = requests.get(f"{peer_urls[index]}/cluster", timeout=5)
+        assert_http_ok(response)
+        return response.json()["result"]
+
+    def wait_for_leader(indices, leader_id):
+        def leader_is_uniform():
+            try:
+                return all(
+                    cluster_info(index)["raft_info"]["leader"] == leader_id
+                    for index in indices
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                return False
+
+        wait_for(leader_is_uniform, wait_for_timeout=60)
+
+    def pause_peer(index):
+        process = peer_processes[index]
+        process.proc.send_signal(signal.SIGSTOP)
+        paused_processes.append(process)
+
+    def resume_peer(index):
+        process = peer_processes[index]
+        process.proc.send_signal(signal.SIGCONT)
+        paused_processes.remove(process)
+
+    def restart_peer(index, bootstrap_index, suffix):
+        old_process = peer_processes[index]
+        port = old_process.p2p_port
+        if old_process.proc.poll() is None:
+            old_process.kill()
+            processes.remove(old_process)
+        peer_logs[index] = log_dir / f"private_oram_mutation_v2_peer_{index}_{suffix}.log"
+        peer_urls[index] = start_peer(
+            peer_dirs[index],
+            peer_logs[index].name,
+            get_uri(peer_processes[bootstrap_index].p2p_port),
+            port=port,
+            extra_env=peer_env[index],
+            capture_stderr=True,
+        )
+        peer_processes[index] = next(
+            process
+            for process in processes
+            if get_uri(process.http_port) == peer_urls[index]
+        )
+        wait_for_peer_online(peer_urls[index], path="/cluster")
+
+    initial = _wait_for_private_oram_consensus_protocol_projection(peer_dirs)
+    initial_authority = authority(initial)
+    assert initial_authority["lease_slot"]["generation"] == 0
+    assert initial_authority["lease_slot"]["max_writer_fence"] == 0
+    owner_checkpoints = initial_authority["owner_checkpoint_table"]["checkpoints"]
+    expected_owners = {checkpoint["owner_peer_id"] for checkpoint in owner_checkpoints}
+    assert expected_owners == {owner_id}
+
+    def assert_not_admitted(projection):
+        current = authority(projection)
+        assert current["lease_slot"] == initial_authority["lease_slot"]
+        assert current["lifecycle"]["active"] is None
+        assert projection["private_oram_mutation_states"] == initial["private_oram_mutation_states"]
+        assert projection["private_oram_epochs"] == initial["private_oram_epochs"]
+
+    opened, _ = _open_private_oram_mutation_v2_session(
+        prepared,
+        f"private-oram-v2-prepared-{restart_coordinator}".encode(),
+    )
+    append_context = _private_oram_mutation_v2_append_context(prepared, opened)
+    _, read_responses = _execute_private_oram_mutation_v2_reads(
+        peer_urls[0], append_context
+    )
+    finalized = _run_private_oram_mutation_v2_fixture_command(
+        "finalize-mutation-v2-append",
+        {"context": append_context, "read_responses": read_responses},
+    )
+    accepted = _post_result(
+        f"{peer_urls[0]}/collections/{COLLECTION}/private-oram/v2/mutation/append",
+        finalized["rest_append_body"],
+    )
+    assert accepted == {"accepted": True, "phase": "prestage_pending"}
+    wait_for(
+        marker_reached,
+        0,
+        "Private ORAM staging mutation append post-prepared pause reached",
+        wait_for_timeout=90,
+    )
+    observed = {}
+
+    def prepared_is_durable():
+        projection = uniform_projection()
+        if projection is None:
+            return False
+        current = authority(projection)
+        attempt = current["active_append_attempt"]
+        if attempt is None or attempt["prepared"] is None:
+            return False
+        reservation = json.loads(attempt["reservation_canonical_json"])["base_reservation"]
+        manifest = json.loads(attempt["prepared"]["recovery_manifest_canonical_json"])
+        assert reservation["mutation_id"] == finalized["mutation_id"]
+        assert manifest["mutation_id"] == finalized["mutation_id"]
+        assert reservation["controller_peer_id"] == owner_id
+        assert {owner["owner_peer_id"] for owner in manifest["owner_evidence"]} == expected_owners
+        assert len(current["owner_checkpoint_table"]["active_leases"]) == len(expected_owners)
+        assert_not_admitted(projection)
+        observed["prepared"] = projection
+        observed["reservation"] = reservation
+        observed["manifest"] = manifest
+        return True
+
+    wait_for(prepared_is_durable, wait_for_timeout=90)
+    prepared_authority = authority(observed["prepared"])
+    reservation = observed["reservation"]
+    prepared_record = prepared_authority["active_append_attempt"]["prepared"]
+    (challenge_outcome,) = prepared_authority["reservation_challenge_outcomes"]
+    assert challenge_outcome["attempt_id"] == reservation["attempt_id"]
+    wait_for_leader(range(3), owner_id)
+
+    def exact_rejection_is_durable():
+        projection = uniform_projection()
+        if projection is None:
+            return False
+        current = authority(projection)
+        rejected = [
+            entry for entry in current["rejected_admissions"]
+            if entry["attempt_id"] == reservation["attempt_id"]
+        ]
+        outcomes = [
+            entry for entry in current["append_outcomes"]
+            if entry["attempt_id"] == reservation["attempt_id"]
+        ]
+        if len(rejected) != 1 or len(outcomes) != 1:
+            return False
+        assert current["active_append_attempt"] is None
+        assert rejected[0]["recovery_manifest_canonical_json"] == prepared_record[
+            "recovery_manifest_canonical_json"
+        ]
+        assert rejected[0]["admission_request_digest"] == prepared_record[
+            "admission_request_digest"
+        ]
+        assert outcomes[0]["kind"] == "admission_rejected"
+        assert outcomes[0]["mutation_id"] == finalized["mutation_id"]
+        assert outcomes[0]["manifest_digest"] == observed["manifest"]["manifest_digest"]
+        assert_not_admitted(projection)
+        observed["rejected"] = projection
+        return True
+
+    try:
+        if restart_coordinator:
+            peer_processes[0].kill()
+            processes.remove(peer_processes[0])
+        else:
+            pause_peer(0)
+        wait_for_leader((1, 2), successor_id)
+        assert all(
+            cluster_info(index)["raft_info"]["term"] > reservation["controller_term"]
+            for index in (1, 2)
+        )
+
+        if restart_coordinator:
+            # All supervisors remain paused, so this process must reload an exact
+            # prepared attempt from disk without an admitted lease or a live job.
+            restart_peer(0, 1, "prepared_restart")
+        else:
+            resume_peer(0)
+        wait_for_leader(range(3), successor_id)
+        wait_for(prepared_is_durable, wait_for_timeout=60)
+        assert authority(observed["prepared"]) == prepared_authority
+        prepared_pause.unlink()
+
+        if restart_coordinator:
+            scan_pause.unlink()
+            wait_for(
+                marker_reached,
+                1,
+                "Private ORAM staging mutation rejection pre-acknowledgement pause reached",
+                wait_for_timeout=90,
+            )
+        # With the live coordinator, keep discovery paused until its own resumed
+        # worker has committed the typed rejection under the new leader's term.
+        wait_for(exact_rejection_is_durable, wait_for_timeout=90)
+        rejected_authority = authority(observed["rejected"])
+        assert rejected_authority["reservation_challenge_outcomes"] == [challenge_outcome]
+        assert rejected_authority["owner_checkpoint_table"]["active_leases"] == (
+            prepared_authority["owner_checkpoint_table"]["active_leases"]
+        )
+
+        if restart_coordinator:
+            # Also cross the durable rejection / owner-ACK boundary. The original
+            # coordinator becomes leader while the rejecting process is restarted.
+            peer_processes[1].kill()
+            processes.remove(peer_processes[1])
+            wait_for_leader((0, 2), owner_id)
+            restart_peer(1, 0, "rejection_restart")
+            wait_for_leader(range(3), owner_id)
+            wait_for(
+                marker_reached,
+                0,
+                "Private ORAM staging mutation rejection pre-acknowledgement pause reached",
+                wait_for_timeout=90,
+            )
+            assert exact_rejection_is_durable()
+            ack_pause.unlink()
+        else:
+            scan_pause.unlink()
+
+        def all_owner_acknowledgements_are_durable():
+            if not exact_rejection_is_durable():
+                return False
+            current = authority(observed["rejected"])
+            accumulator = current.get("reservation_challenge_outcome_accumulator")
+            table = current["owner_checkpoint_table"]
+            if (
+                current.get("reservation_challenge_outcomes", [])
+                or table["active_leases"]
+                or accumulator is None
+            ):
+                return False
+            assert accumulator["last_outcome_digest"] == challenge_outcome["outcome_digest"]
+            assert accumulator["last_challenge_digest"] == challenge_outcome["challenge_digest"]
+            assert accumulator["compacted_outcome_count"] == 1
+            assert table["table_sequence"] > prepared_authority[
+                "owner_checkpoint_table"
+            ]["table_sequence"]
+            assert table["checkpoints"] == owner_checkpoints
+            assert {
+                checkpoint["owner_peer_id"] for checkpoint in table["checkpoints"]
+            } == expected_owners
+            assert not table["repair_pending_owner_enrollment_ids"]
+            return True
+
+        wait_for(all_owner_acknowledgements_are_durable, wait_for_timeout=90)
+
+        def rejected_runtime_has_retired():
+            response = requests.get(
+                f"{peer_urls[0]}/cluster/private-oram/mutation-v2/status",
+                timeout=30,
+            )
+            assert_http_ok(response)
+            status = response.json()["result"]["supervisor"]
+            return (
+                status["state"] == "ready"
+                and status["process_local_pending"] == 0
+                and status["owned_elsewhere"] == 0
+                and status["awaiting_cleanup"] == 0
+                and status["failed"] == 0
+                and status["block_reason"] is None
+            )
+
+        # A completed negative outcome must retire the live process registration
+        # even after durable discovery has no more pending ACK candidates.
+        wait_for(rejected_runtime_has_retired, wait_for_timeout=60)
+        if not restart_coordinator:
+            assert cluster_info(0)["raft_info"]["leader"] == successor_id
+
+        if not restart_coordinator:
+            # Preserve 101's process memory across both changes: a stale frozen
+            # session, job or same-generation runtime-history entry must not block
+            # a fresh append when its coordinator becomes leader again.
+            pause_peer(1)
+            wait_for_leader((0, 2), owner_id)
+            resume_peer(1)
+        wait_for_leader(range(3), owner_id)
+        prepared["leader_url"] = peer_urls[0]
+        fresh_opened, _ = _open_private_oram_mutation_v2_session(
+            prepared,
+            f"private-oram-v2-after-prepared-rejection-{restart_coordinator}".encode(),
+        )
+        assert fresh_opened["mutation_id"] != finalized["mutation_id"]
+        fresh_context = _private_oram_mutation_v2_append_context(prepared, fresh_opened)
+        _, fresh_reads = _execute_private_oram_mutation_v2_reads(peer_urls[0], fresh_context)
+        fresh = _run_private_oram_mutation_v2_fixture_command(
+            "finalize-mutation-v2-append",
+            {"context": fresh_context, "read_responses": fresh_reads},
+        )
+        assert _post_result(
+            f"{peer_urls[0]}/collections/{COLLECTION}/private-oram/v2/mutation/append",
+            fresh["rest_append_body"],
+        ) == {"accepted": True, "phase": "prestage_pending"}
+
+        def fresh_mutation_is_committed_and_cleaned():
+            projection = uniform_projection()
+            if projection is None:
+                return False
+            current = authority(projection)
+            (state,) = projection["private_oram_mutation_states"].values()
+            slot = current["lease_slot"]
+            cleared = current["lifecycle"]["last_cleared"]
+            if (
+                state["state_sequence"] != 1
+                or slot["generation"] != 1
+                or slot["active"] is not None
+                or current["lifecycle"]["active"] is not None
+                or cleared is None
+                or "acknowledged" not in cleared["resolution"]
+                or current["owner_checkpoint_table"]["active_leases"]
+                or current.get("reservation_challenge_outcomes", [])
+            ):
+                return False
+            assert slot["max_writer_fence"] == 1
+            assert slot["last_clear"]["generation"] == 1
+            assert state["signed_state_digest"] == fresh["new_state_digest"]
+            assert state["last_transition"]["receipt"]["mutation_id"] == fresh["mutation_id"]
+            assert cleared["mutation_id"] == fresh["mutation_id"]
+            assert current["active_append_attempt"] is None
+            return True
+
+        wait_for(fresh_mutation_is_committed_and_cleaned, wait_for_timeout=120)
+        _wait_for_private_oram_epochs(peer_dirs, NEXT_EPOCH, 2)
+        _assert_private_oram_mutation_v2_archive_chain(peer_dirs[0], 1)
+    finally:
+        for process in paused_processes:
+            if process.proc.poll() is None:
+                process.proc.send_signal(signal.SIGCONT)
 
 
 def test_private_oram_mutation_v2_owner_follower_resumes_after_leader_change(
