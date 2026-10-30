@@ -9536,7 +9536,8 @@ mod wire_tests {
             &prepared,
             lease.clone(),
             manifest_json,
-            private_oram_mutation_aggregate_apply_context_for_test(
+            // Rejection advances aggregate history without changing the lease/state binding.
+            private_oram_mutation_aggregate_apply_context_with_outer_binding_for_test(
                 &prepared,
                 PrivateOramMutationMaterialOperationV2::AdmissionRejected,
                 private_oram_mutation_admission_request_digest_v2(
@@ -9544,6 +9545,7 @@ mod wire_tests {
                     manifest.manifest_digest(),
                 )
                 .unwrap(),
+                prepared.aggregate().unwrap().outer_binding_digest.clone(),
                 1,
                 base_index + 2,
             )
