@@ -130,7 +130,10 @@ def start_slow_downloads(peer_uri, shard_id, stop_event, n=2):
     deadline = time.time() + 15
     for r in results:
         while time.time() < deadline:
-            if r.get("phase") in ("streaming", "done", "error", "stopped"):
+            # Response headers arrive before the first snapshot body chunk.
+            if (r.get("phase") == "streaming" and r.get("bytes", 0) > 0) or r.get("phase") in (
+                "done", "error", "stopped",
+            ):
                 break
             time.sleep(0.2)
 
