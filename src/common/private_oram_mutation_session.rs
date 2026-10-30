@@ -836,10 +836,11 @@ impl PrivateOramMutationSessionRegistryV2 {
                 Err(invalid_mutation_session())
             };
         }
-        self.runtime_history
+        let history = self
+            .runtime_history
             .get_mut(&claim.authority.collection_id)
-            .ok_or_else(invalid_mutation_session)?
-            .rejected_tombstone = Some(claim);
+            .ok_or_else(invalid_mutation_session)?;
+        history.rejected_tombstone = Some(claim);
         Ok(())
     }
 
@@ -2023,7 +2024,7 @@ fn private_oram_same_admitted_lease_v2(
     active: &PrivateOramMutationLease,
 ) -> bool {
     let mut immutable = active.clone();
-    immutable.phase = original.phase;
+    immutable.phase = original.phase.clone();
     immutable.expires_at_unix = original.expires_at_unix;
     immutable.renewal_revision = original.renewal_revision;
     immutable == *original
@@ -5781,7 +5782,12 @@ mod tests {
         renewed.expires_at_unix = 300;
         renewed.renewal_revision = 1;
         renewed.phase =
-            storage::content_manager::consensus_ops::PrivateOramMutationLeasePhase::Committed;
+            storage::content_manager::consensus_ops::PrivateOramMutationLeasePhase::ConsensusCommitted {
+                committed_record_digest: test_digest(87),
+                committed_state_sequence: 2,
+                committed_signed_state_digest: test_digest(88),
+                receipt_digest: test_digest(89),
+            };
         assert!(private_oram_same_admitted_lease_v2(&original, &renewed));
         for changed in [
             PrivateOramMutationLease {
