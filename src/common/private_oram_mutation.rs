@@ -1433,11 +1433,12 @@ async fn complete_private_oram_admitted_handoff_v2(
     // certificate are durable. Startup reconciliation is not yet allowed to rely on sequence 2 as
     // the sole replacement for reservation retention.
     detached.mark_admitted_ack_pending()?;
-    storage::dispatcher::private_oram_crash_point("mutation_v2_after_admission");
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_admission")?;
     let parent =
         materialize_private_oram_admitted_parent_v2(dispatcher, settings, detached, coordinated)
             .await?;
     detached.mark_parent_sequence1()?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_parent_materialized")?;
     detached.begin_owner_adoption()?;
     let owners_prepared = coordinate_private_oram_owner_adoption_v2(
         dispatcher,
@@ -1449,6 +1450,7 @@ async fn complete_private_oram_admitted_handoff_v2(
     )
     .await?;
     detached.mark_parent_sequence2()?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_after_owner_adoption")?;
     detached.begin_point_staging()?;
     let _point_stage = stage_private_oram_mutation_point_v2(
         dispatcher,
@@ -1476,6 +1478,7 @@ async fn complete_private_oram_admitted_handoff_v2(
         &detached.immutable_manifest().manifest.owner_signing_key_id,
     )
     .await?;
+    storage::dispatcher::private_oram_test_point("mutation_v2_before_outcome_acknowledgement")?;
     acknowledge_detached_reservation_outcome_v3(
         dispatcher,
         settings,
@@ -1486,7 +1489,7 @@ async fn complete_private_oram_admitted_handoff_v2(
     .await?;
     detached.mark_admitted_ack_complete()?;
     detached.mark_deciding()?;
-    storage::dispatcher::private_oram_crash_point("mutation_v2_before_consensus_commit");
+    storage::dispatcher::private_oram_test_point("mutation_v2_before_consensus_commit")?;
     decide_private_oram_admitted_mutation_v2(dispatcher, coordinated.admission()).await
 }
 
@@ -3532,6 +3535,7 @@ pub(crate) async fn coordinate_private_oram_recovery_readiness_v2(
         owner_evidence.push(evidence);
     }
 
+    storage::dispatcher::private_oram_test_point("mutation_v2_readiness_after_capsules")?;
     repin_all_owners(
         consensus,
         identity,

@@ -261,6 +261,36 @@ admitted mutation whose readiness can never be certified (an owner that never
 installs its capsule) still stays blocked, because both decisions require the
 readiness certificate.
 
+The live handoff has test-only points (feature `private-oram-crash-points`)
+after admission, after the parent materialization, after the owner adoption,
+inside readiness after the capsule installs, before the outcome
+acknowledgement and before the decision. `QDRANT_PRIVATE_ORAM_CRASH_POINT`
+kills the coordinator there; `QDRANT_PRIVATE_ORAM_FAULT_POINT` makes the step
+return an error once per process, as a timed-out proposal or a leader change
+does. `test_private_oram_paired_append_recovers_a_failed_live_handoff` fails
+the handoff at every point and the supervisor commits in the same process each
+time. `test_private_oram_paired_append_commits_after_the_coordinator_restarts`
+kills the coordinator at every point and restarts it; every point but one
+commits. After a restart that follows the parent materialization, the admitted
+reconcile's re-validation of the retained owner prepare
+(`validate_private_oram_append_owner_prepare_from_durable_recovery_v2`) fails
+with a mutation contract error on every supervisor pass, so the append stays
+blocked; that case is marked as an expected failure until it is fixed.
+`test_private_oram_paired_append_commits_through_repeated_leader_changes`
+freezes whichever peer leads four times while the handoff and the recovery run.
+
+The three-peer TLS append also runs on trees of height 4 (both indexes; the
+client's `build` takes a `tree_height`, and the HNSW build reserves every slot
+but one dummy so both indexes declare the same logical capacity). In the debug
+build it completes in about 2-3.5 minutes. At height 5 each material entry of
+a few hundred KB takes 2-7 s to apply on every peer, long enough to trip the
+election timeout again and again, and the append does not finish within five
+minutes. A `perf` profile of the coordinator puts most of the time in base64
+decoding, deserializing the owner bucket batches, UTF-8 checks and hashing of
+the append material, all unoptimized in a debug build; every Raft state save
+also re-validates the whole private ORAM state (about 0.2-0.6 s) and rewrites
+a 650 KB state file.
+
 ## Risks and open questions
 
 - The floor-aware Initialize is new consensus behavior: needs the version gate,

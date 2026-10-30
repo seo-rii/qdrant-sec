@@ -1596,6 +1596,17 @@ Signed fields:
   leader로 보내야 한다. CI에서만 나던 실패도 고쳤다: dead replica 복구 test가 placement에 따라 layout
   generation 3이 되는 경우, V2 activation이 learner promotion 전에 실행되던 경우, scale-down snapshot
   test가 upload의 session lease release가 적용되기 전에 resharding을 시작하던 경우.
+- 2026-10-15: Live handoff의 여섯 지점(admission 직후, parent materialization 뒤, owner adoption 뒤,
+  readiness의 capsule install 뒤, outcome ACK 전, 결정 전)에 test 전용 crash/fault point를 두었다.
+  모든 지점에서 fault(같은 process)는 supervisor가 commit까지 끝내고, crash 뒤 재시작도 한 지점을
+  빼고 commit된다. Parent materialization 뒤 재시작하면 admitted reconcile이 retained owner
+  prepare를 다시 검증하다 mutation contract 오류로 매번 거부되어 append가 막힌다(test는 expected
+  failure로 표시, 원인 조사 중). Leader를 네 번 바꾸는 churn test도 통과한다. 더 큰 tree: height 4는
+  debug build의 TLS 3-peer에서 2-3.5분에 끝나지만 height 5는 material entry apply가 2-7 s 걸려
+  election이 반복되어 5분 안에 끝나지 않는다. Profile상 시간은 base64 decode, owner bucket batch
+  deserialize, UTF-8 검사와 hash에 쓰이고, Raft state 저장마다 private ORAM state 전체 검증(0.2-0.6 s)과
+  650 KB state file 재기록이 든다. CI는 실패한 test의 peer warning과 traceback 위치를
+  annotation으로 남긴다.
 
 완료 조건:
 

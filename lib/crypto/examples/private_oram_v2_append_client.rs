@@ -8,7 +8,8 @@
 //! - `{"cmd": "build", "collection_id": ...}` seals a V1 HNSW index and a V1 result index from
 //!   three points and returns them, with one signed V1 write-back per index, in the
 //!   `private_oram_cluster_fixture` shape. Each write-back re-seals the root bucket under the
-//!   next epoch, so every stored bucket stays readable by this client.
+//!   next epoch, so every stored bucket stays readable by this client. An optional
+//!   `"tree_height"` (1-16, default 2) sets both indexes' Path ORAM tree height.
 //! - `{"cmd": "enroll", "template": ...}` (after both write-backs) signs the V2 immutable
 //!   manifest of both indexes and a genesis state whose client state digest is that of the
 //!   sealed append checkpoint built from the real position maps.
@@ -91,12 +92,12 @@ const CLIENT_ID: &str = "tenant-a/append-e2e-sdk";
 const RK_EPOCH: u64 = 7;
 const BASE_EPOCH: u64 = 42;
 const NEXT_EPOCH: u64 = 43;
-const TREE_HEIGHT: u32 = 2;
+const DEFAULT_TREE_HEIGHT: u32 = 2;
 const HNSW_BLOCK_SIZE_BYTES: usize = 4096;
 const RESULT_BLOCK_SIZE_BYTES: u32 = 1024;
-/// Leaves one dummy slot (14 physical, 3 logical), so both indexes declare a logical capacity of
-/// four: every V2 index must declare the same one.
-const HNSW_RESERVED_SLOTS: u64 = 10;
+/// Dummy blocks each index declares. V2 requires every index to declare the same logical
+/// capacity (points plus dummies), so the HNSW build reserves every other free slot.
+const DUMMY_COUNT: u64 = 1;
 const CREATED_AT_UNIX: u64 = 1_770_000_000;
 const MAX_NEIGHBOR_REWRITES: u32 = 1;
 const MAX_CLIENT_STASH_BLOCKS: u64 = 8;
@@ -161,6 +162,7 @@ struct Client {
     owner_key: Ed25519KeyPair,
     checkpoint_key: SecretKey,
     points: Vec<PrivateHnswBuildPoint>,
+    tree_height: u32,
     hnsw: Option<HnswIndex>,
     result: Option<ResultIndex>,
     enrolled: Option<Enrolled>,
@@ -191,6 +193,7 @@ fn main() -> Result<(), BoxError> {
             .map_err(|_| "failed to create the owner key")?,
         checkpoint_key: SecretKey::from_bytes(CHECKPOINT_KEY),
         points: fixture_points(),
+        tree_height: DEFAULT_TREE_HEIGHT,
         hnsw: None,
         result: None,
         enrolled: None,
@@ -223,6 +226,12 @@ impl Client {
                 let collection_id = command["collection_id"]
                     .as_str()
                     .ok_or("build needs a collection_id")?;
+                if let Some(tree_height) = command.get("tree_height").and_then(Value::as_u64) {
+                    self.tree_height = u32::try_from(tree_height)
+                        .ok()
+                        .filter(|height| (1..=16).contains(height))
+                        .ok_or("tree_height must be between 1 and 16")?;
+                }
                 self.build(collection_id)
             }
             Some("enroll") => {
@@ -275,7 +284,7 @@ impl Client {
 
     fn build_hnsw(&self) -> Result<(HnswIndex, Value), BoxError> {
         let config = PrivateHnswOramClientConfig {
-            tree_height: TREE_HEIGHT,
+            tree_height: self.tree_height,
             bucket_size: 2,
             block_size_bytes: HNSW_BLOCK_SIZE_BYTES,
             fixed_neighbor_slots: 4,
@@ -290,7 +299,11 @@ impl Client {
             &[0, 1, 2],
         )?;
         // An index that enrolls into mutation V2 keeps physical slots free for appends.
-        reserve_private_hnsw_oram_physical_slots(&mut build, HNSW_RESERVED_SLOTS)?;
+        let physical_slots = ((1_u64 << (self.tree_height + 1)) - 1) * config.bucket_size as u64;
+        let reserved_slots = physical_slots
+            .checked_sub(self.points.len() as u64 + DUMMY_COUNT)
+            .ok_or("the HNSW tree is too small for the fixture points")?;
+        reserve_private_hnsw_oram_physical_slots(&mut build, reserved_slots)?;
         let keys = PrivateHnswClientKeys::derive_from_resource_key_with_context(
             &SecretKey::from_bytes(RESOURCE_KEY),
             &self.collection_id,
@@ -324,7 +337,7 @@ impl Client {
                     kind: OramKind::PathOram,
                     bucket_size: 2,
                     block_size_bytes: HNSW_BLOCK_SIZE_BYTES as u32,
-                    tree_height: TREE_HEIGHT,
+                    tree_height: self.tree_height,
                     path_batch_size: 1,
                 },
                 fixed_budget: FixedBudgetParams {
@@ -344,7 +357,7 @@ impl Client {
 
         // V1 write-back: read the path to leaf 0 and re-seal the root bucket under the next
         // epoch with unchanged plaintext.
-        let read_paths = vec![encode_private_hnsw_oram_leaf_label(0, TREE_HEIGHT)?];
+        let read_paths = vec![encode_private_hnsw_oram_leaf_label(0, self.tree_height)?];
         let read_signature = sign_private_hnsw_oram_read_paths_for_manifest_context(
             &self.owner_key,
             &manifest,
@@ -419,10 +432,10 @@ impl Client {
             kind: OramKind::PathOram,
             bucket_size: 2,
             block_size_bytes: RESULT_BLOCK_SIZE_BYTES,
-            tree_height: TREE_HEIGHT,
+            tree_height: self.tree_height,
             path_batch_size: 1,
         };
-        let bucket_count = (1_u64 << (TREE_HEIGHT + 1)) - 1;
+        let bucket_count = (1_u64 << (self.tree_height + 1)) - 1;
         let mut manifest = PrivateResultOramManifest {
             version: 1,
             provider: PAYLOAD_PRIVATE_RESULT_ORAM_PROVIDER.to_string(),
@@ -436,7 +449,7 @@ impl Client {
             root_hash: BASE64URL_NOPAD.encode(&[0; 32]),
             bucket_count,
             logical_result_count: self.points.len() as u64,
-            dummy_result_count: 1,
+            dummy_result_count: DUMMY_COUNT,
             owner_signing_key_id: OWNER_SIGNING_KEY_ID.to_string(),
             created_at_unix: CREATED_AT_UNIX,
         };
@@ -466,11 +479,11 @@ impl Client {
                 deleted: false,
                 generation: 1,
             };
-            let leaf_bucket = *private_result_oram_bucket_ids_for_leaf(leaf, TREE_HEIGHT)?
+            let leaf_bucket = *private_result_oram_bucket_ids_for_leaf(leaf, self.tree_height)?
                 .last()
                 .ok_or("a leaf path is never empty")?;
             plaintext[usize::try_from(leaf_bucket)?].blocks[0] = Some(block.clone());
-            positions.insert_position(payload_fetch_token, leaf, TREE_HEIGHT)?;
+            positions.insert_position(payload_fetch_token, leaf, self.tree_height)?;
             blocks.push(block);
         }
         let buckets = plaintext
@@ -493,7 +506,7 @@ impl Client {
         let manifest_signature = sign_private_result_oram_manifest(&self.owner_key, &manifest)?;
 
         // V1 write-back: read the path to leaf 0 and re-seal the root bucket.
-        let read_bucket_ids = private_result_oram_bucket_ids_for_leaf(0, TREE_HEIGHT)?;
+        let read_bucket_ids = private_result_oram_bucket_ids_for_leaf(0, self.tree_height)?;
         let read_signature = sign_private_result_oram_read_buckets(
             &self.owner_key,
             PrivateResultOramReadBucketsSignatureContext {
@@ -609,7 +622,7 @@ impl Client {
         // prunes that list, which needs every current neighbor's vector, so the candidate
         // phase reads every node: the rewrites, the insert and one candidate path per point.
         let fixed_append_read_path_count = MAX_NEIGHBOR_REWRITES + 1 + self.points.len() as u32;
-        let fixed_append_write_bucket_count = fixed_append_read_path_count * (TREE_HEIGHT + 1);
+        let fixed_append_write_bucket_count = fixed_append_read_path_count * (self.tree_height + 1);
         let capacity = |bucket_count: u64, bucket_size: u32, logical: u64, dummy: u64| {
             let physical_slots = bucket_count * u64::from(bucket_size);
             let occupancy = logical + dummy;
@@ -691,14 +704,14 @@ impl Client {
                     index_epoch: hnsw.epoch,
                     root_hash: hnsw.root_hash.clone(),
                     entry_node_id: Some(BASE64URL_NOPAD.encode(&hnsw.build.entry_node_id)),
-                    state: hnsw.build.state.to_snapshot(TREE_HEIGHT)?,
+                    state: hnsw.build.state.to_snapshot(self.tree_height)?,
                     records: self.hnsw_records(hnsw)?,
                 },
                 PrivateOramAppendClientIndexCheckpointV2::Result {
                     index_name: RESULT_INDEX_NAME.to_string(),
                     index_epoch: result.epoch,
                     root_hash: result.root_hash.clone(),
-                    state: result.positions.to_snapshot(TREE_HEIGHT)?,
+                    state: result.positions.to_snapshot(self.tree_height)?,
                     records: result_records(&result.blocks),
                 },
             ],
@@ -792,7 +805,7 @@ impl Client {
             visible_point_id: None,
             payload_fetch_token: Some(payload_fetch_token),
             vector: APPENDED_VECTOR.to_vec(),
-            initial_leaf: random_leaf()?,
+            initial_leaf: random_leaf(self.tree_height)?,
         };
         // Every node is a candidate (see the read schedule chosen at enrollment).
         let hnsw_plan = PrivateOramAppendHnswTransactionPlanV2 {
@@ -802,11 +815,11 @@ impl Client {
             writer_fence: session.writer_fence,
             paths_per_window: 1,
             candidate_node_ids: self.points.iter().map(|point| point.node_id).collect(),
-            candidate_remap_leaves: random_leaves(self.points.len() as u32)?,
-            rewrite_remap_leaves: random_leaves(MAX_NEIGHBOR_REWRITES)?,
-            padding_leaves: random_leaves(fixed_read_path_count)?,
+            candidate_remap_leaves: random_leaves(self.points.len() as u32, self.tree_height)?,
+            rewrite_remap_leaves: random_leaves(MAX_NEIGHBOR_REWRITES, self.tree_height)?,
+            padding_leaves: random_leaves(fixed_read_path_count, self.tree_height)?,
         };
-        let result_initial_leaf = random_leaf()?;
+        let result_initial_leaf = random_leaf(self.tree_height)?;
         let result_point = PrivateOramAppendResultPointV2 {
             payload_fetch_token,
             point_token,
@@ -819,8 +832,8 @@ impl Client {
             writer_lease_digest: session.writer_lease_digest.clone(),
             writer_fence: session.writer_fence,
             paths_per_window: 1,
-            insert_eviction_leaf: (result_initial_leaf + 1) % (1 << TREE_HEIGHT),
-            padding_leaves: random_leaves(fixed_read_path_count - 1)?,
+            insert_eviction_leaf: (result_initial_leaf + 1) % (1 << self.tree_height),
+            padding_leaves: random_leaves(fixed_read_path_count - 1, self.tree_height)?,
         };
         let hnsw_transaction = PrivateOramAppendHnswTransactionV2::begin(
             manifest,
@@ -920,8 +933,11 @@ impl Client {
         let session = &self.append.as_ref().ok_or("begin before reading")?.session;
         let mut bucket_ids = Vec::new();
         for path in paths {
-            let leaf = decode_private_result_oram_leaf_label(path, TREE_HEIGHT)?;
-            bucket_ids.extend(private_result_oram_bucket_ids_for_leaf(leaf, TREE_HEIGHT)?);
+            let leaf = decode_private_result_oram_leaf_label(path, self.tree_height)?;
+            bucket_ids.extend(private_result_oram_bucket_ids_for_leaf(
+                leaf,
+                self.tree_height,
+            )?);
         }
         let signature = sign_private_result_oram_read_buckets(
             &self.owner_key,
@@ -1100,7 +1116,7 @@ impl Client {
             .buckets
             .iter()
             .flat_map(|bucket| bucket.blocks.iter().flatten())
-            .chain(hnsw.build.state.to_snapshot(TREE_HEIGHT)?.stash.iter())
+            .chain(hnsw.build.state.to_snapshot(self.tree_height)?.stash.iter())
             .map(|block| (block.node_id, (block.level_mask, block.generation)))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut points = self.points.iter().collect::<Vec<_>>();
@@ -1230,14 +1246,14 @@ fn random_base64url_32() -> Result<String, BoxError> {
     Ok(BASE64URL_NOPAD.encode(&random_bytes_32()?))
 }
 
-fn random_leaf() -> Result<u64, BoxError> {
+fn random_leaf(tree_height: u32) -> Result<u64, BoxError> {
     let mut bytes = [0_u8; 8];
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "random generation failed")?;
-    Ok(u64::from_le_bytes(bytes) % (1 << TREE_HEIGHT))
+    Ok(u64::from_le_bytes(bytes) % (1 << tree_height))
 }
 
-fn random_leaves(count: u32) -> Result<Vec<u64>, BoxError> {
-    (0..count).map(|_| random_leaf()).collect()
+fn random_leaves(count: u32, tree_height: u32) -> Result<Vec<u64>, BoxError> {
+    (0..count).map(|_| random_leaf(tree_height)).collect()
 }
