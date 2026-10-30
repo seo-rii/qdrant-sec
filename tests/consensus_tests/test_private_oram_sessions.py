@@ -2205,7 +2205,9 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
         assert reservation["mutation_id"] == finalized["mutation_id"]
         assert manifest["mutation_id"] == finalized["mutation_id"]
         assert reservation["controller_peer_id"] == owner_id
-        assert {owner["owner_peer_id"] for owner in manifest["owner_evidence"]} == expected_owners
+        assert {
+            owner["receipt"]["owner_peer_id"] for owner in manifest["owner_evidence"]
+        } == expected_owners
         assert len(current["owner_checkpoint_table"]["active_leases"]) == len(expected_owners)
         assert_not_admitted(projection)
         observed["prepared"] = projection
