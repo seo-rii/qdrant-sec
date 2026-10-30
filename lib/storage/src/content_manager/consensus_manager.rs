@@ -96,6 +96,11 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::authority:
     private_oram_mutation_reservation_challenge_cancellation_v1,
     private_oram_mutation_reservation_outcome_acknowledgement_v1,
 };
+pub use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
+    PrivateOramMutationPreadmissionRecoveryCandidateV2,
+    PrivateOramMutationPreparedAppendSnapshotV2,
+    PrivateOramMutationRejectedAdmissionAcknowledgementV2,
+};
 use crate::content_manager::consensus::private_oram_mutation_cleanup::format::PrivateOramMutationFormatFloorV2;
 use crate::content_manager::consensus::private_oram_mutation_cleanup::owner_checkpoint::{
     PrivateOramOwnerCheckpointTableV1, PrivateOramOwnerEnrollmentNextStepV1,
@@ -2713,6 +2718,104 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 recovery_manifest_canonical_json,
             ),
         ))
+    }
+
+    pub(crate) fn private_oram_mutation_v2_prepared_rejection_operation(
+        &self,
+        lease: &PrivateOramMutationLease,
+        manifest: &PrivateOramMutationAllOwnersPrestagedV2,
+        expected: &str,
+    ) -> Result<ConsensusOperations, StorageError> {
+        let key = PrivateOramMutationKey {
+            collection_id: lease.collection_id.clone(),
+        };
+        let candidate = self
+            .private_oram_mutation_v2_preadmission_recovery_candidate(&key)?
+            .ok_or_else(|| StorageError::PreconditionFailed {
+                description: "private ORAM prepared append is no longer retained".to_string(),
+            })?;
+        let prepared =
+            candidate
+                .prepared_snapshot()
+                .ok_or_else(|| StorageError::PreconditionFailed {
+                    description: "private ORAM append is no longer prepared".to_string(),
+                })?;
+        if candidate.lease() != lease
+            || candidate.manifest() != manifest
+            || prepared.expected_aggregate_digest() != expected
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM prepared rejection authority changed".to_string(),
+            });
+        }
+        let canonical = encode_private_oram_mutation_admission_recovery_manifest_v2(manifest)
+            .map_err(|_| {
+                StorageError::bad_request("private ORAM prepared rejection manifest is invalid")
+            })?;
+        self.private_oram_mutation_v2_admission_rejected_operation_at_expected(
+            lease.clone(),
+            canonical,
+            expected.to_string(),
+        )
+    }
+
+    /// Captures reservation, prepared manifest and aggregate authority under one read guard.
+    pub fn private_oram_mutation_v2_preadmission_recovery_candidate(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Result<Option<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(None);
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_preadmission_recovery_candidate(key)
+    }
+
+    pub fn private_oram_mutation_v2_preadmission_recovery_candidates(
+        &self,
+    ) -> Result<Vec<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(Vec::new());
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_preadmission_recovery_candidates()
+    }
+
+    pub fn private_oram_mutation_v2_rejected_admission_acknowledgement(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+    ) -> Result<Option<PrivateOramMutationRejectedAdmissionAcknowledgementV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(None);
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_rejected_admission_acknowledgement(key, lease)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_retained_admission_outcome(
+        &self,
+        lease: &PrivateOramMutationLease,
+        manifest_digest: &str,
+    ) -> Result<Option<bool>, StorageError> {
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_retained_admission_outcome(
+                &PrivateOramMutationKey {
+                    collection_id: lease.collection_id.clone(),
+                },
+                lease,
+                manifest_digest,
+            )
     }
 
     pub fn private_oram_mutation_v2_renewal_operation(

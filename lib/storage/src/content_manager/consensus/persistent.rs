@@ -57,7 +57,9 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::authority:
     PrivateOramMutationAuthorityStateV2, PrivateOramMutationConsensusAggregateV2,
     PrivateOramMutationMaterialOperationV2, PrivateOramMutationOwnerEnrollmentPlanV2,
     PrivateOramMutationPendingReservationChallengeV1,
+    PrivateOramMutationPreadmissionRecoveryCandidateV2,
     PrivateOramMutationRecoveryCapsulesCertificateV2,
+    PrivateOramMutationRejectedAdmissionAcknowledgementV2,
     PrivateOramMutationReservationChallengeOutcomeV1,
     acknowledge_private_oram_mutation_authority_clear_v2,
     activate_private_oram_mutation_authority_v2,
@@ -4138,6 +4140,114 @@ impl Persistent {
         aggregate
             .retains_rejected_admission(lease, recovery_manifest_digest)
             .map_err(private_oram_mutation_authority_corrupt)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_preadmission_recovery_candidates(
+        &self,
+    ) -> Result<Vec<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        let mut candidates = Vec::new();
+        for state in self.private_oram_mutation_states.values() {
+            let key = PrivateOramMutationKey {
+                collection_id: state.collection_id.clone(),
+            };
+            if let Some(candidate) =
+                self.private_oram_mutation_v2_preadmission_recovery_candidate(&key)?
+            {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_unstable_by(|left, right| {
+            left.key().collection_id.cmp(&right.key().collection_id)
+        });
+        if candidates
+            .windows(2)
+            .any(|pair| pair[0].key().collection_id >= pair[1].key().collection_id)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM pre-admission recovery identity is inconsistent",
+            ));
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_preadmission_recovery_candidate(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Result<Option<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        let aggregate = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+            .ok_or_else(|| {
+                StorageError::service_error("private ORAM mutation authority state is inconsistent")
+            })?;
+        let candidate = aggregate
+            .preadmission_recovery_candidate()
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        if candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.key() != key)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM pre-admission recovery identity is inconsistent",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_rejected_admission_acknowledgement(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+    ) -> Result<Option<PrivateOramMutationRejectedAdmissionAcknowledgementV2>, StorageError> {
+        if key.collection_id != lease.collection_id {
+            return Ok(None);
+        }
+        let Some(aggregate) = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+        else {
+            return Ok(None);
+        };
+        aggregate
+            .rejected_admission_acknowledgement(lease)
+            .map_err(private_oram_mutation_authority_corrupt)
+    }
+
+    /// `Some(true)` is admitted, `Some(false)` is rejected, and `None` is unresolved.
+    pub(crate) fn private_oram_mutation_v2_retained_admission_outcome(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+        manifest_digest: &str,
+    ) -> Result<Option<bool>, StorageError> {
+        let aggregate = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+            .ok_or_else(|| {
+                StorageError::bad_request(
+                    "private ORAM V2 mutation authority is not active for collection",
+                )
+            })?;
+        let admitted = aggregate
+            .retains_admission(lease, manifest_digest)
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        let rejected = aggregate
+            .retains_rejected_admission(lease, manifest_digest)
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        match (admitted, rejected) {
+            (true, false) => Ok(Some(true)),
+            (false, true) => Ok(Some(false)),
+            (false, false) => Ok(None),
+            (true, true) => Err(StorageError::service_error(
+                "private ORAM admission has conflicting retained outcomes",
+            )),
+        }
     }
 
     pub fn has_active_private_oram_mutation(&self) -> bool {
@@ -11066,6 +11176,31 @@ mod tests {
             .private_oram_mutation_v2_aggregate_digest(&fixture.key)
             .unwrap();
         assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    fixture.preparing_slot.active.as_ref().unwrap(),
+                    expected_recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            Some(true)
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_rejected_admission_acknowledgement(
+                    &fixture.key,
+                    fixture.preparing_slot.active.as_ref().unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
             persistent.private_oram_mutation_state(&fixture.key),
             Some(fixture.old_state.clone())
         );
@@ -11263,6 +11398,33 @@ mod tests {
             lease.clone(),
             recovery_manifest_canonical_json.clone(),
         );
+        let candidate = persistent
+            .private_oram_mutation_v2_preadmission_recovery_candidate(&fixture.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.key(), &fixture.key);
+        assert_eq!(candidate.lease(), &lease);
+        assert_eq!(candidate.manifest(), &recovery_manifest);
+        let snapshot = candidate.prepared_snapshot().unwrap();
+        assert_eq!(snapshot.reservation(), &reservation);
+        assert_eq!(snapshot.prepared(), &recovery_manifest);
+        assert_eq!(snapshot.expected_aggregate_digest(), admission_expected);
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap(),
+            vec![candidate]
+        );
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    &lease,
+                    recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            None
+        );
         let rejection = ApplyPrivateOramMutationMaterialV2::admission_rejected(
             fixture.key.clone(),
             admission_expected.clone(),
@@ -11284,6 +11446,30 @@ mod tests {
             .private_oram_mutation_v2_aggregate_digest(&fixture.key)
             .unwrap();
         assert_ne!(aggregate_after_rejection, admission_expected);
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    &lease,
+                    recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            Some(false)
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        // Historical V2 reservations have no signed owner-resolution ACK, so absence of
+        // pending work alone must not authorize local runtime retirement.
+        assert!(
+            persistent
+                .private_oram_mutation_v2_rejected_admission_acknowledgement(&fixture.key, &lease,)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             persistent.private_oram_mutation_lease_slot(&fixture.key),
             Some(fixture.genesis_slot.clone())

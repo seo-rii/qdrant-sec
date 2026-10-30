@@ -78,8 +78,8 @@ use crate::content_manager::consensus::private_oram_mutation_watermark::{
     private_oram_mutation_parent_watermark_is_canonical_prefix_v2,
 };
 use crate::content_manager::consensus_ops::{
-    PrivateOramMutationClearReceiptV1, PrivateOramMutationLease, PrivateOramMutationLeasePhase,
-    PrivateOramMutationLeaseSlotV2,
+    PrivateOramMutationClearReceiptV1, PrivateOramMutationKey, PrivateOramMutationLease,
+    PrivateOramMutationLeasePhase, PrivateOramMutationLeaseSlotV2,
 };
 use crate::content_manager::private_oram_mutation_journal::{
     PrivateOramMutationAllOwnersPrestagedV2, PrivateOramMutationAppendAuthorityContextV2,
@@ -498,6 +498,98 @@ impl Debug for PrivateOramMutationRejectedAdmissionV2 {
             .field("rejected_from_aggregate_digest", &"[redacted]")
             .field("rejection_digest", &"[redacted]")
             .finish()
+    }
+}
+
+/// One consensus snapshot of the exact prepared attempt and its admission CAS authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateOramMutationPreparedAppendSnapshotV2 {
+    reservation: PrivateOramMutationAppendReservationV2,
+    prepared: PrivateOramMutationAllOwnersPrestagedV2,
+    expected_aggregate_digest: String,
+}
+
+impl PrivateOramMutationPreparedAppendSnapshotV2 {
+    pub fn reservation(&self) -> &PrivateOramMutationAppendReservationV2 {
+        &self.reservation
+    }
+
+    pub fn prepared(&self) -> &PrivateOramMutationAllOwnersPrestagedV2 {
+        &self.prepared
+    }
+
+    pub fn expected_aggregate_digest(&self) -> &str {
+        &self.expected_aggregate_digest
+    }
+}
+
+/// Durable work before admission, or its exact rejected outcome awaiting owner acknowledgement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateOramMutationPreadmissionRecoveryCandidateV2 {
+    key: PrivateOramMutationKey,
+    lease: PrivateOramMutationLease,
+    manifest: PrivateOramMutationAllOwnersPrestagedV2,
+    prepared_snapshot: Option<PrivateOramMutationPreparedAppendSnapshotV2>,
+}
+
+impl PrivateOramMutationPreadmissionRecoveryCandidateV2 {
+    pub fn key(&self) -> &PrivateOramMutationKey {
+        &self.key
+    }
+
+    pub fn lease(&self) -> &PrivateOramMutationLease {
+        &self.lease
+    }
+
+    pub fn manifest(&self) -> &PrivateOramMutationAllOwnersPrestagedV2 {
+        &self.manifest
+    }
+
+    pub fn prepared_snapshot(&self) -> Option<&PrivateOramMutationPreparedAppendSnapshotV2> {
+        self.prepared_snapshot.as_ref()
+    }
+}
+
+impl Debug for PrivateOramMutationPreadmissionRecoveryCandidateV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationPreadmissionRecoveryCandidateV2")
+            .field("generation", &self.lease.generation)
+            .field("prepared", &self.prepared_snapshot.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact negative admission and its completed owner acknowledgement, read together.
+///
+/// This is not an admitted cleanup permit and does not consume a lease generation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateOramMutationRejectedAdmissionAcknowledgementV2 {
+    lease: PrivateOramMutationLease,
+    recovery_manifest_digest: String,
+    rejection_digest: String,
+}
+
+impl PrivateOramMutationRejectedAdmissionAcknowledgementV2 {
+    pub fn lease(&self) -> &PrivateOramMutationLease {
+        &self.lease
+    }
+
+    pub fn recovery_manifest_digest(&self) -> &str {
+        &self.recovery_manifest_digest
+    }
+
+    pub fn rejection_digest(&self) -> &str {
+        &self.rejection_digest
+    }
+}
+
+impl Debug for PrivateOramMutationRejectedAdmissionAcknowledgementV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationRejectedAdmissionAcknowledgementV2")
+            .field("generation", &self.lease.generation)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1511,6 +1603,134 @@ impl PrivateOramMutationConsensusAggregateV2 {
         &self,
     ) -> Option<&PrivateOramMutationActiveAppendAttemptV2> {
         self.active_append_attempt.as_ref()
+    }
+
+    pub(crate) fn preadmission_recovery_candidate(
+        &self,
+    ) -> Result<
+        Option<PrivateOramMutationPreadmissionRecoveryCandidateV2>,
+        PrivateOramMutationJournalError,
+    > {
+        if let Some(active) = self.active_append_attempt.as_ref()
+            && let Some(prepared) = active.prepared.as_ref()
+        {
+            let reservation = decode_private_oram_mutation_append_reservation_wire(
+                &active.reservation_canonical_json,
+            )?;
+            let manifest = decode_private_oram_mutation_admission_recovery_manifest_v2(
+                &prepared.recovery_manifest_canonical_json,
+            )?;
+            reservation.validate_manifest(&manifest)?;
+            let reservation = reservation.base_reservation().clone();
+            return Ok(Some(PrivateOramMutationPreadmissionRecoveryCandidateV2 {
+                key: PrivateOramMutationKey {
+                    collection_id: reservation.collection_id().to_string(),
+                },
+                lease: reservation.preparing_lease().clone(),
+                manifest: manifest.clone(),
+                prepared_snapshot: Some(PrivateOramMutationPreparedAppendSnapshotV2 {
+                    reservation,
+                    prepared: manifest,
+                    expected_aggregate_digest: self.aggregate_digest.clone(),
+                }),
+            }));
+        }
+
+        // An earlier cancelled challenge may still be at the FIFO head. The retained
+        // rejection supplies this collection's recovery descriptor, while each ACK still
+        // uses the existing exact authority and signed receipts for its own FIFO head.
+        let Some(rejected) = self
+            .reservation_challenge_outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.kind == PrivateOramMutationReservationChallengeOutcomeKindV1::FinalizedV3
+            })
+            .find_map(|outcome| {
+                self.rejected_admissions.iter().find(|rejected| {
+                    rejected.attempt_id == outcome.attempt_id
+                        && rejected.admission_request_digest.is_some()
+                })
+            })
+        else {
+            return Ok(None);
+        };
+        let manifest = decode_private_oram_mutation_admission_recovery_manifest_v2(
+            rejected
+                .recovery_manifest_canonical_json
+                .as_deref()
+                .ok_or(PrivateOramMutationJournalError::Corrupt)?,
+        )?;
+        manifest.validate_admission_lease(&rejected.lease)?;
+        Ok(Some(PrivateOramMutationPreadmissionRecoveryCandidateV2 {
+            key: PrivateOramMutationKey {
+                collection_id: rejected.lease.collection_id.clone(),
+            },
+            lease: rejected.lease.clone(),
+            manifest,
+            prepared_snapshot: None,
+        }))
+    }
+
+    pub(crate) fn rejected_admission_acknowledgement(
+        &self,
+        lease: &PrivateOramMutationLease,
+    ) -> Result<
+        Option<PrivateOramMutationRejectedAdmissionAcknowledgementV2>,
+        PrivateOramMutationJournalError,
+    > {
+        let mut matching = self.rejected_admissions.iter().filter(|rejected| {
+            rejected.lease == *lease && rejected.admission_request_digest.is_some()
+        });
+        let Some(rejected) = matching.next() else {
+            return Ok(None);
+        };
+        if matching.next().is_some() {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        }
+        let DecodedPrivateOramMutationAppendReservation::CheckpointBoundV3(reservation) =
+            decode_private_oram_mutation_append_reservation_wire(
+                &rejected.reservation_canonical_json,
+            )?
+        else {
+            // Historical reservations have no signed owner-resolution ACK evidence.
+            return Ok(None);
+        };
+        let Some(accumulator) = self.reservation_challenge_outcome_accumulator.as_ref() else {
+            return Ok(None);
+        };
+        let base = reservation.base_reservation();
+        if self
+            .reservation_challenge_outcomes
+            .iter()
+            .any(|outcome| outcome.attempt_id == rejected.attempt_id)
+            || accumulator.last_attempt_sequence < base.attempt_sequence()
+            || !locator_is_strictly_after(
+                &accumulator.last_acknowledgement_applied,
+                &rejected.rejection_applied,
+            )
+            || (accumulator.last_attempt_sequence == base.attempt_sequence()
+                && accumulator.last_challenge_digest
+                    != reservation.prepared_challenge().prepared_challenge_digest())
+        {
+            return Ok(None);
+        }
+        // The accumulator advances only after signed receipts settle a FIFO outcome. Its
+        // retained sequence and locator prove completion even after a later ACK, while the
+        // exact rejected record keeps a pruned or different attempt from authorizing cleanup.
+        let manifest = decode_private_oram_mutation_admission_recovery_manifest_v2(
+            rejected
+                .recovery_manifest_canonical_json
+                .as_deref()
+                .ok_or(PrivateOramMutationJournalError::Corrupt)?,
+        )?;
+        manifest.validate_admission_lease(lease)?;
+        Ok(Some(
+            PrivateOramMutationRejectedAdmissionAcknowledgementV2 {
+                lease: lease.clone(),
+                recovery_manifest_digest: manifest.manifest_digest().to_string(),
+                rejection_digest: rejected.rejection_digest.clone(),
+            },
+        ))
     }
 
     pub(crate) fn append_outcomes(&self) -> &[PrivateOramMutationAppendOutcomeV2] {
@@ -8628,7 +8848,7 @@ mod wire_tests {
             renewal_revision: 0,
             phase: PrivateOramMutationLeasePhase::Preparing,
         };
-        let (base_reservation, _) = private_oram_mutation_append_fixture_for_test(
+        let (base_reservation, manifest) = private_oram_mutation_append_fixture_for_test(
             &lease,
             aggregate.append_authority_context().unwrap(),
             1,
@@ -9091,6 +9311,10 @@ mod wire_tests {
             Err(PrivateOramMutationJournalError::Corrupt)
         ));
 
+        assert_prepared_rejection_requires_owner_acknowledgement(
+            &reserved, &manifest, &owner_key, None,
+        );
+
         let rejection_request_digest =
             decode_private_oram_mutation_append_reservation_wire(&reservation_canonical_json)
                 .unwrap()
@@ -9111,6 +9335,18 @@ mod wire_tests {
         )
         .unwrap();
         let rejected_aggregate = rejected.aggregate().unwrap();
+        assert!(
+            rejected_aggregate
+                .preadmission_recovery_candidate()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            rejected_aggregate
+                .rejected_admission_acknowledgement(&lease)
+                .unwrap()
+                .is_none()
+        );
         let finalized_outcome = &rejected_aggregate.reservation_challenge_outcomes()[0];
         let abort_authority_digest = rejected_aggregate
             .append_outcomes()
@@ -9222,6 +9458,265 @@ mod wire_tests {
                 .unwrap()
                 .reservation_challenge_outcomes()
                 .is_empty()
+        );
+    }
+
+    fn assert_prepared_rejection_requires_owner_acknowledgement(
+        reserved: &PrivateOramMutationAuthorityStateV2,
+        manifest: &PrivateOramMutationAllOwnersPrestagedV2,
+        owner_key: &Ed25519KeyPair,
+        preceding_acknowledgement: Option<&PrivateOramMutationReservationOutcomeAcknowledgementV1>,
+    ) {
+        use crate::content_manager::private_oram_mutation_journal::encode_private_oram_mutation_admission_recovery_manifest_v2;
+
+        let aggregate = reserved.aggregate().unwrap();
+        let base_index = aggregate.last_material_transition.locator.index;
+        assert!(
+            aggregate
+                .preadmission_recovery_candidate()
+                .unwrap()
+                .is_none()
+        );
+        let active = aggregate.active_append_attempt().unwrap();
+        let reservation = decode_private_oram_mutation_append_reservation_wire(
+            &active.reservation_canonical_json,
+        )
+        .unwrap();
+        let lease = reservation.base_reservation().preparing_lease();
+        let manifest_json =
+            encode_private_oram_mutation_admission_recovery_manifest_v2(manifest).unwrap();
+        let prepared = apply_private_oram_mutation_authority_append_prepared_v2(
+            reserved,
+            manifest_json.clone(),
+            private_oram_mutation_aggregate_apply_context_for_test(
+                reserved,
+                PrivateOramMutationMaterialOperationV2::AppendPrepared,
+                reservation
+                    .append_prepared_request_digest(manifest)
+                    .unwrap(),
+                1,
+                base_index + 1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let candidate = prepared
+            .aggregate()
+            .unwrap()
+            .preadmission_recovery_candidate()
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.lease(), lease);
+        assert_eq!(candidate.manifest(), manifest);
+        let snapshot = candidate.prepared_snapshot().unwrap();
+        assert_eq!(snapshot.reservation(), reservation.base_reservation());
+        assert_eq!(snapshot.prepared(), manifest);
+        assert_eq!(
+            snapshot.expected_aggregate_digest(),
+            prepared.aggregate().unwrap().aggregate_digest
+        );
+
+        // Reserved-only cancellation must remain unavailable once an append is prepared.
+        assert!(
+            apply_private_oram_mutation_authority_reserved_attempt_rejected_v2(
+                &prepared,
+                active.reservation_canonical_json.clone(),
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &prepared,
+                    PrivateOramMutationMaterialOperationV2::ReservedAttemptRejected,
+                    reservation.reserved_rejection_request_digest().unwrap(),
+                    1,
+                    base_index + 2,
+                )
+                .unwrap(),
+            )
+            .is_err()
+        );
+        let rejected = apply_private_oram_mutation_authority_admission_rejected_v2(
+            &prepared,
+            lease.clone(),
+            manifest_json,
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &prepared,
+                PrivateOramMutationMaterialOperationV2::AdmissionRejected,
+                private_oram_mutation_admission_request_digest_v2(
+                    lease,
+                    manifest.manifest_digest(),
+                )
+                .unwrap(),
+                1,
+                base_index + 2,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rejected_aggregate = rejected.aggregate().unwrap();
+        assert_eq!(rejected_aggregate.lease_slot, aggregate.lease_slot);
+        assert!(rejected_aggregate.active_append_attempt().is_none());
+        let candidate = rejected_aggregate
+            .preadmission_recovery_candidate()
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.lease(), lease);
+        assert_eq!(candidate.manifest(), manifest);
+        assert!(candidate.prepared_snapshot().is_none());
+        assert!(
+            rejected_aggregate
+                .rejected_admission_acknowledgement(lease)
+                .unwrap()
+                .is_none()
+        );
+
+        let ack_ready = if let Some(acknowledgement) = preceding_acknowledgement {
+            assert_eq!(rejected_aggregate.reservation_challenge_outcomes().len(), 2);
+            let after_head = apply_private_oram_mutation_authority_acknowledge_reservation_outcome_v3(
+                &rejected,
+                encode_private_oram_mutation_reservation_outcome_acknowledgement_v1(acknowledgement).unwrap(),
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &rejected,
+                    PrivateOramMutationMaterialOperationV2::AppendReservationOutcomeAcknowledged,
+                    acknowledgement.acknowledgement_digest.clone(),
+                    1,
+                    base_index + 3,
+                ).unwrap(),
+            ).unwrap();
+            let after_head_aggregate = after_head.aggregate().unwrap();
+            assert_eq!(
+                after_head_aggregate.reservation_challenge_outcomes().len(),
+                1
+            );
+            assert!(
+                after_head_aggregate
+                    .rejected_admission_acknowledgement(lease)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                after_head_aggregate
+                    .preadmission_recovery_candidate()
+                    .unwrap()
+                    .unwrap(),
+                candidate
+            );
+            after_head
+        } else {
+            rejected.clone()
+        };
+        let rejected_aggregate = ack_ready.aggregate().unwrap();
+
+        let outcome = &rejected_aggregate.reservation_challenge_outcomes()[0];
+        let expected =
+            expected_owner_reservation_completions_v1(outcome, rejected_aggregate).unwrap();
+        assert_eq!(expected.len(), 1);
+        let expected = &expected[0];
+        let receipt = sign_private_oram_owner_reservation_resolution_receipt_v1(
+            owner_key,
+            PrivateOramOwnerReservationResolutionReceiptV1 {
+                version: PRIVATE_ORAM_OWNER_RESERVATION_RESOLUTION_VERSION_V1,
+                disposition: PrivateOramOwnerReservationResolutionDispositionV1::FinalizedInstalled,
+                collection_id: expected.collection_id.clone(),
+                owner_peer_id: expected.owner_peer_id,
+                committed_challenge_digest: expected.committed_challenge_digest.clone(),
+                reservation_intent_digest: expected.reservation_intent_digest.clone(),
+                attempt_id: expected.attempt_id.clone(),
+                challenge_applied_term: expected.challenge_applied.term,
+                challenge_applied_index: expected.challenge_applied.index,
+                resolution_applied_term: expected.resolution_applied.term,
+                resolution_applied_index: expected.resolution_applied.index,
+                reserved_terminal_intent_key: expected.reserved_terminal_intent_key.clone(),
+                finalized_reservation_digest: expected.finalized_reservation_digest.clone(),
+                durable_fence_record_digest: expected.durable_fence_record_digest.clone().unwrap(),
+                owner_store_incarnation_digest: expected.owner_store_incarnation_digest.clone(),
+                owner_store_binding_digest: expected.owner_store_binding_digest.clone(),
+                installed_intent_marker_digest: Some(digest(94)),
+                installed_prestage_receipt_digest: expected
+                    .installed_prestage_receipt_digest
+                    .clone(),
+                installed_package_sha256: Some(expected.installed_package_sha256.clone()),
+                abort_release_authority_digest: None,
+                abort_release_marker_digest: None,
+                local_resolution_record_digest: digest(95),
+            },
+            private_oram_owner_cleanup_signer_v1(owner_key, 1).unwrap(),
+        )
+        .unwrap();
+        let acknowledgement = private_oram_mutation_reservation_outcome_acknowledgement_v1(
+            outcome.outcome_digest.clone(),
+            vec![receipt],
+        )
+        .unwrap();
+        let acknowledged =
+            apply_private_oram_mutation_authority_acknowledge_reservation_outcome_v3(
+                &ack_ready,
+                encode_private_oram_mutation_reservation_outcome_acknowledgement_v1(
+                    &acknowledgement,
+                )
+                .unwrap(),
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &ack_ready,
+                    PrivateOramMutationMaterialOperationV2::AppendReservationOutcomeAcknowledged,
+                    acknowledgement.acknowledgement_digest.clone(),
+                    1,
+                    base_index + 3 + u64::from(preceding_acknowledgement.is_some()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let acknowledged_aggregate = acknowledged.aggregate().unwrap();
+        assert!(
+            acknowledged_aggregate
+                .reservation_challenge_outcomes()
+                .is_empty()
+        );
+        assert!(
+            acknowledged_aggregate
+                .preadmission_recovery_candidate()
+                .unwrap()
+                .is_none()
+        );
+        let proof = acknowledged_aggregate
+            .rejected_admission_acknowledgement(lease)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.lease(), lease);
+        assert_eq!(proof.recovery_manifest_digest(), manifest.manifest_digest());
+        assert_eq!(
+            proof.rejection_digest(),
+            rejected_aggregate.rejected_admissions[0].rejection_digest
+        );
+        let mut different_lease = lease.clone();
+        different_lease.mutation_id = digest(96);
+        assert!(
+            acknowledged_aggregate
+                .rejected_admission_acknowledgement(&different_lease)
+                .unwrap()
+                .is_none()
+        );
+
+        // Reopening consensus data preserves the exact proof after the pending outcome is gone.
+        let encoded =
+            encode_private_oram_mutation_tagged_authority_wire_json_v2(&acknowledged).unwrap();
+        let decoded = decode_private_oram_mutation_authority_wire_json_v2(&encoded).unwrap();
+        let reopened = decoded.tagged_authority().unwrap().aggregate().unwrap();
+        assert_eq!(
+            reopened.rejected_admission_acknowledgement(lease).unwrap(),
+            Some(proof)
+        );
+        let mut missing_rejection = reopened.clone();
+        missing_rejection.rejected_admissions.clear();
+        assert!(
+            missing_rejection
+                .rejected_admission_acknowledgement(lease)
+                .unwrap()
+                .is_none()
+        );
+        let mut missing_acknowledgement = reopened.clone();
+        missing_acknowledgement.reservation_challenge_outcome_accumulator = None;
+        assert!(
+            missing_acknowledgement
+                .rejected_admission_acknowledgement(lease)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -9362,7 +9857,7 @@ mod wire_tests {
             renewal_revision: 0,
             phase: PrivateOramMutationLeasePhase::Preparing,
         };
-        let (base_b, _) = private_oram_mutation_append_fixture_for_test(
+        let (base_b, manifest_b) = private_oram_mutation_append_fixture_for_test(
             &lease_b,
             cancelled_aggregate.append_authority_context().unwrap(),
             1,
@@ -9484,6 +9979,18 @@ mod wire_tests {
                 .unwrap()
                 .reserved_rejection_request_digest()
                 .unwrap();
+        let preceding_acknowledgement =
+            private_oram_mutation_reservation_outcome_acknowledgement_v1(
+                outcome_a.outcome_digest.clone(),
+                vec![receipt_a.clone()],
+            )
+            .unwrap();
+        assert_prepared_rejection_requires_owner_acknowledgement(
+            &reserved_b,
+            &manifest_b,
+            &owner_key,
+            Some(&preceding_acknowledgement),
+        );
         let rejected_b = apply_private_oram_mutation_authority_reserved_attempt_rejected_v2(
             &reserved_b,
             reservation_b_json,

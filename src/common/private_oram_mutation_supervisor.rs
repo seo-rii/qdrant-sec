@@ -13,10 +13,13 @@ use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::dispatcher::Dispatcher;
 
 use super::auth::Auth;
-use super::private_oram_mutation::reconcile_private_oram_admitted_to_commit_v2;
+use super::private_oram_mutation::{
+    reconcile_private_oram_admitted_to_commit_v2, recover_private_oram_preadmission_once_v2,
+};
 use super::private_oram_mutation_session::{
     current_unix_secs, private_oram_detached_job_deciding_for_collection_v2,
     private_oram_detached_job_exists_for_collection_v2,
+    reconcile_private_oram_rejected_runtime_jobs_v2,
 };
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::{
@@ -314,9 +317,12 @@ async fn reconcile_private_oram_mutations_once_v2(
     let keys = dispatcher.active_private_oram_mutation_keys()?;
     let pending_acknowledgements =
         dispatcher.private_oram_mutation_pending_acknowledgement_keys()?;
+    let preadmission_candidates =
+        consensus.private_oram_mutation_v2_preadmission_recovery_candidates()?;
     let candidate_count = keys
         .len()
         .checked_add(pending_acknowledgements.len())
+        .and_then(|count| count.checked_add(preadmission_candidates.len()))
         .ok_or_else(|| {
             StorageError::service_error("private ORAM mutation supervisor candidate limit exceeded")
         })?;
@@ -368,6 +374,53 @@ async fn reconcile_private_oram_mutations_once_v2(
         ..PrivateOramMutationSupervisorStatusV2::default()
     };
     let mut foreign_owner_observations = HashSet::new();
+    for candidate in preadmission_candidates {
+        let Some(collection_name) = collection_names.get(&candidate.key().collection_id) else {
+            status.failed = status.failed.saturating_add(1);
+            continue;
+        };
+        if consensus
+            .require_private_oram_activation_coordinator_is_local_leader()
+            .is_err()
+        {
+            // Prepared attempts are recovered by the current leader, not an immutable
+            // admitted owner. They must still keep follower readiness pending.
+            status.owned_elsewhere = status.owned_elsewhere.saturating_add(1);
+            continue;
+        }
+        match recover_private_oram_preadmission_once_v2(
+            dispatcher,
+            settings,
+            identity,
+            collection_name,
+            &candidate,
+        )
+        .await
+        {
+            Ok(true) => status.reconciled = status.reconciled.saturating_add(1),
+            Ok(false) => {
+                status.process_local_pending = status.process_local_pending.saturating_add(1)
+            }
+            Err(_) => {
+                log::warn!("private ORAM mutation supervisor pre-admission recovery failed");
+                status.failed = status.failed.saturating_add(1);
+            }
+        }
+    }
+    // A new leader may have acknowledged an orphan while its original coordinator was
+    // paused. Retire exact rejected local jobs on every peer, even after durable candidates
+    // have disappeared from the leader's pending-work list.
+    match reconcile_private_oram_rejected_runtime_jobs_v2(dispatcher).await {
+        Ok(retired) => {
+            status.reconciled = status
+                .reconciled
+                .saturating_add(u32::try_from(retired).unwrap_or(u32::MAX))
+        }
+        Err(_) => {
+            log::warn!("private ORAM mutation supervisor rejected runtime cleanup failed");
+            status.failed = status.failed.saturating_add(1);
+        }
+    }
     for (key, owner_peer_id, generation) in pending_acknowledgements {
         let Some(collection_name) = collection_names.get(&key.collection_id) else {
             status.failed = status.failed.saturating_add(1);

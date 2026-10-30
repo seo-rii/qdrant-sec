@@ -2928,6 +2928,59 @@ impl Dispatcher {
         })
     }
 
+    /// Rejects an exact prepared attempt without minting or consuming a live admission permit.
+    /// Admission and rejection race on the same aggregate CAS; a committed admission always
+    /// remains authoritative, including after its lease has advanced or cleared.
+    pub async fn reject_private_oram_mutation_prepared_admission_v2(
+        &self,
+        lease: &PrivateOramMutationLease,
+        manifest: &PrivateOramMutationAllOwnersPrestagedV2,
+        expected_aggregate_digest: &str,
+        wait_timeout: Option<Duration>,
+    ) -> Result<PrivateOramMutationAdmissionOutcomeV2, StorageError> {
+        let consensus = self.consensus_state.as_ref().ok_or_else(|| {
+            StorageError::service_error("private ORAM prepared rejection requires distributed mode")
+        })?;
+        let inspect = || {
+            consensus
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    lease,
+                    manifest.manifest_digest(),
+                )
+                .map(|outcome| {
+                    outcome.map(|admitted| {
+                        if admitted {
+                            PrivateOramMutationAdmissionOutcomeV2::AppliedExact
+                        } else {
+                            PrivateOramMutationAdmissionOutcomeV2::CommittedRejected
+                        }
+                    })
+                })
+        };
+        if let Some(outcome) = inspect()? {
+            return Ok(outcome);
+        }
+        let operation = match consensus.private_oram_mutation_v2_prepared_rejection_operation(
+            lease,
+            manifest,
+            expected_aggregate_digest,
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return inspect()?.ok_or(error),
+        };
+        for _ in 0..3 {
+            let _proposal = consensus
+                .propose_consensus_op_with_await(operation.clone(), wait_timeout)
+                .await;
+            if let Some(outcome) = inspect()? {
+                return Ok(outcome);
+            }
+        }
+        Err(StorageError::service_error(
+            "private ORAM prepared rejection outcome requires recovery",
+        ))
+    }
+
     /// Submits an already-built admission. An exact retry is both idempotent and a Raft ordering
     /// barrier: a lost first response cannot be mistaken for a definitive pre-admission failure.
     pub async fn submit_private_oram_mutation_admission_v2(
