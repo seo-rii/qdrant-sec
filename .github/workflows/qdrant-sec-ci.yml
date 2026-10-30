@@ -257,10 +257,16 @@ jobs:
             # One annotation per failing test and one with the assertion lines, any peer panic and
             # the log tail (job logs and artifacts need sign-in). The step runs under
             # `bash -e -o pipefail`, so a grep without matches must not end it early.
-            { grep -E '^(FAILED|ERROR) ' private-oram-e2e.log || true; } | head -n 8 | while read -r line; do
+            # A step keeps at most 10 error annotations: 5 failed tests, the details, and the peer
+            # warnings of the first 3 failed tests.
+            { grep -E '^(FAILED|ERROR) ' private-oram-e2e.log || true; } | head -n 5 | while read -r line; do
               echo "::error title=private ORAM cluster test failed::${line}"
             done
-            details=$({ grep -E '^E   ' private-oram-e2e.log | head -n 40 || true; grep -rh -A2 'panicked at' consensus_test_logs 2>/dev/null | head -n 20 || true; tail -n 15 private-oram-e2e.log; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}') || true
+            details=$({ grep -E '^(E   |(tests/)?consensus_tests/[^ ]+:[0-9]+: in )' private-oram-e2e.log | head -n 50 || true; grep -rh -A2 'panicked at' consensus_test_logs 2>/dev/null | head -n 20 || true; tail -n 15 private-oram-e2e.log; } | head -n 80 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}') || true
             echo "::error title=private ORAM cluster test details::${details}"
+            { grep -E '^FAILED ' private-oram-e2e.log || true; } | sed -E 's/^FAILED [^:]+::([^ ]+).*/\1/' | head -n 3 | while read -r test; do
+              warnings=$({ grep -HE 'WARN .*private ORAM|crash point|fault point|became leader' "consensus_test_logs/${test}"/*.log 2>/dev/null || true; } | sed -E 's#^consensus_test_logs/[^/]*/##; s/^([^:]*):[0-9-]+T([0-9:.]+)Z +/\1 \2 /' | cut -c1-240 | uniq | head -n 45 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}') || true
+              echo "::error title=private ORAM peer warnings ${test}::${warnings}"
+            done
           fi
           exit "$status"
