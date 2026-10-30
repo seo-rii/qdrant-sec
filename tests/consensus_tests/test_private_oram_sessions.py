@@ -2086,9 +2086,10 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
     if restart_coordinator:
         ack_pause.write_text("pause")
 
-    # Keep the coordinator at the default tick. The followers' 5-10s and 20-40s
-    # election windows select 102 on its loss, then 101 when 102 is stopped. Both
-    # leadership changes are explicit and must cross the durable prepared boundary.
+    # Applying the retained rejection took over two seconds in a debug run. Use
+    # 20-40s election windows for 101/102 and 60-120s for 103, as in the existing
+    # failover fixtures. SIGSTOP/kill still forces both leadership changes after
+    # the durable prepared boundary, with only one faster candidate left running.
     peer_env = [
         {
             **tls_env,
@@ -2100,7 +2101,7 @@ def test_private_oram_mutation_v2_prepared_attempt_recovers_before_admission(
                 ack_pause
             ),
         }
-        for tick in (100, 250, 1000)
+        for tick in (1000, 1000, 3000)
     ]
     peer_env[0]["QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE"] = str(
         prepared_pause
