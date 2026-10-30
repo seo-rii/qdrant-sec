@@ -2043,6 +2043,9 @@ def test_private_oram_mutation_v2_owner_follower_resumes_after_leader_change(
     # Large recovery entries can occupy the debug consensus thread for seconds.
     # Keep elections tied to the deliberate owner stop, including after restart.
     consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
+    # Separate the surviving voters' 20-40 and 60-120 second election windows.
+    # Simultaneous self-votes can otherwise exhaust the failover deadline.
+    slow_follower_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "3000"}
     pause_env = {
         **consensus_env,
         "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE": str(
@@ -2051,7 +2054,7 @@ def test_private_oram_mutation_v2_owner_follower_resumes_after_leader_change(
     }
     prepared = _prepare_private_oram_mutation_v2_collection(
         tmp_path,
-        [pause_env, consensus_env, consensus_env],
+        [pause_env, consensus_env, slow_follower_env],
     )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
