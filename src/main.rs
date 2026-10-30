@@ -439,6 +439,15 @@ fn main() -> anyhow::Result<()> {
             settings.cluster.peer_id,
         )?,
     };
+    let is_distributed_deployment = settings.cluster.enabled;
+    let private_oram_mutation_unsettled = persistent_consensus_state
+        .has_unsettled_private_oram_mutation()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if !is_distributed_deployment && private_oram_mutation_unsettled {
+        anyhow::bail!(
+            "Standalone startup is blocked by an unsettled private ORAM cluster mutation"
+        );
+    }
     let private_oram_peer_identity = private_oram_mutation_v2_startup
         .as_ref()
         .map(|activation| {
@@ -474,25 +483,22 @@ fn main() -> anyhow::Result<()> {
         private_oram_external_recovery_install_is_pending(&settings.storage.storage_path)?;
     let private_oram_external_recovery_active =
         persistent_consensus_state.has_active_private_oram_external_recovery();
-    let private_oram_mutation_active =
-        persistent_consensus_state.has_active_private_oram_mutation();
     if (args.storage_snapshot.is_some() || args.snapshot.is_some())
         && (private_oram_recovery_install_pending || private_oram_external_recovery_active)
     {
         anyhow::bail!("Snapshot recovery is blocked by an active private ORAM external recovery");
     }
-    if (args.storage_snapshot.is_some() || args.snapshot.is_some()) && private_oram_mutation_active
+    if (args.storage_snapshot.is_some() || args.snapshot.is_some())
+        && private_oram_mutation_unsettled
     {
-        anyhow::bail!("Snapshot recovery is blocked by an active private ORAM mutation");
+        anyhow::bail!("Snapshot recovery is blocked by an unsettled private ORAM mutation");
     }
     if private_oram_recovery_install_pending
         || private_oram_external_recovery_active
-        || private_oram_mutation_active
+        || private_oram_mutation_unsettled
     {
         settings.storage.handle_collection_load_errors = false;
     }
-
-    let is_distributed_deployment = settings.cluster.enabled;
 
     let temp_path = settings.storage.temp_path.as_deref();
 
@@ -652,6 +658,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("initialize consensus manager: {err}"))?
         .into();
         let is_new_deployment = consensus_state.is_new_deployment();
+        let reinitializing_follower = args.reinit && bootstrap.is_some();
 
         dispatcher =
             dispatcher.with_consensus(consensus_state.clone(), settings.cluster.resharding_enabled);
@@ -740,7 +747,10 @@ fn main() -> anyhow::Result<()> {
         //     toc_arc.resume_resharding_tasks().await;
         // });
 
-        let collections_to_recover_in_consensus = if is_new_deployment {
+        // Reinitialized followers start with an empty Raft state, but their collections
+        // already belong to the cluster and are restored by the bootstrap peer's snapshot.
+        // Re-proposing them as standalone migrations would create duplicates and abort startup.
+        let collections_to_recover_in_consensus = if is_new_deployment && !reinitializing_follower {
             let existing_collections =
                 runtime_handle.block_on(toc_arc.all_collections(&FULL_ACCESS));
             existing_collections

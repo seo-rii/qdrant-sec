@@ -165,8 +165,7 @@ fi
 }' $QDRANT_HOST qdrant.Points/Get
 
 # validate search request when vector and indices have different sizes
-set +e
-response=$(
+if response=$(
   "${docker_grpcurl[@]}" -d '{
     "collection_name": "test_sparse_collection",
     "vector": [0.2,0.1],
@@ -174,13 +173,18 @@ response=$(
     "vector_name": "test",
     "limit": 3
   }' $QDRANT_HOST qdrant.Points/Search 2>&1
-)
-if [[ $response != *"Sparse indices does not match sparse vector conditions: values: Validation error: must be the same length as indices [{}]"* ]]; then
-    echo Unexpected response, expected validation error: $response
+); then
+    echo "Expected malformed sparse search to fail, got: $response"
+    exit 1
+fi
+if ! grep -Fxq '  Code: InvalidArgument' <<< "$response" ||
+    ! grep -Fxq '  Message: Malformed sparse vector' <<< "$response"; then
+    echo "Unexpected response, expected sparse search validation error: $response"
     exit 1
 fi
 
-response=$(
+# Upsert validates the nested vector before converting the request.
+if response=$(
   "${docker_grpcurl[@]}" -d '{
     "collection_name": "test_sparse_collection",
     "wait": true,
@@ -198,9 +202,12 @@ response=$(
       }
     ]
   }' $QDRANT_HOST qdrant.Points/Upsert 2>&1
-)
-if [[ $response != *"Validation error in body: [points[0].vectors.vectors_options.vectors.[].values: Validation error: must be the same length as indices [{}]]"* ]]; then
-    echo Unexpected response, expected validation error: $response
+); then
+    echo "Expected malformed sparse upsert to fail, got: $response"
     exit 1
 fi
-set -e
+if ! grep -Fxq '  Code: InvalidArgument' <<< "$response" ||
+    ! grep -Fxq '  Message: Validation error in body: [points[0].vectors.vectors_options.vectors.[].values: Validation error: must be the same length as indices [{}]]' <<< "$response"; then
+    echo "Unexpected response, expected sparse upsert validation error: $response"
+    exit 1
+fi

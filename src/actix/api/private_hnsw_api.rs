@@ -546,6 +546,7 @@ pub fn config_private_hnsw_api(cfg: &mut web::ServiceConfig) {
 #[cfg(test)]
 mod private_hnsw_rest_tests {
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use actix_web::http::StatusCode;
     use actix_web::{App, test as actix_test, web};
@@ -962,6 +963,7 @@ mod private_hnsw_rest_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_rest_request_dtos_reject_unknown_fields() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1071,6 +1073,7 @@ mod private_hnsw_rest_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_rest_dto_debug_redacts_sensitive_values() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1245,6 +1248,7 @@ mod private_hnsw_rest_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sdk_fixture_roundtrips_through_rest_wire_dtos() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1344,6 +1348,7 @@ mod private_hnsw_rest_tests {
     /// Leakage scan (PLAN V2-D5): a private HNSW index uploaded through the server path and
     /// captured in a collection snapshot must leave no plaintext vector, node id, point token
     /// or client key bytes anywhere under the storage, snapshot or temp directories.
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_upload_and_snapshot_store_no_plaintext_sentinels() {
         let _guard = route_e2e_guard();
@@ -1398,9 +1403,13 @@ mod private_hnsw_rest_tests {
             )
             .await
             .unwrap();
-            crate::common::collections::do_create_snapshot(toc.clone(), &auth, "docs")
-                .await
-                .unwrap();
+            crate::common::collections::do_create_snapshot(
+                Arc::new(dispatcher.clone()),
+                &auth,
+                "docs",
+            )
+            .await
+            .unwrap();
         });
 
         let files = files_under(temp.path());
@@ -1501,6 +1510,7 @@ mod private_hnsw_rest_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_common_ops_require_write_access_for_mutations() {
         let _guard = route_e2e_guard();
@@ -1674,6 +1684,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rest_rejects_unsafe_private_hnsw_vector_route_without_reflecting_it() {
         let _guard = route_e2e_guard();
@@ -1896,6 +1907,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rest_rejects_private_hnsw_missing_collection_encryption_without_reflecting_collection() {
         let _guard = route_e2e_guard();
@@ -2045,6 +2057,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sdk_fixture_uploads_reads_and_commits_through_rest_routes() {
         let _guard = route_e2e_guard();
@@ -3721,7 +3734,7 @@ mod private_hnsw_rest_tests {
             let search_run = fixture.run_single_search_collect_writeback();
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 "docs",
             )
@@ -6336,6 +6349,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_rest_routes_reject_distributed_epoch_operations() {
         let _guard = route_e2e_guard();
@@ -6473,6 +6487,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_upload_rest_route_rejects_reserved_result_private_runtime_mode() {
         let _guard = route_e2e_guard();
@@ -6520,6 +6535,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_upload_rest_route_accepts_result_private_with_result_oram_binding() {
         let _guard = route_e2e_guard();
@@ -6603,6 +6619,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_read_rest_route_revalidates_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -6768,6 +6785,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_upload_rest_route_revalidates_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -6965,6 +6983,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_paths_rest_route_rejects_active_session_after_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -7233,6 +7252,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn commit_rest_route_rejects_active_session_after_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -7510,6 +7530,7 @@ mod private_hnsw_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_paths_rest_route_preserves_fixed_size_bucket_sequence() {
         let _guard = route_e2e_guard();

@@ -1246,6 +1246,7 @@ mod private_hnsw_grpc_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sdk_fixture_roundtrips_through_grpc_wire_requests_and_verified_path_response() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -1442,6 +1443,7 @@ mod private_hnsw_grpc_tests {
         assert!(!restored_commit_buckets.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn grpc_rejects_unsafe_private_hnsw_vector_route_without_reflecting_it() {
         let _guard = route_e2e_guard();
@@ -1627,6 +1629,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn grpc_private_hnsw_mutations_require_write_access_without_private_oram_details() {
         let _guard = route_e2e_guard();
@@ -1850,6 +1853,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn grpc_rejects_private_hnsw_missing_collection_encryption_without_reflecting_collection() {
         let _guard = route_e2e_guard();
@@ -1984,6 +1988,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sdk_fixture_uploads_reads_and_commits_through_grpc_service() {
         let _guard = route_e2e_guard();
@@ -3802,7 +3807,7 @@ mod private_hnsw_grpc_tests {
             let search_run = fixture.run_single_search_collect_writeback();
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 COLLECTION_NAME,
             )
@@ -6394,6 +6399,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn distributed_initial_staging_builds_validated_hnsw_replication_bundle() {
         let _guard = route_e2e_guard();
@@ -6464,6 +6470,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_grpc_routes_reject_distributed_epoch_operations() {
         let _guard = route_e2e_guard();
@@ -6603,6 +6610,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_upload_grpc_route_rejects_reserved_result_private_runtime_mode() {
         let _guard = route_e2e_guard();
@@ -6641,6 +6649,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_upload_grpc_route_accepts_result_private_with_result_oram_binding() {
         let _guard = route_e2e_guard();
@@ -6724,6 +6733,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_read_grpc_route_revalidates_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -6858,6 +6868,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_upload_grpc_route_revalidates_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -6998,6 +7009,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_paths_grpc_service_preserves_fixed_size_bucket_sequence() {
         let _guard = route_e2e_guard();
@@ -7227,6 +7239,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_paths_rejects_active_session_after_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -7420,6 +7433,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn commit_rejects_active_session_after_runtime_policy_drift() {
         let _guard = route_e2e_guard();
@@ -7642,6 +7656,7 @@ mod private_hnsw_grpc_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_paths_and_commit_require_manifest_owner_signing_key() {
         let _guard = route_e2e_guard();

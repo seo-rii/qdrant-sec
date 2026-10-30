@@ -3,6 +3,8 @@ from operator import itemgetter
 from random import randrange
 from time import sleep
 
+import pytest
+
 from .fixtures import create_collection, drop_collection
 from .utils import *
 
@@ -44,9 +46,9 @@ def compare_points(uri):
     original_points = POINTS_JSON["points"]
     fetched_points = get_collection_points(uri)
     original_points, fetched_points = [sorted(l, key=itemgetter('id')) for l in (original_points, fetched_points)]
-    pairs = zip(original_points, fetched_points)
-    diff = [(x, y) for x, y in pairs if x != y]
-    assert len(diff) == 0, f'Original and final points are not equal, diff: "{diff}"'
+    assert fetched_points == original_points, (
+        f"Original and final points differ: expected {original_points}, got {fetched_points}"
+    )
 
 
 def test_reinit_consensus(tmp_path: pathlib.Path):
@@ -97,3 +99,47 @@ def test_reinit_consensus(tmp_path: pathlib.Path):
     wait_for_uniform_cluster_status(peer_urls_new, leader)
     wait_collection_exists_and_active_on_all_peers(collection_name=COLLECTION_NAME, peer_api_uris=peer_urls_new)
     compare_points(peer_urls_new[1])
+
+
+@pytest.mark.parametrize("reinit", [False, True], ids=["ordinary", "reinit"])
+def test_standalone_to_cluster_preserves_collection_on_joining_peer(tmp_path: pathlib.Path, reinit):
+    assert_project_root()
+    first_dir = make_peer_folder(tmp_path, 0)
+    first_port = get_port()
+    standalone_url, _ = start_first_peer(
+        first_dir,
+        "standalone.log",
+        port=first_port,
+        extra_env={"QDRANT__CLUSTER__ENABLED": "false"},
+        capture_stderr=True,
+    )
+    wait_for_peer_online(standalone_url)
+    create_collection(standalone_url, shard_number=1, replication_factor=1)
+    wait_collection_exists_and_active_on_all_peers(
+        collection_name=COLLECTION_NAME, peer_api_uris=[standalone_url]
+    )
+    response = requests.put(
+        f"{standalone_url}/collections/{COLLECTION_NAME}/points?wait=true", json=POINTS_JSON
+    )
+    assert_http_ok(response)
+    compare_points(standalone_url)
+    # PeerProcess.kill waits for exit before releasing its ports.
+    processes.pop().kill()
+
+    first_url, bootstrap_uri = start_first_peer(
+        first_dir, "first_cluster_peer.log", port=first_port, reinit=reinit,
+        capture_stderr=True,
+    )
+    leader = wait_peer_added(first_url)
+    second_dir = make_peer_folder(tmp_path, 1)
+    second_url = start_peer(
+        second_dir, "joining_peer.log", bootstrap_uri, capture_stderr=True
+    )
+    peer_urls = [first_url, second_url]
+    wait_for_uniform_cluster_status(peer_urls, leader)
+    wait_collection_exists_and_active_on_all_peers(
+        collection_name=COLLECTION_NAME, peer_api_uris=peer_urls
+    )
+    # The new peer must learn the collection from consensus, not just read old local state.
+    for peer_url in peer_urls:
+        compare_points(peer_url)

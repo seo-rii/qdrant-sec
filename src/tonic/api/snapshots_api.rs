@@ -48,15 +48,7 @@ impl Snapshots for SnapshotsService {
         let timing = Instant::now();
         let dispatcher = self.dispatcher.clone();
 
-        // Nothing to verify here.
-        let pass = new_unchecked_verification_pass();
-
-        let response = do_create_snapshot(
-            Arc::clone(dispatcher.toc(&auth, &pass)),
-            &auth,
-            &collection_name,
-        )
-        .await?;
+        let response = do_create_snapshot(dispatcher, &auth, &collection_name).await?;
 
         Ok(Response::new(CreateSnapshotResponse {
             snapshot_description: Some(response.into()),
@@ -408,6 +400,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collection_and_full_snapshot_reject_active_private_oram_session() {
         let _guard = route_e2e_guard();
@@ -574,6 +567,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collection_and_full_snapshot_reject_active_private_result_oram_session() {
         let _guard = route_e2e_guard();

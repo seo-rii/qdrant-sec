@@ -173,12 +173,26 @@ pub(crate) fn validate_private_oram_mutation_activation_pending_v2(
                 proof.required_consensus_wire_protocol(),
                 false,
             ),
-            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads => (
-                3,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION,
-                true,
-            ),
+            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads => {
+                if format_floor.format_epoch() < 3
+                    || format_floor.format_epoch() % 2 == 0
+                    || format_floor.minimum_writer_protocol()
+                        < PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION
+                    || format_floor.minimum_writer_protocol()
+                        >= proof.required_consensus_wire_protocol()
+                    || proof.required_consensus_wire_protocol() < 8
+                    || proof.required_consensus_wire_protocol()
+                        > PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+                {
+                    return Err(invalid());
+                }
+                (
+                    format_floor.format_epoch(),
+                    proof.required_consensus_wire_protocol(),
+                    format_floor.minimum_writer_protocol(),
+                    true,
+                )
+            }
             _ => return Err(invalid()),
         };
     let expected_floor = private_oram_mutation_format_floor_from_barrier_v2(
@@ -195,6 +209,9 @@ pub(crate) fn validate_private_oram_mutation_activation_pending_v2(
                 .eligible_process_incarnations_digest()
                 .to_string(),
             capability_manifest_digest: proof.expected_runtime_capability_fingerprint().to_string(),
+            required_binary_capability_digest: proof
+                .required_binary_capability_digest()
+                .to_string(),
             activation_enabled,
             term: pending.prepare_entry_term,
             index: pending.prepare_entry_index,
@@ -342,16 +359,23 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                 proof.required_consensus_wire_protocol(),
                 true,
             ),
-            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads => (
-                3,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION,
-                true,
-            ),
+            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads => {
+                let floor = current_format_floor.ok_or_else(invalid)?;
+                (
+                    floor.format_epoch().checked_add(1).ok_or_else(invalid)?,
+                    proof.required_consensus_wire_protocol(),
+                    floor.minimum_writer_protocol(),
+                    true,
+                )
+            }
             PrivateOramMutationActivationBarrierPhaseV2::EnableReservationV3Writes => (
-                4,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+                current_format_floor
+                    .ok_or_else(invalid)?
+                    .format_epoch()
+                    .checked_add(1)
+                    .ok_or_else(invalid)?,
+                proof.required_consensus_wire_protocol(),
+                proof.required_consensus_wire_protocol(),
                 true,
             ),
         };
@@ -359,7 +383,8 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
         operation.phase(),
         PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads
             | PrivateOramMutationActivationBarrierPhaseV2::EnableReservationV3Writes
-    ) && proof.required_consensus_wire_protocol() != PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+    ) && !(8..=PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION)
+        .contains(&proof.required_consensus_wire_protocol())
     {
         return Err(invalid());
     };
@@ -377,6 +402,9 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                 .eligible_process_incarnations_digest()
                 .to_string(),
             capability_manifest_digest: proof.expected_runtime_capability_fingerprint().to_string(),
+            required_binary_capability_digest: proof
+                .required_binary_capability_digest()
+                .to_string(),
             activation_enabled,
             term: facts.entry_term,
             index: facts.entry_index,
@@ -407,6 +435,9 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
                     capability_manifest_digest: proof
                         .expected_runtime_capability_fingerprint()
                         .to_string(),
+                    required_binary_capability_digest: proof
+                        .required_binary_capability_digest()
+                        .to_string(),
                     activation_enabled: false,
                     term: current_pending.ok_or_else(invalid)?.prepare_entry_term(),
                     index: current_pending.ok_or_else(invalid)?.prepare_entry_index(),
@@ -421,12 +452,13 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
             let floor = current_format_floor.ok_or_else(invalid)?;
             if current_pending.is_some()
                 || !floor.activation_enabled()
-                || floor.format_epoch() != 2
-                || floor.snapshot_format_epoch() != 2
-                || floor.minimum_reader_protocol()
-                    != PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION
+                || floor.format_epoch() < 2
+                || floor.format_epoch() % 2 != 0
+                || floor.snapshot_format_epoch() != floor.format_epoch()
+                || floor.minimum_reader_protocol() != floor.minimum_writer_protocol()
                 || floor.minimum_writer_protocol()
-                    != PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION
+                    < PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION
+                || floor.minimum_reader_protocol() >= proof.required_consensus_wire_protocol()
             {
                 return Err(invalid());
             }
@@ -438,31 +470,12 @@ pub(crate) fn validate_private_oram_mutation_activation_barrier_v2(
             {
                 return Err(invalid());
             }
-            let expected_prepare_floor = private_oram_mutation_format_floor_from_barrier_v2(
-                PrivateOramMutationFormatFloorBarrierInputV2 {
-                    consensus_history_id_digest: consensus_history_id_digest.clone(),
-                    raft_group_id_digest: raft_group_id_digest.clone(),
-                    format_epoch: 3,
-                    minimum_reader_protocol: PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                    minimum_writer_protocol: PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_MIN_VERSION,
-                    snapshot_format_epoch: 3,
-                    membership_generation: proof.expected_hard_commit(),
-                    eligible_peer_set_digest: proof.eligible_peer_set_digest().to_string(),
-                    eligible_process_incarnations_digest: proof
-                        .eligible_process_incarnations_digest()
-                        .to_string(),
-                    capability_manifest_digest: proof
-                        .expected_runtime_capability_fingerprint()
-                        .to_string(),
-                    activation_enabled: true,
-                    term: pending.prepare_entry_term(),
-                    index: pending.prepare_entry_index(),
-                },
-            )
-            .map_err(|_| invalid())?;
-            if current_format_floor != Some(&expected_prepare_floor) {
-                return Err(invalid());
-            }
+            validate_private_oram_mutation_activation_pending_v2(
+                current_pending,
+                current_format_floor,
+                facts.prior_applied_index,
+                true,
+            )?;
         }
     }
     plan_private_oram_mutation_format_floor_transition_v2(current_format_floor, &next_format_floor)
@@ -509,7 +522,7 @@ pub(crate) fn private_oram_activation_uri_digest(uri: &http::Uri) -> Result<Stri
     try_private_oram_activation_peer_uri_digest_v1(scheme, &host, port).map_err(|_| ())
 }
 
-fn private_oram_activation_history_and_group_digests(
+pub(super) fn private_oram_activation_history_and_group_digests(
     cluster_identity_digest: &str,
     cluster_first_voter_peer_id: u64,
 ) -> Result<(String, String), ()> {
@@ -916,6 +929,161 @@ mod tests {
             PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
         );
         assert!(writers_v7.next_pending().is_none());
+    }
+
+    #[test]
+    fn historical_wire7_floor_upgrades_with_monotonic_epochs() {
+        use super::super::private_oram_mutation_cleanup::format::LEGACY_WIRE_7_FORMAT_FLOOR_JSON;
+
+        let legacy: PrivateOramMutationFormatFloorV2 =
+            serde_json::from_str(LEGACY_WIRE_7_FORMAT_FLOOR_JSON).unwrap();
+        let fixture = private_oram_mutation_v3_floor_upgrade_fixture_for_test(
+            legacy.floor_applied_index(),
+            2,
+            1,
+        );
+        let prepared = validate_private_oram_mutation_activation_barrier_v2(
+            &fixture.prepare_operation,
+            &fixture.authority,
+            Some(&legacy),
+            None,
+            &fixture.conf_state,
+            &fixture.peer_addresses,
+            PrivateOramMutationActivationApplyFactsV2 {
+                entry_term: fixture.current_term,
+                entry_index: fixture.base_index + 1,
+                prior_applied_index: fixture.base_index,
+                barrier_base_entry_term: fixture.base_entry_term,
+            },
+        )
+        .unwrap();
+        let floor: PrivateOramMutationFormatFloorV2 =
+            serde_json::from_slice(&serde_json::to_vec(prepared.next_format_floor()).unwrap())
+                .unwrap();
+        let pending: PrivateOramMutationActivationPendingV2 =
+            serde_json::from_slice(&serde_json::to_vec(prepared.next_pending().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(floor.format_epoch(), legacy.format_epoch() + 1);
+        assert_eq!(floor.minimum_writer_protocol(), 7);
+        assert_eq!(
+            floor.minimum_reader_protocol(),
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+        );
+        validate_private_oram_mutation_activation_pending_v2(
+            Some(&pending),
+            Some(&floor),
+            fixture.base_index + 1,
+            true,
+        )
+        .unwrap();
+        let enabled = validate_private_oram_mutation_activation_barrier_v2(
+            &fixture.enable_operation,
+            &fixture.authority,
+            Some(&floor),
+            Some(&pending),
+            &fixture.conf_state,
+            &fixture.peer_addresses,
+            PrivateOramMutationActivationApplyFactsV2 {
+                entry_term: fixture.current_term + 1,
+                entry_index: fixture.base_index + 2,
+                prior_applied_index: fixture.base_index + 1,
+                barrier_base_entry_term: fixture.base_entry_term,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            enabled.next_format_floor().format_epoch(),
+            legacy.format_epoch() + 2
+        );
+        assert_eq!(
+            enabled.next_format_floor().minimum_writer_protocol(),
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+        );
+        assert!(enabled.next_pending().is_none());
+    }
+
+    #[test]
+    fn historical_wire8_floor_replays_then_upgrades_to_wire9() {
+        let apply = |fixture: &PrivateOramMutationActivationBarrierFixtureV2,
+                     current: Option<&PrivateOramMutationFormatFloorV2>| {
+            let prepared = validate_private_oram_mutation_activation_barrier_v2(
+                &fixture.prepare_operation,
+                &fixture.authority,
+                current,
+                None,
+                &fixture.conf_state,
+                &fixture.peer_addresses,
+                PrivateOramMutationActivationApplyFactsV2 {
+                    entry_term: fixture.current_term,
+                    entry_index: fixture.base_index + 1,
+                    prior_applied_index: fixture.base_index,
+                    barrier_base_entry_term: fixture.base_entry_term,
+                },
+            )
+            .unwrap();
+            // Restored pending reader floors must use the signed historical target protocol,
+            // rather than silently being reinterpreted as the running binary's newer version.
+            let pending: PrivateOramMutationActivationPendingV2 = serde_json::from_slice(
+                &serde_json::to_vec(prepared.next_pending().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let floor: PrivateOramMutationFormatFloorV2 =
+                serde_json::from_slice(&serde_json::to_vec(prepared.next_format_floor()).unwrap())
+                    .unwrap();
+            validate_private_oram_mutation_activation_pending_v2(
+                Some(&pending),
+                Some(&floor),
+                fixture.base_index + 1,
+                true,
+            )
+            .unwrap();
+            if let Some(current) = current {
+                assert_eq!(
+                    floor.minimum_writer_protocol(),
+                    current.minimum_writer_protocol()
+                );
+            }
+            validate_private_oram_mutation_activation_barrier_v2(
+                &fixture.enable_operation,
+                &fixture.authority,
+                Some(&floor),
+                Some(&pending),
+                &fixture.conf_state,
+                &fixture.peer_addresses,
+                PrivateOramMutationActivationApplyFactsV2 {
+                    entry_term: fixture.current_term + 1,
+                    entry_index: fixture.base_index + 2,
+                    prior_applied_index: fixture.base_index + 1,
+                    barrier_base_entry_term: fixture.base_entry_term,
+                },
+            )
+            .unwrap()
+            .next_format_floor()
+            .clone()
+        };
+        let initial = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+        let wire6 = apply(&initial, None);
+        let upgrade8 = private_oram_mutation_activation_barrier_fixture_for_test(
+            8,
+            initial.base_index + 2,
+            initial.current_term + 1,
+            initial.current_term + 1,
+            PrivateOramMutationActivationBarrierPhaseV2::PrepareReservationV3Reads,
+            PrivateOramMutationActivationBarrierPhaseV2::EnableReservationV3Writes,
+        );
+        let wire8 = apply(&upgrade8, Some(&wire6));
+        assert_eq!(wire8.format_epoch(), 4);
+        assert_eq!(wire8.minimum_reader_protocol(), 8);
+        assert_eq!(wire8.minimum_writer_protocol(), 8);
+        let upgrade9 = private_oram_mutation_v3_floor_upgrade_fixture_for_test(
+            upgrade8.base_index + 2,
+            upgrade8.current_term + 1,
+            upgrade8.current_term + 1,
+        );
+        let wire9 = apply(&upgrade9, Some(&wire8));
+        assert_eq!(wire9.format_epoch(), 6);
+        assert_eq!(wire9.minimum_reader_protocol(), 9);
+        assert_eq!(wire9.minimum_writer_protocol(), 9);
     }
 
     #[test]

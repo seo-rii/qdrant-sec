@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use common::fs::sync_parent_dir_async;
 use common::tempfile_ext::MaybeTempPath;
 use fs_err as fs;
 use fs_err::tokio as tokio_fs;
@@ -293,13 +294,22 @@ impl SnapshotStorageLocalFS {
         let checksum_file = TempPath::try_from_path(&checksum_path)?;
         let mut file = tokio_fs::File::create(checksum_path.as_path()).await?;
         file.write_all(checksum.as_bytes()).await?;
-        file.flush().await?;
+        file.sync_all().await?;
         drop(file);
 
         move_file(&source_path, &target_path_tmp).await?;
+        // Windows FlushFileBuffers requires a handle opened for writing.
+        tokio_fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(&target_path_tmp)
+            .await?
+            .sync_all()
+            .await?;
         target_path_tmp.persist(target_path).map_err(|e| e.error)?;
 
         checksum_file.keep()?;
+        sync_parent_dir_async(target_path).await?;
         get_snapshot_description(target_path).await
     }
 
@@ -408,9 +418,13 @@ impl SnapshotStorageCloud {
         source_path: &Path,
         target_path: &Path,
     ) -> CollectionResult<SnapshotDescription> {
+        let checksum = hash_file(source_path).await?;
         snapshot_storage_ops::multipart_upload(&self.client, source_path, target_path).await?;
         tokio_fs::remove_file(source_path).await?;
-        snapshot_storage_ops::get_snapshot_description(&self.client, target_path).await
+        let mut description =
+            snapshot_storage_ops::get_snapshot_description(&self.client, target_path).await?;
+        description.checksum = Some(checksum);
+        Ok(description)
     }
 
     async fn get_stored_file(

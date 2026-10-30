@@ -14,9 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use data_encoding::BASE64URL_NOPAD;
-#[cfg(unix)]
 use fs_err as fs;
-#[cfg(unix)]
 use qdrant_sec::CommandOpenFheBackend;
 use qdrant_sec::vector::CkksPlaintextQueryScoreBatchItem;
 use qdrant_sec::{
@@ -229,7 +227,7 @@ fn public_material() -> CkksPublicMaterial {
     .unwrap()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn test_bash_backend() -> CommandOpenFheBackend {
     let bash = ["/usr/bin/bash", "/bin/bash"]
         .into_iter()
@@ -1404,7 +1402,37 @@ fn constructor_rejects_invalid_identifiers_and_public_material() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn command_openfhe_checked_backend_rejects_unsupported_platform() {
+    let dir = tempfile::Builder::new()
+        .prefix("openfhe-platform-")
+        .tempdir_in(std::env::current_dir().unwrap().canonicalize().unwrap())
+        .unwrap();
+    let program = dir.path().join("bridge");
+    let bytes = b"#!/bin/sh\nexit 0\n";
+    fs::write(&program, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let digest = BASE64URL_NOPAD.encode(&Sha256::digest(bytes));
+    for result in [
+        CommandOpenFheBackend::new_checked(&program),
+        CommandOpenFheBackend::new_checked_with_sha256_b64(&program, digest),
+    ] {
+        assert!(matches!(
+            result,
+            Err(CkksError::Backend(message))
+                if message == "OpenFHE checked bridge spawn requires Linux fd-backed /proc/self/fd execution"
+        ));
+    }
+    assert_eq!(fs::read(&program).unwrap(), bytes);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_checked_constructor_validates_bridge_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -1467,7 +1495,7 @@ fn command_openfhe_backend_checked_constructor_validates_bridge_path() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_revalidates_bridge_before_spawn() {
     use std::os::unix::fs::PermissionsExt;
@@ -1879,7 +1907,7 @@ print('{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext"
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_bridge_protocol() {
     use std::os::unix::fs::PermissionsExt;
@@ -1953,7 +1981,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_reuses_registered_context_material() {
     use std::os::unix::fs::PermissionsExt;
@@ -2010,7 +2038,7 @@ done
         .unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_reregisters_context_after_worker_restart() {
     use std::os::unix::fs::PermissionsExt;
@@ -2057,7 +2085,7 @@ esac
         .unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_reuses_registered_context_for_score_and_query_requests() {
     use std::os::unix::fs::PermissionsExt;
@@ -2164,7 +2192,7 @@ done
     assert_eq!(encrypted_scores, vec![9.5, 4.25]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_security_profile_mismatch() {
     use std::os::unix::fs::PermissionsExt;
@@ -2207,7 +2235,7 @@ printf '{"version":1,"security_profile":"ckks-unsafe-test-profile","ciphertext":
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_missing_security_profile() {
     use std::os::unix::fs::PermissionsExt;
@@ -2249,7 +2277,7 @@ printf '{"version":1,"ciphertext":"b3BlbmZoZS1jaXBoZXI"}\n'
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_weak_security_level_metadata() {
     use std::os::unix::fs::PermissionsExt;
@@ -2291,7 +2319,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","security_l
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_invalid_noise_budget_metadata() {
     use std::os::unix::fs::PermissionsExt;
@@ -2352,7 +2380,7 @@ done
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_batch_weak_security_level_metadata() {
     use std::os::unix::fs::PermissionsExt;
@@ -2412,7 +2440,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","security_l
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_score_batch_invalid_noise_budget_metadata() {
     use std::os::unix::fs::PermissionsExt;
@@ -2475,7 +2503,7 @@ done
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_plaintext_query_score_protocol() {
     use std::os::unix::fs::PermissionsExt;
@@ -2531,7 +2559,7 @@ done
     assert_eq!(score, 12.5);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_plaintext_query_score_batch_protocol() {
     use std::os::unix::fs::PermissionsExt;
@@ -2589,7 +2617,7 @@ done
     assert_eq!(scores, vec![12.5, 7.25]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_encrypted_query_score_batch_protocol() {
     use std::os::unix::fs::PermissionsExt;
@@ -2652,7 +2680,7 @@ done
     assert_eq!(scores, vec![12.5, 7.25]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_encrypted_query_score_batch_response_size_mismatch() {
     use std::os::unix::fs::PermissionsExt;
@@ -2719,7 +2747,7 @@ done
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_encrypted_query_score_batch_security_profile_mismatch() {
     use std::os::unix::fs::PermissionsExt;
@@ -2787,7 +2815,7 @@ done
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_scores_stored_ciphertext_as_query() {
     use std::os::unix::fs::PermissionsExt;
@@ -2849,7 +2877,7 @@ done
     assert_eq!(scores, vec![8.5]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_score_batch_response_size_mismatch() {
     use std::os::unix::fs::PermissionsExt;
@@ -2911,7 +2939,7 @@ done
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_passes_plaintext_query_distance_metric() {
     use std::os::unix::fs::PermissionsExt;
@@ -2967,7 +2995,7 @@ done
     assert_eq!(score, 0.875);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_batch_bridge_protocol() {
     use std::os::unix::fs::PermissionsExt;
@@ -3035,7 +3063,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_batch_response_size_mismatch() {
     use std::os::unix::fs::PermissionsExt;
@@ -3094,7 +3122,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_times_out_and_kills_hung_bridge() {
     use std::os::unix::fs::PermissionsExt;
@@ -3133,7 +3161,7 @@ sleep 10
     assert!(matches!(err, CkksError::Backend(message) if message.contains("timed out")));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_timeout_does_not_wait_for_stdout_holder() {
     use std::os::unix::fs::PermissionsExt;
@@ -3175,7 +3203,7 @@ sleep 10
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_bridge_exit_after_request() {
     use std::os::unix::fs::PermissionsExt;
@@ -3215,7 +3243,7 @@ exit 0
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_oversized_bridge_output() {
     use std::os::unix::fs::PermissionsExt;
@@ -3256,7 +3284,7 @@ done
     assert!(matches!(err, CkksError::Backend(message) if message.contains("stdout exceeded")));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_invalid_json_response() {
     use std::os::unix::fs::PermissionsExt;
@@ -3299,7 +3327,7 @@ printf '{not-json}\n'
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_response_without_newline() {
     use std::os::unix::fs::PermissionsExt;
@@ -3338,7 +3366,7 @@ printf '{"version":1,"ciphertext":"b3BlbmZoZS1jaXBoZXI"}'
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_rejects_oversized_bridge_stderr() {
     use std::os::unix::fs::PermissionsExt;
@@ -3384,7 +3412,7 @@ printf '{"version":1,"security_profile":"ckks-128-n16384-d4-scale50","ciphertext
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_stderr_cap_fails_before_timeout() {
     use std::os::unix::fs::PermissionsExt;
@@ -3431,7 +3459,7 @@ done
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_reuses_worker_process_when_bridge_supports_streaming() {
     use std::os::unix::fs::PermissionsExt;
@@ -3491,7 +3519,7 @@ done
     assert_eq!(fifo_line_count(&count_lines, "request"), 2);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_uses_pool_size_for_concurrent_requests() {
     use std::os::unix::fs::PermissionsExt;
@@ -3572,7 +3600,7 @@ set -euo pipefail
     assert_eq!(fifo_line_count(&count_lines, "request"), 2);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_fails_fast_when_pool_is_busy() {
     use std::os::unix::fs::PermissionsExt;
@@ -3657,7 +3685,7 @@ done
     assert_eq!(fifo_line_count(&count_lines, "request"), 1);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn command_openfhe_backend_clones_reuse_worker_process() {
     use std::os::unix::fs::PermissionsExt;

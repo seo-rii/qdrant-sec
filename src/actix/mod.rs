@@ -495,7 +495,7 @@ fn path_has_private_oram_marker(path: &str) -> bool {
 fn is_private_oram_recovery_action(action: &str) -> bool {
     matches!(
         action,
-        "begin" | "upload" | "status" | "verify" | "commit" | "abort"
+        "begin" | "export-context" | "upload" | "status" | "verify" | "commit" | "abort"
     )
 }
 
@@ -1489,7 +1489,15 @@ mod tests {
 
     #[test]
     fn private_oram_recovery_access_paths_redact_queries_and_unknown_suffixes() {
-        for action in ["begin", "upload", "status", "verify", "commit", "abort"] {
+        for action in [
+            "begin",
+            "export-context",
+            "upload",
+            "status",
+            "verify",
+            "commit",
+            "abort",
+        ] {
             let endpoint = format!("/collections/docs/private-oram/recovery/{action}");
             assert_eq!(redact_private_oram_access_path(&endpoint), endpoint);
             assert_eq!(

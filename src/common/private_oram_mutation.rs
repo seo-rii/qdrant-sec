@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+use std::path::Path;
+
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::private_hnsw_oram_store::PrivateHnswOramStore;
 use collection::private_result_oram_store::PrivateResultOramStore;
@@ -42,13 +45,14 @@ use qdrant_sec::{
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use storage::content_manager::consensus_manager::{
-    PrivateOramOwnerEnrollmentStepV2, PrivateOramOwnerReservationPrepareContextV3,
-    PrivateOramPeerRecoverySignerPairPin, PrivateOramPeerRecoverySignerPin,
-    PrivateOramReservationChallengeDispositionKindV3, PrivateOramReservationChallengeDispositionV3,
+    PrivateOramMutationPreadmissionRecoveryCandidateV2, PrivateOramOwnerEnrollmentStepV2,
+    PrivateOramOwnerReservationPrepareContextV3, PrivateOramPeerRecoverySignerPairPin,
+    PrivateOramPeerRecoverySignerPin, PrivateOramReservationChallengeDispositionKindV3,
+    PrivateOramReservationChallengeDispositionV3,
 };
 use storage::content_manager::consensus_ops::{
     PrivateOramConsensusLayout, PrivateOramLayoutKey, PrivateOramMutationKey,
-    PrivateOramMutationLeasePhase,
+    PrivateOramMutationLease, PrivateOramMutationLeasePhase,
 };
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::private_oram_mutation_journal::{
@@ -77,7 +81,8 @@ use super::private_hnsw::{
 };
 use super::private_oram_mutation_session::{
     PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS, PrivateOramDetachedMutationAppendV2,
-    current_unix_secs,
+    acquire_private_oram_mutation_execution_v2, current_unix_secs,
+    private_oram_detached_job_exists_for_collection_v2,
 };
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::do_install_local_private_oram_owner_recovery_capsule_v2;
@@ -94,6 +99,29 @@ const PRIVATE_ORAM_PARENT_PROGRESS_MAX_STEPS: usize = 8;
 const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS: usize = 2 * 1_024 + 1;
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_ATTEMPTS: usize = 240;
+const PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE";
+const PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE";
+const PRIVATE_ORAM_MUTATION_REJECTION_PRE_ACK_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_REJECTION_PRE_ACK_PAUSE_FILE";
+
+#[cfg(debug_assertions)]
+async fn private_oram_mutation_pause_v2(variable: &str, message: &str) {
+    let Some(pause_file) = std::env::var_os(variable) else {
+        return;
+    };
+    if pause_file.is_empty() {
+        return;
+    }
+    log::warn!("{message}");
+    while Path::new(&pause_file).exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn private_oram_mutation_pause_v2(_variable: &str, _message: &str) {}
 
 fn private_oram_owner_reservation_resolution_input_v1(
     challenge: &PrivateOramOwnerReservationPrepareChallengeV1,
@@ -345,7 +373,26 @@ pub(crate) async fn run_private_oram_owner_enrollment_v2(
 ) -> StorageResult<()> {
     let coordinator_peer_id = identity.peer_id();
     for _ in 0..PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS {
-        let operation = match consensus.private_oram_mutation_v2_owner_enrollment_step(key)? {
+        let step = consensus.private_oram_mutation_v2_owner_enrollment_step(key)?;
+        if let PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id }
+        | PrivateOramOwnerEnrollmentStepV2::Activate { owner_peer_id } = &step
+        {
+            if *owner_peer_id != coordinator_peer_id {
+                // Local proposal completion does not mean this owner has applied the
+                // enrollment authority yet. Its next RPC validates that exact state.
+                let state = consensus.hard_state();
+                toc.get_channel_service()
+                    .await_commit_on_peer(
+                        *owner_peer_id,
+                        state.commit,
+                        state.term,
+                        PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                    )
+                    .await
+                    .map_err(|_| owner_enrollment_unreachable(*owner_peer_id))?;
+            }
+        }
+        let operation = match step {
             PrivateOramOwnerEnrollmentStepV2::Complete => return Ok(()),
             PrivateOramOwnerEnrollmentStepV2::Prepare { owner_peer_id } => {
                 let (owner_signer, lifecycle_state) = if owner_peer_id == coordinator_peer_id {
@@ -918,6 +965,18 @@ async fn resolve_private_oram_owner_reservation_fences_v3(
             )
             .await?
         } else {
+            // The disposition is committed locally; the owner must apply it before resolving
+            // its fence. Use the current commit/term pair, not the disposition's historical term.
+            let state = consensus.hard_state();
+            toc.get_channel_service()
+                .await_commit_on_peer(
+                    challenge.owner_peer_id,
+                    state.commit,
+                    state.term,
+                    PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                )
+                .await
+                .map_err(|_| invalid_owner_prestage())?;
             toc.get_channel_service()
                 .resolve_private_oram_mutation_owner_reservation_v3(
                     challenge.owner_peer_id,
@@ -1001,6 +1060,24 @@ async fn acknowledge_oldest_private_oram_reservation_outcome_v3(
     else {
         return Ok(false);
     };
+    let local_peer_id = dispatcher.this_peer_id();
+    if identity.peer_id() != local_peer_id
+        || (consensus
+            .require_private_oram_activation_coordinator_is_local_leader()
+            .is_err()
+            && !consensus
+                .private_oram_mutation_lease(&key)
+                .as_ref()
+                .is_some_and(|lease| {
+                    recovery.matches_active_controller_lease(local_peer_id, lease)
+                }))
+    {
+        return Err(StorageError::PreconditionFailed {
+            description:
+                "private ORAM reservation outcome must be acknowledged by the current leader or immutable active controller"
+                    .to_string(),
+        });
+    }
     let disposition = recovery.disposition().clone();
     let attempt_id = recovery
         .owner_contexts()
@@ -1289,6 +1366,73 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             return Err(error);
         }
     };
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation append post-prepared pause reached",
+    )
+    .await;
+    let key = PrivateOramMutationKey {
+        collection_id: detached.collection_id().to_string(),
+    };
+    let execution = acquire_private_oram_mutation_execution_v2(&key).await?;
+    let readiness_result: StorageResult<()> = async {
+        let auth = Auth::new_internal(Access::full("private ORAM mutation final owner readiness"));
+        let pass = auth.check_collection_access(
+            detached.collection_name(),
+            AccessRequirements::new().write(),
+            "private_oram_mutation_final_owner_readiness_v2",
+        )?;
+        let verification = new_unchecked_verification_pass();
+        let toc = dispatcher.toc(&auth, &verification);
+        let collection = toc.get_collection(&pass).await?;
+        let config = collection.config_snapshot().await;
+        if config.stable_crypto_id(collection.name())? != key.collection_id {
+            return Err(invalid_owner_prestage());
+        }
+        let owner_signing_key_id = &detached.immutable_manifest().manifest.owner_signing_key_id;
+        let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+            settings.as_ref(),
+            collection.name(),
+            collection.path(),
+            &config,
+            detached.vector_name(),
+            owner_signing_key_id,
+        )?;
+        let expectation = dispatcher.private_oram_owner_new_generation_readiness_expectation_v2(
+            &key,
+            dispatcher.this_peer_id(),
+        )?;
+        if expectation.consensus_aggregate_digest() != coordinated.prepared_aggregate_digest() {
+            return Err(invalid_owner_prestage());
+        }
+        PrivateOramOwnerPrestageStoreV2::try_new_pinned_absolute_v2(
+            PrivateHnswOramStore::new(hnsw_context.collection_path(), detached.vector_name())
+                .map_err(|_| invalid_owner_prestage())?
+                .root_path(),
+        )
+        .map_err(|_| invalid_owner_prestage())?
+        .require_ready_for_new_generation_v2(&expectation)
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM owner journal is not ready for a new generation".to_string(),
+        })?;
+        if collection.config_snapshot().await != config {
+            return Err(invalid_owner_prestage());
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = readiness_result {
+        drop(execution);
+        return resolve_failed_private_oram_preadmission_v2(
+            dispatcher.as_ref(),
+            settings.as_ref(),
+            identity.as_ref(),
+            &detached,
+            &coordinated,
+            error,
+        )
+        .await;
+    }
     let permit = match detached.bind_live_admission_permit(
         dispatcher.as_ref(),
         coordinated.admission(),
@@ -1296,23 +1440,16 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
     ) {
         Ok(permit) => permit,
         Err(error) => {
-            match reject_private_oram_coordinated_prestage_v2(
+            drop(execution);
+            return resolve_failed_private_oram_preadmission_v2(
                 dispatcher.as_ref(),
                 settings.as_ref(),
                 identity.as_ref(),
                 &detached,
                 &coordinated,
+                error,
             )
-            .await
-            {
-                Ok(()) => {
-                    let _ = detached.mark_not_submitted();
-                }
-                Err(_) => {
-                    let _ = detached.mark_preadmission_recovery_required();
-                }
-            }
-            return Err(error);
+            .await;
         }
     };
     let outcome = dispatcher
@@ -1324,6 +1461,7 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
         )
         .await;
+    drop(execution);
     match outcome {
         Ok(PrivateOramMutationAdmissionOutcomeV2::AppliedExact) => {
             let handoff = complete_private_oram_admitted_handoff_v2(
@@ -1337,35 +1475,28 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             hand_failed_admitted_handoff_to_recovery_v2(&detached, handoff)
         }
         Ok(PrivateOramMutationAdmissionOutcomeV2::CommittedRejected) => {
-            detached.mark_rejected_ack_pending()?;
-            acknowledge_detached_reservation_outcome_v3(
+            complete_private_oram_rejected_handoff_v2(
                 dispatcher.as_ref(),
                 settings.as_ref(),
                 identity.as_ref(),
                 &detached,
-                PrivateOramReservationAckProposerV3::Leader,
+                coordinated.admission().lease(),
             )
-            .await?;
-            detached.mark_rejected_ack_complete()
+            .await
         }
         Err(failure)
             if failure.class()
                 == PrivateOramMutationAdmissionFailureClassV2::DefinitelyNotSubmitted =>
         {
-            let error = failure.into_storage_error();
-            match reject_private_oram_coordinated_prestage_v2(
+            resolve_failed_private_oram_preadmission_v2(
                 dispatcher.as_ref(),
                 settings.as_ref(),
                 identity.as_ref(),
                 &detached,
                 &coordinated,
+                failure.into_storage_error(),
             )
             .await
-            {
-                Ok(()) => detached.mark_not_submitted()?,
-                Err(_) => detached.mark_preadmission_recovery_required()?,
-            }
-            Err(error)
         }
         Err(failure) => {
             detached.mark_admission_unknown()?;
@@ -1388,16 +1519,14 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
                         return hand_failed_admitted_handoff_to_recovery_v2(&detached, handoff);
                     }
                     Ok(Some(PrivateOramMutationAdmissionOutcomeV2::CommittedRejected)) => {
-                        detached.mark_rejected_ack_pending()?;
-                        acknowledge_detached_reservation_outcome_v3(
+                        return complete_private_oram_rejected_handoff_v2(
                             dispatcher.as_ref(),
                             settings.as_ref(),
                             identity.as_ref(),
                             &detached,
-                            PrivateOramReservationAckProposerV3::Leader,
+                            coordinated.admission().lease(),
                         )
-                        .await?;
-                        return detached.mark_rejected_ack_complete();
+                        .await;
                     }
                     Ok(None) | Err(_) => {}
                 }
@@ -1428,12 +1557,21 @@ async fn complete_private_oram_admitted_handoff_v2(
     detached: &PrivateOramDetachedMutationAppendV2,
     coordinated: &PrivateOramCoordinatedPrestageV2,
 ) -> StorageResult<()> {
-    require_exact_admitted_recovery_manifest_v2(dispatcher, coordinated)?;
+    let key = PrivateOramMutationKey {
+        collection_id: detached.collection_id().to_string(),
+    };
+    let _execution = acquire_private_oram_mutation_execution_v2(&key).await?;
     // Outcome ACK remains pending until point staging and the replicated recovery-readiness
     // certificate are durable. Startup reconciliation is not yet allowed to rely on sequence 2 as
     // the sole replacement for reservation retention.
     detached.mark_admitted_ack_pending()?;
+    require_exact_admitted_recovery_manifest_v2(dispatcher, coordinated)?;
     storage::dispatcher::private_oram_test_point("mutation_v2_after_admission")?;
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation append post-admission pause reached",
+    )
+    .await;
     let parent =
         materialize_private_oram_admitted_parent_v2(dispatcher, settings, detached, coordinated)
             .await?;
@@ -1489,17 +1627,13 @@ async fn complete_private_oram_admitted_handoff_v2(
     .await?;
     detached.mark_admitted_ack_complete()?;
     detached.mark_deciding()?;
-    storage::dispatcher::private_oram_test_point("mutation_v2_before_consensus_commit")?;
     decide_private_oram_admitted_mutation_v2(dispatcher, coordinated.admission()).await
 }
 
-/// The decision for an admitted mutation whose recovery readiness is certified and whose
-/// reservation outcome is acknowledged. It commits, unless the lease the client's mutation
-/// signed has expired: a mutation is never applied after its signed validity window, and Raft
-/// apply cannot read a clock, so the lease owner fences an expired one with the
-/// `Preparing -> AbortDecided` transition instead. Both transitions require the preparing lease;
-/// if a commit and an abort race, Raft order decides and the terminal resume finishes whichever
-/// applied.
+/// Commits an admitted mutation whose recovery readiness is certified and whose reservation
+/// outcome is acknowledged, while its signed lease is valid. Expiry alone is not abort
+/// authority: an expired preparing lease remains fenced until an authorized recovery policy
+/// can supply durable abort intent and worker-quiescence evidence.
 async fn decide_private_oram_admitted_mutation_v2(
     dispatcher: &Dispatcher,
     admission: &PrivateOramMutationAdmissionPlanV2,
@@ -1510,82 +1644,40 @@ async fn decide_private_oram_admitted_mutation_v2(
     let key = PrivateOramMutationKey {
         collection_id: admission.lease().collection_id.clone(),
     };
-    if private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-        return Ok(());
-    }
     // Renewals can move the expiry of the lease consensus holds.
-    let expires_at_unix = consensus
+    let expires_at_unix = match consensus
         .private_oram_mutation_lease_slot(&key)
         .and_then(|slot| slot.active)
         .filter(|lease| lease.generation == admission.lease().generation)
-        .map_or(admission.lease().expires_at_unix, |lease| {
-            lease.expires_at_unix
-        });
+    {
+        Some(lease) => match lease.phase {
+            PrivateOramMutationLeasePhase::Preparing => {
+                // Both the live handoff and admitted recovery reach this boundary after durable
+                // recovery readiness and reservation ACK. A live handoff failure must not let
+                // recovery bypass the test's pre-decision crash, including an expired lease.
+                storage::dispatcher::private_oram_test_point(
+                    "mutation_v2_before_consensus_commit",
+                )?;
+                lease.expires_at_unix
+            }
+            PrivateOramMutationLeasePhase::ConsensusCommitted { .. } => {
+                // Confirm the exact paired state and receipt even when a prior proposal won.
+                return commit_private_oram_admitted_mutation_v2(dispatcher, admission).await;
+            }
+            // Existing durable decisions remain the terminal recovery path's responsibility.
+            PrivateOramMutationLeasePhase::AbortDecided => return Ok(()),
+        },
+        None => admission.lease().expires_at_unix,
+    };
     if current_unix_secs()? < expires_at_unix {
         commit_private_oram_admitted_mutation_v2(dispatcher, admission).await
     } else {
-        abort_private_oram_admitted_mutation_v2(dispatcher, admission).await
-    }
-}
-
-/// Whether consensus already holds a decision (commit or abort) for the admitted generation.
-fn private_oram_admitted_mutation_decided_v2(
-    consensus: &storage::content_manager::consensus_manager::ConsensusStateRef,
-    key: &PrivateOramMutationKey,
-    admission: &PrivateOramMutationAdmissionPlanV2,
-) -> bool {
-    consensus
-        .private_oram_mutation_lease_slot(key)
-        .and_then(|slot| slot.active)
-        .is_some_and(|lease| {
-            lease.generation == admission.lease().generation
-                && lease.phase != PrivateOramMutationLeasePhase::Preparing
+        Err(StorageError::PreconditionFailed {
+            description:
+                "private ORAM admitted mutation lease expired and requires authorized recovery"
+                    .to_string(),
         })
-}
-
-/// Fences an expired admitted mutation with the `Preparing -> AbortDecided` transition of the
-/// lease consensus holds (renewals may have moved its expiry); the terminal resume then rolls
-/// every owner back to the exact old state and cleans up.
-async fn abort_private_oram_admitted_mutation_v2(
-    dispatcher: &Dispatcher,
-    admission: &PrivateOramMutationAdmissionPlanV2,
-) -> StorageResult<()> {
-    let consensus = dispatcher
-        .consensus_state()
-        .ok_or_else(invalid_owner_prestage)?;
-    let key = PrivateOramMutationKey {
-        collection_id: admission.lease().collection_id.clone(),
-    };
-    let preparing = consensus
-        .private_oram_mutation_lease_slot(&key)
-        .and_then(|slot| slot.active)
-        .filter(|lease| {
-            lease.generation == admission.lease().generation
-                && lease.phase == PrivateOramMutationLeasePhase::Preparing
-        });
-    let Some(preparing) = preparing else {
-        return if private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-            Ok(())
-        } else {
-            Err(invalid_owner_prestage())
-        };
-    };
-    if consensus.private_oram_mutation_state(&key).as_ref() != Some(admission.expected_old_state())
-    {
-        return Err(invalid_owner_prestage());
     }
-    let mut abort_decided = preparing;
-    abort_decided.phase = PrivateOramMutationLeasePhase::AbortDecided;
-    let operation = consensus.private_oram_mutation_v2_abort_decision_operation(abort_decided)?;
-    let _applied = consensus
-        .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
-        .await;
-    if !private_oram_admitted_mutation_decided_v2(consensus, &key, admission) {
-        return Err(StorageError::service_error(
-            "private ORAM mutation abort decision was not applied",
-        ));
-    }
-    Ok(())
 }
 
 /// The commit decision. With every owner pre-staged and adopted, the point staged and the
@@ -1599,51 +1691,12 @@ async fn commit_private_oram_admitted_mutation_v2(
     dispatcher: &Dispatcher,
     admission: &PrivateOramMutationAdmissionPlanV2,
 ) -> StorageResult<()> {
-    let consensus = dispatcher
-        .consensus_state()
-        .ok_or_else(invalid_owner_prestage)?;
-    let key = PrivateOramMutationKey {
-        collection_id: admission.lease().collection_id.clone(),
-    };
-    let committed = || {
-        consensus
-            .private_oram_mutation_lease_slot(&key)
-            .and_then(|slot| slot.active)
-            .is_some_and(|lease| {
-                lease.generation == admission.lease().generation
-                    && matches!(
-                        lease.phase,
-                        PrivateOramMutationLeasePhase::ConsensusCommitted { .. }
-                    )
-            })
-            && consensus.private_oram_mutation_state(&key).as_ref()
-                == Some(admission.expected_new_state())
-    };
-    if committed() {
-        return Ok(());
-    }
-    if consensus.private_oram_mutation_state(&key).as_ref() != Some(admission.expected_old_state())
-    {
-        // The other proposer's commit can apply between the two reads.
-        return if committed() {
-            Ok(())
-        } else {
-            Err(invalid_owner_prestage())
-        };
-    }
-    let operation = consensus.private_oram_mutation_v2_consensus_commit_operation(
-        admission.lease().generation,
-        admission.expected_new_state().clone(),
-    )?;
-    let _applied = consensus
-        .propose_consensus_op_with_await(operation, Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT))
-        .await;
-    if !committed() {
-        return Err(StorageError::service_error(
-            "private ORAM mutation commit was not applied",
-        ));
-    }
-    Ok(())
+    dispatcher
+        .submit_private_oram_mutation_consensus_commit_v2(
+            admission,
+            Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+        )
+        .await
 }
 
 /// Parent materialization, owner adoption and point staging advance the coordinator's journal
@@ -1718,8 +1771,9 @@ async fn record_private_oram_parent_progress_v2(
 /// or when its live handoff failed (for example because Raft leadership moved while it was in
 /// flight). It reloads the exact admitted plan from the retained recovery manifest, re-runs the
 /// steps before recovery readiness unless readiness is already certified, acknowledges the
-/// reservation outcome and decides: it commits, or aborts a mutation whose signed lease expired.
-/// A committed or abort-decided lease is the terminal resume's.
+/// reservation outcome and commits while the signed lease is valid. An expired preparing lease
+/// stays fenced for authorized recovery. A committed or previously abort-decided lease is the
+/// terminal resume's.
 pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     dispatcher: &Dispatcher,
     settings: &Settings,
@@ -1727,6 +1781,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     collection_name: &str,
     key: &PrivateOramMutationKey,
 ) -> StorageResult<()> {
+    let _execution = acquire_private_oram_mutation_execution_v2(key).await?;
     let consensus = dispatcher
         .consensus_state()
         .ok_or_else(invalid_owner_prestage)?;
@@ -1743,6 +1798,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     if active_lease.collection_id != key.collection_id
         || active_lease.owner_peer_id != identity.peer_id()
         || active_lease.owner_peer_id != dispatcher.this_peer_id()
+        || !matches!(active_lease.phase, PrivateOramMutationLeasePhase::Preparing)
     {
         return Err(invalid_owner_prestage());
     }
@@ -1769,7 +1825,6 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
     let auth = Auth::new_internal(Access::full("private ORAM admitted restart reconciliation"));
     let pass = auth.check_collection_access(
         collection_name,
@@ -1873,7 +1928,7 @@ pub(crate) async fn reconcile_private_oram_admitted_to_commit_v2(
                 expected_state_sequence: expected_old_state.state_sequence,
                 expected_old_state_digest: &old_state_digest,
                 expected_visible_point_record,
-                now_unix: mutation.issued_at_unix,
+                now_unix: mutation.new_state.state.signed_at_unix,
                 max_mutation_ttl_secs: PRIVATE_ORAM_MUTATION_SESSION_LEASE_SECS,
                 public_key: hnsw_context.public_key(),
             },
@@ -1974,6 +2029,12 @@ fn require_exact_admitted_recovery_manifest_v2(
     dispatcher: &Dispatcher,
     coordinated: &impl PrivateOramAdmittedPlanContextV2,
 ) -> StorageResult<()> {
+    if !matches!(
+        coordinated.admission().lease().phase,
+        PrivateOramMutationLeasePhase::Preparing
+    ) {
+        return Err(invalid_owner_prestage());
+    }
     let retained = dispatcher
         .private_oram_mutation_v2_exact_admitted_recovery_manifest(coordinated.admission().lease())?
         .ok_or_else(invalid_owner_prestage)?;
@@ -2350,32 +2411,223 @@ async fn stage_private_oram_mutation_point_v2(
     Ok(staged)
 }
 
-async fn reject_private_oram_coordinated_prestage_v2(
+/// A failure before submission must resolve the *prepared* attempt. Reserved-only rejection
+/// deliberately refuses this state. The exact admission and rejection race through the same CAS,
+/// so observing an admission here transfers responsibility to the admitted recovery path.
+async fn resolve_failed_private_oram_preadmission_v2(
     dispatcher: &Dispatcher,
     settings: &Settings,
     identity: &PrivateOramPeerRecoveryIdentity,
     detached: &PrivateOramDetachedMutationAppendV2,
     coordinated: &PrivateOramCoordinatedPrestageV2,
+    original_error: StorageError,
 ) -> StorageResult<()> {
+    match dispatcher
+        .reject_private_oram_mutation_prepared_admission_v2(
+            coordinated.admission().lease(),
+            coordinated.all_owners_prestaged(),
+            coordinated.prepared_aggregate_digest(),
+            Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+        )
+        .await
+    {
+        Ok(PrivateOramMutationAdmissionOutcomeV2::AppliedExact) => {
+            let handoff = complete_private_oram_admitted_handoff_v2(
+                dispatcher,
+                settings,
+                identity,
+                detached,
+                coordinated,
+            )
+            .await;
+            hand_failed_admitted_handoff_to_recovery_v2(detached, handoff)
+        }
+        Ok(PrivateOramMutationAdmissionOutcomeV2::CommittedRejected) => {
+            // A follower cannot acknowledge this outcome itself. Keep the durable rejection and
+            // its local pending phase for the current leader and the runtime retirement scan.
+            let _ = complete_private_oram_rejected_handoff_v2(
+                dispatcher,
+                settings,
+                identity,
+                detached,
+                coordinated.admission().lease(),
+            )
+            .await;
+            Err(original_error)
+        }
+        Err(_) => {
+            let _ = detached.mark_preadmission_recovery_required();
+            Err(original_error)
+        }
+    }
+}
+
+async fn complete_private_oram_rejected_handoff_v2(
+    dispatcher: &Dispatcher,
+    settings: &Settings,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    detached: &PrivateOramDetachedMutationAppendV2,
+    lease: &PrivateOramMutationLease,
+) -> StorageResult<()> {
+    detached.mark_rejected_ack_pending()?;
+    if !acknowledge_private_oram_rejected_admission_v2(
+        dispatcher,
+        settings,
+        identity,
+        detached.collection_name(),
+        detached.vector_name(),
+        &detached.immutable_manifest().manifest.owner_signing_key_id,
+        lease,
+    )
+    .await?
+    {
+        return Err(StorageError::service_error(
+            "private ORAM rejected admission acknowledgement requires recovery",
+        ));
+    }
+    detached.mark_rejected_ack_complete()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge_private_oram_rejected_admission_v2(
+    dispatcher: &Dispatcher,
+    settings: &Settings,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    vector_name: &str,
+    owner_signing_key_id: &str,
+    lease: &PrivateOramMutationLease,
+) -> StorageResult<bool> {
     let consensus = dispatcher
         .consensus_state()
         .ok_or_else(invalid_owner_prestage)?;
     let key = PrivateOramMutationKey {
-        collection_id: coordinated.admission().lease().collection_id.clone(),
+        collection_id: lease.collection_id.clone(),
     };
-    let (reservation, prepared) = consensus
-        .private_oram_mutation_v2_active_append_attempt(&key)?
-        .ok_or_else(invalid_owner_prestage)?;
-    if prepared.as_ref() != Some(coordinated.all_owners_prestaged()) {
-        return Err(invalid_owner_prestage());
+    if consensus
+        .private_oram_mutation_v2_rejected_admission_acknowledgement(&key, lease)?
+        .is_some()
+    {
+        return Ok(true);
     }
-    resolve_private_oram_reserved_attempt_rejection_v2(consensus, &key, &reservation).await?;
-    acknowledge_detached_reservation_outcome_v3(
+    consensus.require_private_oram_activation_coordinator_is_local_leader()?;
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_REJECTION_PRE_ACK_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation rejection pre-acknowledgement pause reached",
+    )
+    .await;
+    acknowledge_oldest_private_oram_reservation_outcome_v3(
         dispatcher,
         settings,
         identity,
-        detached,
+        collection_name,
+        vector_name,
+        owner_signing_key_id,
         PrivateOramReservationAckProposerV3::Leader,
+    )
+    .await?;
+    Ok(consensus
+        .private_oram_mutation_v2_rejected_admission_acknowledgement(&key, lease)?
+        .is_some())
+}
+
+/// Reconcile only the durable boundary before admission. The admitted lease owner remains
+/// responsible if its admission won, and a live worker in the current term keeps its opportunity
+/// to admit. A leader change or a completed worker makes the prepared attempt an orphan.
+pub(crate) async fn recover_private_oram_preadmission_once_v2(
+    dispatcher: &Dispatcher,
+    settings: &Settings,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    candidate: &PrivateOramMutationPreadmissionRecoveryCandidateV2,
+) -> StorageResult<bool> {
+    let consensus = dispatcher
+        .consensus_state()
+        .ok_or_else(invalid_owner_prestage)?;
+    consensus.require_private_oram_activation_coordinator_is_local_leader()?;
+    if identity.peer_id() != dispatcher.this_peer_id() {
+        return Err(invalid_owner_prestage());
+    }
+    if let Some(snapshot) = candidate.prepared_snapshot()
+        && snapshot.reservation().controller_peer_id() == dispatcher.this_peer_id()
+        && snapshot.reservation().controller_term() == consensus.hard_state().term
+        && private_oram_detached_job_exists_for_collection_v2(&candidate.key().collection_id)?
+    {
+        return Ok(false);
+    }
+    let (package, _) = candidate
+        .manifest()
+        .coordinator_recovery_envelope()
+        .map_err(|_| invalid_owner_prestage())?;
+    let lease = candidate.lease();
+    if package.collection_name != collection_name
+        || package.collection_id != candidate.key().collection_id
+        || package.collection_id != lease.collection_id
+        || package.coordinator_peer_id != lease.owner_peer_id
+        || package.owner_peer_id != lease.owner_peer_id
+        || package.mutation_id != lease.mutation_id
+        || package.mutation_digest != lease.signed_mutation_digest
+        || package.transition_digest != lease.transition_digest
+        || package.lease_generation != lease.generation
+        || package.writer_fence != lease.writer_fence
+        || package.immutable_manifest.manifest.result_privacy
+            != ResultPrivacyMode::PrivatePayloadOramRequired
+    {
+        return Err(invalid_owner_prestage());
+    }
+    let auth = Auth::new_internal(Access::full("private ORAM prepared append recovery"));
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_prepared_append_recovery_v2",
+    )?;
+    let verification = new_unchecked_verification_pass();
+    let collection = dispatcher
+        .toc(&auth, &verification)
+        .get_collection(&pass)
+        .await?;
+    let config = collection.config_snapshot().await;
+    if config.stable_crypto_id(collection.name())? != candidate.key().collection_id {
+        return Err(invalid_owner_prestage());
+    }
+    let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+        settings,
+        collection.name(),
+        collection.path(),
+        &config,
+        &package.vector_name,
+        &package.owner_signing_key_id,
+    )?;
+    if hnsw_context.collection_crypto_id() != candidate.key().collection_id {
+        return Err(invalid_owner_prestage());
+    }
+    if let Some(snapshot) = candidate.prepared_snapshot() {
+        let execution = acquire_private_oram_mutation_execution_v2(candidate.key()).await?;
+        consensus.require_private_oram_activation_coordinator_is_local_leader()?;
+        let outcome = dispatcher
+            .reject_private_oram_mutation_prepared_admission_v2(
+                lease,
+                snapshot.prepared(),
+                snapshot.expected_aggregate_digest(),
+                Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+            )
+            .await?;
+        drop(execution);
+        if outcome == PrivateOramMutationAdmissionOutcomeV2::AppliedExact {
+            return Ok(true);
+        }
+    }
+    if collection.config_snapshot().await != config {
+        return Err(invalid_owner_prestage());
+    }
+    acknowledge_private_oram_rejected_admission_v2(
+        dispatcher,
+        settings,
+        identity,
+        collection_name,
+        &package.vector_name,
+        &package.owner_signing_key_id,
+        lease,
     )
     .await
 }
@@ -2682,19 +2934,34 @@ pub(crate) async fn coordinate_private_oram_owner_prestage_v2(
                 )
                 .await
             } else {
-                toc.get_channel_service()
-                    .prepare_private_oram_mutation_owner_reservation_v3(
-                        *owner_peer_id,
-                        validated.collection_name(),
-                        validated.vector_name(),
-                        owner_signing_key_id,
-                        context.challenge(),
-                        context.expected_owner_signer(),
-                        context.expected_lifecycle_state(),
-                    )
-                    .await
-                    .map(|response| response.into_verified().prepare().clone())
-                    .map_err(|_| invalid_owner_prestage())
+                async {
+                    // The remote prepare validates its own committed challenge. Synchronize
+                    // this owner first, keeping wait failures in the cancellation path below.
+                    let state = consensus.hard_state();
+                    toc.get_channel_service()
+                        .await_commit_on_peer(
+                            *owner_peer_id,
+                            state.commit,
+                            state.term,
+                            PRIVATE_ORAM_RECOVERY_READINESS_WAIT,
+                        )
+                        .await
+                        .map_err(|_| invalid_owner_prestage())?;
+                    toc.get_channel_service()
+                        .prepare_private_oram_mutation_owner_reservation_v3(
+                            *owner_peer_id,
+                            validated.collection_name(),
+                            validated.vector_name(),
+                            owner_signing_key_id,
+                            context.challenge(),
+                            context.expected_owner_signer(),
+                            context.expected_lifecycle_state(),
+                        )
+                        .await
+                        .map(|response| response.into_verified().prepare().clone())
+                        .map_err(|_| invalid_owner_prestage())
+                }
+                .await
             };
         match prepare_result {
             Ok(prepare) => owner_reservation_prepares.push(prepare),
@@ -2795,6 +3062,9 @@ pub(crate) async fn coordinate_private_oram_owner_prestage_v2(
         .map_err(|_| invalid_owner_prestage())?;
         let owner_result: StorageResult<_> = async {
             if owner_peer_id == coordinator_peer_id {
+                // Detaching the append job already released its paired read sessions.
+                // The local owner acquires the same lifecycle guard as a remote owner;
+                // requiring the consumed read sessions here would reject every append.
                 let receipt = install_private_oram_owner_prestage_v2(
                     toc,
                     settings,
@@ -3039,19 +3309,15 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
-    let _hnsw_lifecycle = begin_private_hnsw_collection_lifecycle(collection.name(), &config)?;
     let has_result = package
         .immutable_manifest
         .manifest
         .indexes
         .iter()
         .any(|index| index.kind() == qdrant_sec::PrivateOramIndexKindV2::Result);
+    let _hnsw_lifecycle = begin_private_hnsw_collection_lifecycle(collection.name(), &config)?;
     let _result_lifecycle = if has_result {
-        Some(begin_private_result_oram_collection_lifecycle(
-            collection.name(),
-            &config,
-        )?)
+        begin_private_result_oram_collection_lifecycle(collection.name(), &config)?
     } else {
         None
     };
@@ -3133,7 +3399,6 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
     {
         return Err(invalid_owner_prestage());
     }
-
     let hnsw_store = PrivateHnswOramStore::new(collection.path(), &request.vector_name)?;
     let hnsw_current = hnsw_store.read_current_epoch()?;
     let old_hnsw = package
@@ -3181,7 +3446,6 @@ pub(crate) async fn install_private_oram_owner_prestage_v2(
             return Err(invalid_owner_prestage());
         }
     }
-
     let staged_frame = decode_prestage_frame(&package)?;
     let point_id = staged_frame
         .as_ref()
@@ -3471,6 +3735,36 @@ pub(crate) async fn coordinate_private_oram_recovery_readiness_v2(
         hnsw_context.public_key().to_vec(),
     )
     .map_err(|_| invalid_recovery_readiness())?;
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let linearizable = consensus
+        .linearizable_private_oram_mutation_reconcile_snapshot_v2(
+            &key,
+            coordinator_peer_id,
+            Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+        )
+        .await?;
+    let applied_parent_sequence = linearizable.active_parent_watermark_sequence().unwrap_or(0);
+    let pending_parent_progress = journal
+        .point_stage_parent_progress_proposals_v2()
+        .map_err(|_| invalid_recovery_readiness())?;
+    let applied_parent_count =
+        usize::try_from(applied_parent_sequence).map_err(|_| invalid_recovery_readiness())?;
+    if applied_parent_count > pending_parent_progress.len() {
+        return Err(invalid_recovery_readiness());
+    }
+    for progress in pending_parent_progress
+        .into_iter()
+        .skip(applied_parent_count)
+    {
+        dispatcher
+            .submit_private_oram_mutation_parent_progress_v2(
+                progress,
+                Some(PRIVATE_ORAM_RECOVERY_READINESS_WAIT),
+            )
+            .await?;
+    }
     let layout = dispatcher
         .private_oram_consensus_layout(&PrivateOramLayoutKey {
             collection_id: collection_id.clone(),

@@ -194,7 +194,10 @@ fn test_from_filter_attributes() {
 #[test]
 fn ckks_ciphertext_index_refreshes_when_sidecar_payload_changes() {
     init_logger();
-    let dir = Builder::new().prefix("ckks_segment_dir").tempdir().unwrap();
+    let dir = Builder::new()
+        .prefix("ckks_segment_dir")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
     let hw_counter = HardwareCounterCell::new();
     let mut segment = build_simple_segment(dir.path(), 2, Distance::Dot).unwrap();
 

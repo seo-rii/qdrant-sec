@@ -16,6 +16,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use api::rest::models::HardwareUsage;
@@ -38,9 +39,10 @@ use dashmap::DashMap;
 use fs_err as fs;
 use fs_err::tokio as tokio_fs;
 use futures::{StreamExt, stream};
+use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::collection_defaults::CollectionConfigDefaults;
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use self::collection_meta_ops::collection_params_use_private_oram_bucket_store;
 use self::dispatcher::TocDispatcher;
@@ -57,9 +59,13 @@ use crate::content_manager::consensus_ops::{
 };
 use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
+use crate::content_manager::snapshots::private_oram_external_recovery::{
+    PrivateOramExternalRecoveryArchiveResources, load_private_oram_external_recovery_reservations,
+    private_oram_external_recovery_reservation_bytes,
+};
 use crate::content_manager::toc::telemetry::TocTelemetryCollector;
 use crate::rbac::{Access, AccessRequirements, CollectionMultipass, CollectionPass};
-use crate::types::StorageConfig;
+use crate::types::{PrivateOramExternalRecoveryConfig, StorageConfig};
 
 pub const ALIASES_PATH: &str = "aliases";
 pub const COLLECTIONS_DIR: &str = "collections";
@@ -105,6 +111,139 @@ struct PrivateOramExternalRecoveryDetachedCollection {
     collection_id: String,
     operation_id_hash: String,
     state: collection_state::State,
+}
+
+struct PrivateOramExternalRecoveryResourceState {
+    reservations: HashMap<String, u64>,
+    reserved_bytes: u64,
+}
+
+struct PrivateOramExternalRecoveryResources {
+    limits: PrivateOramExternalRecoveryConfig,
+    state: ParkingMutex<PrivateOramExternalRecoveryResourceState>,
+    workers: Arc<Semaphore>,
+    preflight_scanned_logical_bytes: AtomicU64,
+    preflight_scanned_entries: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrivateOramExternalRecoveryResourceSnapshot {
+    pub reserved_bytes: u64,
+    pub staging_reservations: u64,
+    pub worker_limit: u64,
+    pub workers_in_use: u64,
+    pub preflight_scanned_logical_bytes: u64,
+    pub preflight_scanned_entries: u64,
+}
+
+pub struct PrivateOramExternalRecoveryReservation {
+    resources: Arc<PrivateOramExternalRecoveryResources>,
+    operation_id_hash: String,
+    persistent: bool,
+}
+
+impl PrivateOramExternalRecoveryReservation {
+    pub fn persist(mut self) {
+        self.persistent = true;
+    }
+}
+
+impl Drop for PrivateOramExternalRecoveryReservation {
+    fn drop(&mut self) {
+        if !self.persistent {
+            self.resources.release(&self.operation_id_hash);
+        }
+    }
+}
+
+impl PrivateOramExternalRecoveryResources {
+    fn new(
+        limits: PrivateOramExternalRecoveryConfig,
+        reservations: HashMap<String, u64>,
+    ) -> Result<Self, StorageError> {
+        let reserved_bytes = reservations.values().try_fold(0_u64, |total, reserved| {
+            total
+                .checked_add(*reserved)
+                .ok_or_else(invalid_private_oram_external_recovery_resource_state)
+        })?;
+        Ok(Self {
+            workers: Arc::new(Semaphore::new(limits.max_concurrent_verify_prepare.get())),
+            limits,
+            state: ParkingMutex::new(PrivateOramExternalRecoveryResourceState {
+                reservations,
+                reserved_bytes,
+            }),
+            preflight_scanned_logical_bytes: AtomicU64::new(0),
+            preflight_scanned_entries: AtomicU64::new(0),
+        })
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        operation_id_hash: &str,
+        snapshot_size_bytes: u64,
+    ) -> Result<PrivateOramExternalRecoveryReservation, StorageError> {
+        let reserved =
+            private_oram_external_recovery_reservation_bytes(snapshot_size_bytes, &self.limits)?;
+        let mut state = self.state.lock();
+        if state.reservations.contains_key(operation_id_hash) {
+            return Err(invalid_private_oram_external_recovery_resource_state());
+        }
+        let next_total = state
+            .reserved_bytes
+            .checked_add(reserved)
+            .ok_or_else(invalid_private_oram_external_recovery_resource_state)?;
+        if next_total > self.limits.max_total_staged_bytes {
+            return Err(StorageError::bad_request(
+                "private ORAM external recovery staging quota exceeded",
+            ));
+        }
+        state
+            .reservations
+            .insert(operation_id_hash.to_string(), reserved);
+        state.reserved_bytes = next_total;
+        Ok(PrivateOramExternalRecoveryReservation {
+            resources: Arc::clone(self),
+            operation_id_hash: operation_id_hash.to_string(),
+            persistent: false,
+        })
+    }
+
+    fn release(&self, operation_id_hash: &str) {
+        let mut state = self.state.lock();
+        if let Some(reserved) = state.reservations.remove(operation_id_hash) {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(reserved);
+        }
+    }
+
+    fn record_archive_scan(&self, resources: PrivateOramExternalRecoveryArchiveResources) {
+        saturating_atomic_add(
+            &self.preflight_scanned_logical_bytes,
+            resources.logical_bytes,
+        );
+        saturating_atomic_add(&self.preflight_scanned_entries, resources.entry_count);
+    }
+
+    fn snapshot(&self) -> PrivateOramExternalRecoveryResourceSnapshot {
+        let state = self.state.lock();
+        let worker_limit = self.limits.max_concurrent_verify_prepare.get();
+        PrivateOramExternalRecoveryResourceSnapshot {
+            reserved_bytes: state.reserved_bytes,
+            staging_reservations: state.reservations.len() as u64,
+            worker_limit: worker_limit as u64,
+            workers_in_use: worker_limit.saturating_sub(self.workers.available_permits()) as u64,
+            preflight_scanned_logical_bytes: self
+                .preflight_scanned_logical_bytes
+                .load(Ordering::Relaxed),
+            preflight_scanned_entries: self.preflight_scanned_entries.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn saturating_atomic_add(target: &AtomicU64, value: u64) {
+    let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 impl fmt::Debug for PrivateOramExternalRecoveryDetachedCollection {
@@ -154,9 +293,10 @@ pub struct TableOfContent {
     /// If not defined - no rate limiting is applied.
     update_rate_limiter: Option<Semaphore>,
     /// Serializes collection registry, path, and alias lifecycle changes.
-    collection_lifecycle_lock: Mutex<()>,
+    collection_lifecycle_lock: Arc<Mutex<()>>,
     private_oram_external_recovery_detached:
         DashMap<CollectionId, PrivateOramExternalRecoveryDetachedCollection>,
+    private_oram_external_recovery_resources: Arc<PrivateOramExternalRecoveryResources>,
     /// Aggregation of all hardware measurements for each alias or collection config.
     collection_hw_metrics: DashMap<CollectionId, Arc<HwSharedDrain>>,
     client_payload_nonce_replay_cache: Mutex<ClientPayloadNonceReplayCache>,
@@ -363,6 +503,17 @@ impl TableOfContent {
         let alias_path = storage_config.storage_path.join(ALIASES_PATH);
         let alias_persistence = AliasPersistence::open(&alias_path)?;
 
+        let private_oram_external_recovery_reservations =
+            load_private_oram_external_recovery_reservations(
+                &storage_config.storage_path,
+                &storage_config.private_oram_external_recovery,
+            )?;
+        let private_oram_external_recovery_resources =
+            Arc::new(PrivateOramExternalRecoveryResources::new(
+                storage_config.private_oram_external_recovery.clone(),
+                private_oram_external_recovery_reservations,
+            )?);
+
         let rate_limiter = match storage_config.performance.update_rate_limit {
             Some(limit) => Some(Semaphore::new(limit)),
             None => {
@@ -395,6 +546,7 @@ impl TableOfContent {
             update_rate_limiter: rate_limiter,
             collection_lifecycle_lock: Default::default(),
             private_oram_external_recovery_detached: Default::default(),
+            private_oram_external_recovery_resources,
             collection_hw_metrics: DashMap::new(),
             client_payload_nonce_replay_cache: Mutex::new(ClientPayloadNonceReplayCache::default()),
             private_oram_snapshot_recovery_abort_requests: Default::default(),
@@ -433,6 +585,51 @@ impl TableOfContent {
 
     pub fn storage_path(&self) -> &Path {
         &self.storage_config.storage_path
+    }
+
+    pub fn private_oram_external_recovery_limits(&self) -> &PrivateOramExternalRecoveryConfig {
+        &self.private_oram_external_recovery_resources.limits
+    }
+
+    pub fn reserve_private_oram_external_recovery(
+        &self,
+        operation_id_hash: &str,
+        snapshot_size_bytes: u64,
+    ) -> Result<PrivateOramExternalRecoveryReservation, StorageError> {
+        self.private_oram_external_recovery_resources
+            .reserve(operation_id_hash, snapshot_size_bytes)
+    }
+
+    pub fn release_private_oram_external_recovery(&self, operation_id_hash: &str) {
+        self.private_oram_external_recovery_resources
+            .release(operation_id_hash);
+    }
+
+    pub fn try_acquire_private_oram_external_recovery_worker(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, StorageError> {
+        Arc::clone(&self.private_oram_external_recovery_resources.workers)
+            .try_acquire_owned()
+            .map_err(|_| {
+                StorageError::rate_limit_exceeded(
+                    "private ORAM external recovery verify/install worker limit reached",
+                    Some(Duration::from_secs(1)),
+                )
+            })
+    }
+
+    pub fn record_private_oram_external_recovery_archive_scan(
+        &self,
+        resources: PrivateOramExternalRecoveryArchiveResources,
+    ) {
+        self.private_oram_external_recovery_resources
+            .record_archive_scan(resources);
+    }
+
+    pub fn private_oram_external_recovery_resource_snapshot(
+        &self,
+    ) -> PrivateOramExternalRecoveryResourceSnapshot {
+        self.private_oram_external_recovery_resources.snapshot()
     }
 
     /// List of all collections to which the user has access
@@ -1476,32 +1673,46 @@ impl PrivateOramExternalRecoveryCollectionInstallGuard<'_> {
             .storage_config
             .to_shared_storage_config(self.toc.is_distributed());
         shared_storage_config.handle_collection_load_errors = false;
-        let collection = Collection::load(
-            self.collection_name.clone(),
-            self.toc.this_peer_id,
-            &collection_path,
-            &snapshots_path,
-            Arc::new(shared_storage_config),
-            self.toc.channel_service.clone(),
-            TableOfContent::change_peer_from_state_callback(
-                self.toc.consensus_proposal_sender.clone(),
-                self.collection_name.clone(),
-                ReplicaState::Dead,
-            ),
-            TableOfContent::request_shard_transfer_callback(
-                self.toc.consensus_proposal_sender.clone(),
-                self.collection_name.clone(),
-            ),
-            TableOfContent::abort_shard_transfer_callback(
-                self.toc.consensus_proposal_sender.clone(),
-                self.collection_name.clone(),
-            ),
-            Some(self.toc.search_runtime.handle().clone()),
-            Some(self.toc.update_runtime.handle().clone()),
-            self.toc.optimizer_resource_budget.clone(),
-            self.toc.storage_config.optimizers_overwrite.clone(),
-        )
-        .await?;
+        let collection_name = self.collection_name.clone();
+        let this_peer_id = self.toc.this_peer_id;
+        let channel_service = self.toc.channel_service.clone();
+        let consensus_proposal_sender = self.toc.consensus_proposal_sender.clone();
+        let search_runtime = self.toc.search_runtime.handle().clone();
+        let update_runtime = self.toc.update_runtime.handle().clone();
+        let optimizer_resource_budget = self.toc.optimizer_resource_budget.clone();
+        let optimizers_overwrite = self.toc.storage_config.optimizers_overwrite.clone();
+        let collection = self
+            .toc
+            .general_runtime_handle()
+            .spawn(async move {
+                Collection::load(
+                    collection_name.clone(),
+                    this_peer_id,
+                    &collection_path,
+                    &snapshots_path,
+                    Arc::new(shared_storage_config),
+                    channel_service,
+                    TableOfContent::change_peer_from_state_callback(
+                        consensus_proposal_sender.clone(),
+                        collection_name.clone(),
+                        ReplicaState::Dead,
+                    ),
+                    TableOfContent::request_shard_transfer_callback(
+                        consensus_proposal_sender.clone(),
+                        collection_name.clone(),
+                    ),
+                    TableOfContent::abort_shard_transfer_callback(
+                        consensus_proposal_sender,
+                        collection_name,
+                    ),
+                    Some(search_runtime),
+                    Some(update_runtime),
+                    optimizer_resource_budget,
+                    optimizers_overwrite,
+                )
+                .await
+            })
+            .await??;
         if let Err(error) = self.validate_loaded_collection_identity(&collection).await {
             collection.stop_gracefully().await;
             return Err(error);
@@ -1656,6 +1867,10 @@ fn invalid_private_oram_external_recovery_collection_state() -> StorageError {
     StorageError::bad_request("private ORAM external recovery collection state is invalid")
 }
 
+fn invalid_private_oram_external_recovery_resource_state() -> StorageError {
+    StorageError::service_error("private ORAM external recovery resource state is invalid")
+}
+
 fn reject_private_oram_receiving_shard_until_supported(
     _collection_name: &str,
     private_oram_bucket_store_collection: bool,
@@ -1674,6 +1889,8 @@ fn reject_private_oram_receiving_shard_until_supported(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use collection::config::{
         CollectionEncryptionConfig, CollectionParams, CryptoMigrationState, EncryptionRuleRef,
         EncryptionSelector, PRIVATE_HNSW_ORAM_BINDING, PRIVATE_RESULT_ORAM_BINDING,
@@ -1682,8 +1899,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_oram_external_recovery_resources_enforce_quota_and_worker_limit() {
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_snapshot_bytes: 10,
+            max_total_staged_bytes: 20,
+            max_unpacked_bytes: 10,
+            min_free_space_bytes: 0,
+            max_concurrent_verify_prepare: NonZeroUsize::new(1).unwrap(),
+        };
+        let resources =
+            Arc::new(PrivateOramExternalRecoveryResources::new(limits, HashMap::new()).unwrap());
+
+        let reservation = resources.reserve("operation-a", 6).unwrap();
+        reservation.persist();
+        assert_eq!(
+            resources.snapshot(),
+            PrivateOramExternalRecoveryResourceSnapshot {
+                reserved_bytes: 16,
+                staging_reservations: 1,
+                worker_limit: 1,
+                workers_in_use: 0,
+                preflight_scanned_logical_bytes: 0,
+                preflight_scanned_entries: 0,
+            }
+        );
+        assert!(resources.reserve("operation-b", 5).is_err());
+        resources.release("operation-a");
+        let reservation = resources.reserve("operation-b", 5).unwrap();
+        resources.record_archive_scan(PrivateOramExternalRecoveryArchiveResources {
+            entry_count: 5,
+            logical_bytes: 17,
+        });
+
+        let worker = Arc::clone(&resources.workers).try_acquire_owned().unwrap();
+        assert_eq!(resources.snapshot().workers_in_use, 1);
+        assert_eq!(resources.snapshot().preflight_scanned_entries, 5);
+        assert_eq!(resources.snapshot().preflight_scanned_logical_bytes, 17);
+        assert!(Arc::clone(&resources.workers).try_acquire_owned().is_err());
+        drop(worker);
+        assert!(Arc::clone(&resources.workers).try_acquire_owned().is_ok());
+        drop(reservation);
+        assert_eq!(resources.snapshot().staging_reservations, 0);
+        assert_eq!(resources.snapshot().reserved_bytes, 0);
+    }
+
+    #[test]
     fn private_oram_external_recovery_fence_tracks_install_phase() {
-        let state = |phase| PrivateOramExternalRecoveryState {
+        let state = |phase| {
+            PrivateOramExternalRecoveryState {
             committed_backup_generation: 0,
             committed_checkpoint_digest: None,
             committed_install_intent_digest: None,
@@ -1695,12 +1958,14 @@ mod tests {
                     backup_generation: 1,
                     issued_at_unix: 100,
                     expires_at_unix: 160,
+                    authority: crate::content_manager::consensus_ops::PrivateOramExternalRecoveryAuthority::LegacyV1,
                     install_intent_digest: (phase
                         == PrivateOramExternalRecoveryLeasePhase::Installing)
                         .then(|| "C".repeat(43)),
                     phase,
                 },
             ),
+        }
         };
 
         assert_eq!(private_oram_external_recovery_fence(None, 150), None);

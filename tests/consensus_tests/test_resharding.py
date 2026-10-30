@@ -83,6 +83,7 @@ def test_resharding_abort_with_replicas(tmp_path: pathlib.Path):
     # Bootstrap resharding cluster
     peer_uris, peer_ids = bootstrap_resharding(
         tmp_path,
+        peer_idx=0,
         shard_number=1,
         replication_factor=3,
         peers=3,
@@ -329,7 +330,7 @@ def bootstrap_resharding(
     # Select target peer
     peer_id = None
 
-    if peer_idx:
+    if peer_idx is not None:
         try:
             peer_id = peer_ids[peer_idx]
         finally:

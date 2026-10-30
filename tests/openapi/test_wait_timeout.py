@@ -1,5 +1,5 @@
-import threading
 from concurrent.futures import ThreadPoolExecutor
+from time import monotonic, sleep
 
 import pytest
 import requests
@@ -14,8 +14,7 @@ from openapi.helpers.helpers import (
 from openapi.helpers.settings import QDRANT_HOST
 
 
-def _request_with_signal(started, **kwargs):
-    started.set()
+def _debug_request(**kwargs):
     api = kwargs["api"]
     path_params = kwargs.get("path_params") or {}
     query_params = kwargs.get("query_params") or {}
@@ -29,10 +28,39 @@ def _request_with_signal(started, **kwargs):
 
 
 def run_parallel(first_call, second_call):
-    started = threading.Event()
+    wal_url = get_api_string(
+        QDRANT_HOST,
+        "/collections/{collection_name}/shards/0/wal",
+        first_call["path_params"],
+    )
+
+    def latest_wal_id(timeout):
+        response = requests.get(
+            wal_url,
+            params={"entries": 1},
+            headers=qdrant_host_headers(),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        entries = response.json()["result"]
+        return entries[0]["id"] if entries else -1
+
+    baseline_id = latest_wal_id(timeout=1)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(_request_with_signal, started, **first_call)
-        started.wait(timeout=1)
+        # The WAL reader takes the same lock held until the update is enqueued.
+        # Observing a new entry therefore orders the requests at the server.
+        # Keep admission within two seconds, leaving room for the one-second
+        # update timeout before even the shortest five-second delay finishes.
+        deadline = monotonic() + 2
+        first_future = executor.submit(_debug_request, **first_call)
+        while True:
+            remaining = deadline - monotonic()
+            assert remaining > 0, "Delay operation was not enqueued before the deadline"
+            if latest_wal_id(timeout=min(1, remaining)) > baseline_id:
+                break
+            sleep(min(0.01, remaining))
+
+        assert monotonic() < deadline, "Delay admission exceeded the two-second deadline"
         second_future = executor.submit(request_with_validation, **second_call)
         return first_future.result(), second_future.result()
 
@@ -45,7 +73,7 @@ def setup(collection_name):
         api="/collections/{collection_name}",
         method="PUT",
         path_params={"collection_name": collection_name},
-        body={"sparse_vectors": {"bm25": {}}},
+        body={"shard_number": 1, "sparse_vectors": {"bm25": {}}},
     )
 
     assert response.ok

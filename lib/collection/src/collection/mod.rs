@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::grpc::qdrant::{
-    RequestPrivateOramReshardingResumeRequest, RequestPrivateOramShardRecoveryRequest,
+    PrivateOramActiveTransferResumeContext, RequestPrivateOramReshardingResumeRequest,
+    RequestPrivateOramShardRecoveryRequest,
 };
 use clean::ShardCleanTasks;
 use common::budget::ResourceBudget;
@@ -33,6 +34,7 @@ use common::storage_version::StorageVersion;
 use segment::types::{SeqNumberType, ShardKey};
 use semver::Version;
 use shard::operations::optimization::{OptimizationsRequestOptions, OptimizationsResponse};
+pub use snapshots::PreparedCollectionSnapshot;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 
@@ -79,6 +81,7 @@ const CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_MAX_BYTES: u64 = CLIENT_PAYLOAD_NONCE_RE
     as u64
     * (CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_ENTRY_MAX_BYTES as u64 + 1);
 const PRIVATE_ORAM_RESHARDING_RESUME_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+const PRIVATE_ORAM_SOURCE_RESUME_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Collection's data is split into several shards.
 pub struct Collection {
@@ -112,6 +115,7 @@ pub struct Collection {
     private_oram_automatic_recovery_tasks: Arc<Mutex<HashSet<ShardId>>>,
     private_oram_resharding_resume_requests: Arc<Mutex<HashSet<ShardTransferKey>>>,
     private_oram_fixed_transfer_resume_intents: Arc<Mutex<HashSet<ShardTransfer>>>,
+    private_oram_source_resume_requests: Arc<Mutex<HashSet<ShardTransferKey>>>,
     // Background tasks to clean shards
     shard_clean_tasks: ShardCleanTasks,
 }
@@ -394,6 +398,7 @@ impl Collection {
             private_oram_automatic_recovery_tasks: Default::default(),
             private_oram_resharding_resume_requests: Default::default(),
             private_oram_fixed_transfer_resume_intents: Default::default(),
+            private_oram_source_resume_requests: Default::default(),
             shard_clean_tasks: Default::default(),
         })
     }
@@ -526,6 +531,7 @@ impl Collection {
             private_oram_automatic_recovery_tasks: Default::default(),
             private_oram_resharding_resume_requests: Default::default(),
             private_oram_fixed_transfer_resume_intents: Default::default(),
+            private_oram_source_resume_requests: Default::default(),
             shard_clean_tasks: Default::default(),
         };
 
@@ -1048,8 +1054,8 @@ impl Collection {
         let fixed_transfer_resume_intents = {
             let mut intents = self.private_oram_fixed_transfer_resume_intents.lock().await;
             intents.retain(|transfer| active_transfers.contains(transfer));
-            if let Some(transfer) = durable_fixed_transfer_resume_intent {
-                intents.insert(transfer);
+            if let Some(transfer) = durable_fixed_transfer_resume_intent.as_ref() {
+                intents.insert(transfer.clone());
             }
             intents.clone()
         };
@@ -1119,10 +1125,70 @@ impl Collection {
                     resharding_state.as_ref(),
                     self.this_peer_id,
                 );
-            match tasks_lock
+            let task_result = tasks_lock
                 .get_task_status(&transfer.key())
-                .map(|s| s.result)
+                .map(|s| s.result);
+            if fixed_transfer_requires_exact_restart
+                && durable_fixed_transfer_resume_intent.as_ref() == Some(&transfer)
+                && task_result
+                    .as_ref()
+                    .is_none_or(|result| *result == TaskResult::Failed)
             {
+                // Once both stores are installed the target stops requesting preinstall.
+                // A source crash can still lose the streaming task, so its durable intent
+                // must drive recovery too. The RPC rechecks task state under its lock to
+                // avoid a delayed retry replacing a task another request already started.
+                let transfer_key = transfer.key();
+                let should_request_resume = self
+                    .private_oram_source_resume_requests
+                    .lock()
+                    .await
+                    .insert(transfer_key.clone());
+                if should_request_resume {
+                    let transition = transfer
+                        .private_oram_layout_transition
+                        .as_ref()
+                        .expect("exact fixed transfer resume requires a layout transition");
+                    let request = RequestPrivateOramShardRecoveryRequest {
+                        collection_name: self.name().to_string(),
+                        shard_id: transfer.shard_id,
+                        source_peer_id: transfer.from,
+                        target_peer_id: transfer.to,
+                        active_transfer_resume: Some(PrivateOramActiveTransferResumeContext {
+                            sync: transfer.sync,
+                            expected_layout_generation: transition.expected.generation,
+                            expected_layout_digest: transition.expected.layout_digest.clone(),
+                            new_layout_generation: transition.new.generation,
+                            new_layout_digest: transition.new.layout_digest.clone(),
+                            index_state_digest: transition.expected.index_state_digest.clone(),
+                        }),
+                        resume_if_task_missing: true,
+                    };
+                    let channel_service = self.channel_service.clone();
+                    let pending = self.private_oram_source_resume_requests.clone();
+                    self.update_runtime.spawn(async move {
+                        log::info!(
+                            "Resuming a private ORAM source transfer from its durable preinstall intent"
+                        );
+                        match channel_service
+                            .request_private_oram_shard_recovery(request.source_peer_id, request)
+                            .await
+                        {
+                            Ok(response) if response.accepted => {}
+                            Ok(_) => log::warn!(
+                                "Private ORAM source transfer resume was not accepted"
+                            ),
+                            Err(error) => log::warn!(
+                                "Failed to resume private ORAM source transfer: {error}"
+                            ),
+                        }
+                        tokio::time::sleep(PRIVATE_ORAM_SOURCE_RESUME_REQUEST_INTERVAL).await;
+                        pending.lock().await.remove(&transfer_key);
+                    });
+                }
+                continue;
+            }
+            match task_result {
                 None => {
                     if fixed_transfer_requires_exact_restart
                         || resharding_transfer_requires_exact_restart
@@ -1347,6 +1413,7 @@ impl Collection {
                                     source_peer_id: replica_id,
                                     target_peer_id: this_peer_id,
                                     active_transfer_resume: None,
+                                    resume_if_task_missing: false,
                                 },
                             )
                             .await;
@@ -1666,8 +1733,7 @@ fn validate_client_payload_nonce_replay_cache_parent(path: &Path) -> CollectionR
         }
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
-            let sticky_ancestor =
-                Some(directory) != direct_parent && mode & nix::libc::S_ISVTX != 0;
+            let sticky_ancestor = Some(directory) != direct_parent && mode & 0o1000 != 0;
             if sticky_ancestor {
                 current = directory.parent();
                 continue;
@@ -1921,12 +1987,18 @@ impl StorageVersion for CollectionVersion {
 mod tests {
     use super::*;
 
+    fn nonce_replay_cache_temp_dir() -> tempfile::TempDir {
+        // Resolve platform temp-root aliases before adding any deliberate symlinks.
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::Builder::new()
+            .prefix("nonce-replay-path-sentinel-")
+            .tempdir_in(temp_root)
+            .unwrap()
+    }
+
     #[test]
     fn client_payload_nonce_replay_cache_rejects_oversized_entries() {
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(
             &cache_path,
@@ -1950,7 +2022,7 @@ mod tests {
 
     #[test]
     fn client_payload_nonce_replay_cache_rejects_oversized_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         let mut options = std::fs::OpenOptions::new();
         options.create(true).write(true).truncate(true);
@@ -1970,10 +2042,7 @@ mod tests {
 
     #[test]
     fn client_payload_nonce_replay_cache_rejects_malformed_entries() {
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(&cache_path, "not-a-valid-cache-key\n").unwrap();
         #[cfg(unix)]
@@ -2784,7 +2853,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
 
         append_client_payload_nonce_replay_cache(&cache_path, &["nonce-a".to_string()]).unwrap();
@@ -2807,10 +2876,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_load_rejects_group_world_accessible_files() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         std::fs::write(
             &cache_path,
@@ -2829,10 +2895,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_group_world_writable_parent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::Builder::new()
-            .prefix("nonce-replay-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
 
@@ -2857,7 +2920,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_group_world_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let writable_ancestor = dir.path().join("writable-ancestor");
         let collection_dir = writable_ancestor.join("collection");
         std::fs::create_dir(&writable_ancestor).unwrap();
@@ -2887,7 +2950,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_symlink_paths() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let cache_path = dir.path().join(CLIENT_PAYLOAD_NONCE_REPLAY_CACHE_FILE);
         let target_path = dir.path().join("target");
         std::fs::write(&target_path, "target-before\n").unwrap();
@@ -2929,7 +2992,7 @@ mod tests {
     fn client_payload_nonce_replay_cache_rejects_symlink_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = nonce_replay_cache_temp_dir();
         let real_parent = dir.path().join("real-parent");
         let symlink_parent = dir.path().join("symlink-parent");
         std::fs::create_dir(&real_parent).unwrap();

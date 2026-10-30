@@ -12,6 +12,7 @@ edition = "2024"
 workspace = true
 
 [features]
+# Cross-crate development fixtures only. Production binaries must not forward this feature.
 testing = ["dep:ring"]
 tracing = ["dep:tracing", "api/tracing", "segment/tracing"]
 data-consistency-check = []

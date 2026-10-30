@@ -65,7 +65,7 @@ def test_snapshot_restore_kill_during_partial(tmp_path: Path, every_test):
 
     env = {
         "QDRANT__LOG_LEVEL": "DEBUG",
-        "QDRANT__STAGING__SNAPSHOT_RECOVERY_DELAY": "5.0",
+        "QDRANT_STAGING_SNAPSHOT_RECOVERY_DELAY": "5.0",
     }
 
     peer_urls, peer_dirs, bootstrap = start_cluster(tmp_path, 3, port_seed=23000, extra_env=env)

@@ -285,9 +285,9 @@ where
             .await?;
     }
 
-    // shortcuts batch if all requests with limit=0
+    // Preserve one result slot per request, including when every limit is zero.
     if request_batch.iter().all(|(s, _)| s.limit == 0) {
-        return Ok(vec![]);
+        return Ok(vec![vec![]; request_batch.len()]);
     }
 
     // Validate amount of examples

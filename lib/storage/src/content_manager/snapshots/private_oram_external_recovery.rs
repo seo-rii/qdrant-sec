@@ -1,7 +1,12 @@
+use std::collections::HashMap;
+#[cfg(feature = "staging")]
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::DirBuilder;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "staging")]
+use std::sync::{Mutex, OnceLock};
 
 use collection::config::CollectionConfigInternal;
 use collection::private_hnsw_oram_store::PRIVATE_HNSW_ORAM_DIR;
@@ -21,11 +26,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::StorageError;
+#[cfg(test)]
+use crate::content_manager::consensus_ops::PrivateOramExternalRecoveryAuthority;
 use crate::content_manager::consensus_ops::{
     PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryLease,
     PrivateOramExternalRecoveryLeasePhase, PrivateOramExternalRecoveryState,
 };
+use crate::content_manager::private_oram_mutation_journal::PRIVATE_ORAM_MUTATION_JOURNAL_DIR;
 use crate::content_manager::toc::COLLECTIONS_DIR;
+use crate::types::{
+    PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES, PrivateOramExternalRecoveryConfig,
+};
 
 pub const PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -38,10 +49,9 @@ const PRIVATE_ORAM_EXTERNAL_RECOVERY_VERIFY_TEMP_DIR: &str = "verified_collectio
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MARKER_FILE: &str = "install.json";
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BACKUP_DIR: &str = "live_collection.backup";
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_VERSION: u16 = 1;
-const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_VERSION: u16 = 4;
+const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_VERSION: u16 = 5;
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_BYTES: u64 = 64 * 1024;
-const PRIVATE_ORAM_EXTERNAL_RECOVERY_MAX_SNAPSHOT_BYTES: u64 = 1 << 40;
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_TREE_DEPTH: usize = 64;
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_TREE_ENTRIES: u64 = 10_000_000;
 const PRIVATE_ORAM_SHA256_BASE64URL_LEN: usize = 43;
@@ -57,11 +67,143 @@ const PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_TREE_DIGEST_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-external-recovery-tree-digest/v1";
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_PRIVATE_STATE_DIGEST_DOMAIN: &[u8] =
-    b"qdrant-sec/private-oram-external-recovery-private-state-digest/v1";
+    b"qdrant-sec/private-oram-external-recovery-private-state-digest/v2";
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_CONFIG_DIGEST_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-external-recovery-config-digest/v1";
 const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_INTENT_DIGEST_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-external-recovery-install-intent-digest/v1";
+#[cfg(feature = "staging")]
+const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BULK_SYNC_ENOSPC_ONCE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BULK_SYNC_ENOSPC_ONCE_FILE";
+#[cfg(feature = "staging")]
+const PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BULK_SYNC_FAULT_MAX_BYTES: usize = 4 * 1024;
+
+#[cfg(feature = "staging")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateOramExternalRecoveryInstallBulkSyncFault {
+    operation_id_hash: String,
+    tree: String,
+}
+
+#[cfg(feature = "staging")]
+fn should_inject_private_oram_external_recovery_install_bulk_sync_enospc(
+    operation_id_hash: &str,
+    tree: &'static str,
+) -> bool {
+    let Some(selector_path) =
+        std::env::var_os(PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BULK_SYNC_ENOSPC_ONCE_FILE_ENV)
+    else {
+        return false;
+    };
+    if selector_path.is_empty() {
+        return false;
+    }
+    let Ok(selector_bytes) = fs::read(selector_path) else {
+        return false;
+    };
+    if selector_bytes.len() > PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_BULK_SYNC_FAULT_MAX_BYTES {
+        return false;
+    }
+    let Ok(selector) =
+        serde_json::from_slice::<PrivateOramExternalRecoveryInstallBulkSyncFault>(&selector_bytes)
+    else {
+        return false;
+    };
+    if selector.operation_id_hash != operation_id_hash || selector.tree != tree {
+        return false;
+    }
+
+    static CONSUMED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    CONSUMED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|mut consumed| {
+            consumed.insert((operation_id_hash.to_string(), tree.to_string()))
+        })
+}
+
+fn bulk_sync_private_oram_external_recovery_install_tree(
+    path: &Path,
+    _operation_id_hash: &str,
+    _tree: &'static str,
+) -> std::io::Result<()> {
+    #[cfg(feature = "staging")]
+    {
+        if should_inject_private_oram_external_recovery_install_bulk_sync_enospc(
+            _operation_id_hash,
+            _tree,
+        ) {
+            log::warn!(
+                "Private ORAM staging external recovery install bulk-sync ENOSPC injected: {_tree}",
+            );
+            return Err(std::io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+    }
+    common::fs::bulk_sync_dir(path)
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrivateOramExternalRecoveryIoFault {
+    StateTempFileSync,
+    StateParentDirectorySync,
+    InitializationCleanupParentDirectorySync,
+    InstallMarkerTempFileSync,
+    InstallMarkerParentDirectorySync,
+    VerificationOutputRename,
+    VerificationOutputParentDirectorySync,
+    InstallTreeRename,
+    InstallTreeSourceParentDirectorySync,
+    InstallTreeDestinationParentDirectorySync,
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static PRIVATE_ORAM_EXTERNAL_RECOVERY_IO_FAULT: std::cell::Cell<Option<PrivateOramExternalRecoveryIoFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+struct PrivateOramExternalRecoveryIoFaultGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for PrivateOramExternalRecoveryIoFaultGuard {
+    fn drop(&mut self) {
+        PRIVATE_ORAM_EXTERNAL_RECOVERY_IO_FAULT.with(|fault| fault.set(None));
+    }
+}
+
+#[cfg(all(test, unix))]
+fn inject_private_oram_external_recovery_io_fault(
+    point: PrivateOramExternalRecoveryIoFault,
+) -> std::io::Result<()> {
+    let should_fail = PRIVATE_ORAM_EXTERNAL_RECOVERY_IO_FAULT.with(|fault| {
+        if fault.get() == Some(point) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if should_fail {
+        return Err(std::io::Error::from_raw_os_error(nix::libc::ENOSPC));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn set_private_oram_external_recovery_io_fault(
+    point: PrivateOramExternalRecoveryIoFault,
+) -> PrivateOramExternalRecoveryIoFaultGuard {
+    PRIVATE_ORAM_EXTERNAL_RECOVERY_IO_FAULT.with(|fault| {
+        assert!(
+            fault.replace(Some(point)).is_none(),
+            "private ORAM external recovery I/O fault already set",
+        );
+    });
+    PrivateOramExternalRecoveryIoFaultGuard
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +314,10 @@ struct PrivateOramExternalRecoveryStagingState {
     bytes_received: u64,
     next_chunk_index: u64,
     phase: PrivateOramExternalRecoveryStagingPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_tree_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_private_state_digest: Option<String>,
 }
 
 impl fmt::Debug for PrivateOramExternalRecoveryStagingState {
@@ -185,6 +331,8 @@ impl fmt::Debug for PrivateOramExternalRecoveryStagingState {
             .field("bytes_received", &self.bytes_received)
             .field("next_chunk_index", &self.next_chunk_index)
             .field("phase", &self.phase)
+            .field("verified_tree_digest", &"[redacted]")
+            .field("verified_private_state_digest", &"[redacted]")
             .finish()
     }
 }
@@ -229,6 +377,12 @@ pub struct PrivateOramExternalRecoveryVerification {
     checkpoint_digest: String,
     archive_identity: FileIdentity,
     _collection_lock: PrivateOramExternalRecoveryLock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrivateOramExternalRecoveryArchiveResources {
+    pub entry_count: u64,
+    pub logical_bytes: u64,
 }
 
 impl fmt::Debug for PrivateOramExternalRecoveryVerification {
@@ -302,14 +456,351 @@ impl PrivateOramExternalRecoveryVerification {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(invalid_staging_state()),
         }
+        #[cfg(all(test, unix))]
+        inject_private_oram_external_recovery_io_fault(
+            PrivateOramExternalRecoveryIoFault::VerificationOutputRename,
+        )
+        .map_err(|_| invalid_staging_state())?;
         fs::rename(
             &self.verify_temp_collection_path,
             &self.verified_collection_path,
         )
         .map_err(|_| invalid_staging_state())?;
+        #[cfg(all(test, unix))]
+        inject_private_oram_external_recovery_io_fault(
+            PrivateOramExternalRecoveryIoFault::VerificationOutputParentDirectorySync,
+        )
+        .map_err(|_| invalid_staging_state())?;
         common::fs::sync_parent_dir(&self.verified_collection_path)
             .map_err(|_| invalid_staging_state())
     }
+
+    pub fn validate_archive_resources(
+        &self,
+        limits: &PrivateOramExternalRecoveryConfig,
+    ) -> Result<PrivateOramExternalRecoveryArchiveResources, StorageError> {
+        let file = open_regular_file(
+            &self.snapshot_path,
+            true,
+            Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES),
+            false,
+        )?;
+        if file_identity(&file)? != self.archive_identity {
+            return Err(invalid_staging_state());
+        }
+
+        let mut archive = tar::Archive::new(file);
+        let mut entry_count = 0_u64;
+        let mut unpacked_bytes = 0_u64;
+        for entry in archive.entries().map_err(|_| invalid_staging_request())? {
+            let entry = entry.map_err(|_| invalid_staging_request())?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(invalid_staging_request)?;
+            if entry_count > PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_TREE_ENTRIES {
+                return Err(invalid_staging_request());
+            }
+            match entry.header().entry_type() {
+                tar::EntryType::Directory => {}
+                tar::EntryType::Regular | tar::EntryType::GNUSparse => {
+                    // Use the logical size applied by the tar reader, including PAX
+                    // overrides and sparse expansion, rather than the raw header.
+                    let size = entry.size();
+                    unpacked_bytes = unpacked_bytes
+                        .checked_add(size)
+                        .ok_or_else(invalid_staging_request)?;
+                    if unpacked_bytes > limits.max_unpacked_bytes {
+                        return Err(invalid_staging_request());
+                    }
+                }
+                _ => return Err(invalid_staging_request()),
+            }
+        }
+        ensure_private_oram_external_recovery_free_space(
+            &self.snapshot_path,
+            unpacked_bytes,
+            limits.min_free_space_bytes,
+        )?;
+        Ok(PrivateOramExternalRecoveryArchiveResources {
+            entry_count,
+            logical_bytes: unpacked_bytes,
+        })
+    }
+}
+
+pub fn private_oram_external_recovery_reservation_bytes(
+    snapshot_size_bytes: u64,
+    limits: &PrivateOramExternalRecoveryConfig,
+) -> Result<u64, StorageError> {
+    if snapshot_size_bytes == 0
+        || snapshot_size_bytes > limits.max_snapshot_bytes
+        || snapshot_size_bytes > PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
+    {
+        return Err(invalid_staging_request());
+    }
+    snapshot_size_bytes
+        .checked_add(limits.max_unpacked_bytes)
+        .ok_or_else(invalid_staging_request)
+}
+
+fn acquire_private_oram_external_recovery_collection_lock(
+    lock_path: &Path,
+    create: bool,
+) -> Result<PrivateOramExternalRecoveryLock, StorageError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+            .mode(0o600);
+    }
+    let file = options.open(lock_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StorageError::not_found("private ORAM external recovery not found")
+        } else {
+            invalid_staging_state()
+        }
+    })?;
+    let opened = file.metadata().map_err(|_| invalid_staging_state())?;
+    validate_secure_file_metadata(&opened, 0)?;
+    FileExt::lock_exclusive(&file).map_err(|_| invalid_staging_state())?;
+    let current = fs::symlink_metadata(lock_path).map_err(|_| invalid_staging_state())?;
+    ensure_same_file(&opened, &current)?;
+    validate_secure_file_metadata(&current, 0)?;
+    if create {
+        file.sync_all().map_err(|_| invalid_staging_state())?;
+        common::fs::sync_parent_dir(lock_path).map_err(|_| invalid_staging_state())?;
+    }
+    Ok(PrivateOramExternalRecoveryLock { _file: file })
+}
+
+/// Reconcile only the shapes that `begin` can leave before publishing its initial state.
+/// The caller holds the collection lock. No upload can have been acknowledged yet: the
+/// snapshot is absent or empty, and the only other possible entry is one initial-state
+/// write. Validate every entry before removing anything; a complete state is recovered.
+fn reconcile_private_oram_external_recovery_initialization(
+    storage_path: &Path,
+    collection_path: &Path,
+    operation_path: &Path,
+    operation_id_hash: &str,
+    install_marker: Option<&PrivateOramExternalRecoveryInstallMarker>,
+) -> Result<Option<PrivateOramExternalRecoveryStagingState>, StorageError> {
+    if install_marker.is_some_and(|marker| marker.operation_id_hash == operation_id_hash) {
+        return Err(invalid_staging_state());
+    }
+    validate_secure_directory(operation_path)?;
+    let mut snapshot_path = None;
+    let mut temp_path = None;
+    for entry in fs::read_dir(operation_path).map_err(|_| invalid_staging_state())? {
+        let path = entry.map_err(|_| invalid_staging_state())?.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(invalid_staging_state)?;
+        if name == PRIVATE_ORAM_EXTERNAL_RECOVERY_SNAPSHOT_FILE {
+            open_regular_file(&path, true, Some(0), false)?;
+            snapshot_path = Some(path);
+        } else {
+            let suffix = name
+                .strip_prefix(".state-")
+                .and_then(|name| name.strip_suffix(".tmp"))
+                .ok_or_else(invalid_staging_state)?;
+            let nonce = uuid::Uuid::parse_str(suffix).map_err(|_| invalid_staging_state())?;
+            if nonce.to_string() != suffix
+                || nonce.get_version() != Some(uuid::Version::Random)
+                || temp_path.is_some()
+            {
+                return Err(invalid_staging_state());
+            }
+            open_regular_file(
+                &path,
+                true,
+                Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+                false,
+            )?;
+            temp_path = Some(path);
+        }
+    }
+
+    if let Some(temp_path) = temp_path.as_ref() {
+        if snapshot_path.is_none() {
+            return Err(invalid_staging_state());
+        }
+        // Publishing a complete interrupted state requires a writable handle for the
+        // Windows flush; ordinary validation reads remain read-only.
+        let mut file = open_regular_file(
+            temp_path,
+            true,
+            Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+            cfg!(windows),
+        )?;
+        let len = file.metadata().map_err(|_| invalid_staging_state())?.len();
+        let mut bytes = Vec::with_capacity(len as usize);
+        (&mut file)
+            .take(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| invalid_staging_state())?;
+        if bytes.len() as u64 != len {
+            return Err(invalid_staging_state());
+        }
+        match serde_json::from_slice::<PrivateOramExternalRecoveryStagingState>(&bytes) {
+            Ok(state) => {
+                validate_state(&state)?;
+                let staging = PrivateOramExternalRecoveryStaging::new(
+                    storage_path,
+                    &state.checkpoint_bundle.checkpoint.collection_id,
+                    operation_id_hash,
+                )?;
+                if state.operation_id_hash != operation_id_hash
+                    || staging.collection_path() != collection_path
+                    || staging.operation_path() != operation_path
+                    || state.phase != PrivateOramExternalRecoveryStagingPhase::Uploading
+                    || state.bytes_received != 0
+                    || state.next_chunk_index != 0
+                {
+                    return Err(invalid_staging_state());
+                }
+                let state_path = operation_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_FILE);
+                validate_missing_path(&state_path).map_err(|_| invalid_staging_state())?;
+                file.sync_all().map_err(|_| invalid_staging_state())?;
+                fs::rename(temp_path, &state_path).map_err(|_| invalid_staging_state())?;
+                #[cfg(all(test, unix))]
+                inject_private_oram_external_recovery_io_fault(
+                    PrivateOramExternalRecoveryIoFault::StateParentDirectorySync,
+                )
+                .map_err(|_| invalid_staging_state())?;
+                common::fs::sync_parent_dir(&state_path).map_err(|_| invalid_staging_state())?;
+                return Ok(Some(state));
+            }
+            // A short initial write can end at any JSON prefix. Other invalid content
+            // is not evidence of interrupted initialization and must remain untouched.
+            Err(error) if error.is_eof() => {}
+            Err(_) => return Err(invalid_staging_state()),
+        }
+    }
+
+    if let Some(temp_path) = temp_path {
+        fs::remove_file(&temp_path).map_err(|_| invalid_staging_state())?;
+        // Persist this removal before removing the empty snapshot. Otherwise a crash
+        // could leave a temporary state without the earlier snapshot creation.
+        common::fs::sync_parent_dir(&temp_path).map_err(|_| invalid_staging_state())?;
+    }
+    if let Some(snapshot_path) = snapshot_path {
+        fs::remove_file(snapshot_path).map_err(|_| invalid_staging_state())?;
+    }
+    #[cfg(all(test, unix))]
+    inject_private_oram_external_recovery_io_fault(
+        PrivateOramExternalRecoveryIoFault::InitializationCleanupParentDirectorySync,
+    )
+    .map_err(|_| invalid_staging_state())?;
+    common::fs::sync_parent_dir(&operation_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_FILE))
+        .map_err(|_| invalid_staging_state())?;
+    fs::remove_dir(operation_path).map_err(|_| invalid_staging_state())?;
+    common::fs::sync_parent_dir(operation_path).map_err(|_| invalid_staging_state())?;
+    Ok(None)
+}
+
+pub fn load_private_oram_external_recovery_reservations(
+    storage_path: &Path,
+    limits: &PrivateOramExternalRecoveryConfig,
+) -> Result<HashMap<String, u64>, StorageError> {
+    let base_path = storage_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_DIR);
+    match fs::symlink_metadata(&base_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashMap::new());
+        }
+        Err(_) => return Err(invalid_staging_state()),
+        Ok(_) => validate_secure_directory(&base_path)?,
+    }
+
+    let mut reservations = HashMap::new();
+    for collection_entry in fs::read_dir(&base_path).map_err(|_| invalid_staging_state())? {
+        let collection_path = collection_entry
+            .map_err(|_| invalid_staging_state())?
+            .path();
+        validate_secure_directory(&collection_path)?;
+        let collection_key = collection_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(invalid_staging_state)?;
+        validate_base64url_sha256(collection_key).map_err(|_| invalid_staging_state())?;
+        let _collection_lock = acquire_private_oram_external_recovery_collection_lock(
+            &collection_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_LOCK_FILE),
+            true,
+        )?;
+        let install_marker = read_install_marker(
+            &collection_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MARKER_FILE),
+        )?;
+
+        for operation_entry in
+            fs::read_dir(&collection_path).map_err(|_| invalid_staging_state())?
+        {
+            let operation_path = operation_entry.map_err(|_| invalid_staging_state())?.path();
+            let entry_name = operation_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(invalid_staging_state)?;
+            if entry_name == PRIVATE_ORAM_EXTERNAL_RECOVERY_LOCK_FILE {
+                let metadata =
+                    fs::symlink_metadata(&operation_path).map_err(|_| invalid_staging_state())?;
+                validate_secure_file_metadata(&metadata, 0)?;
+                continue;
+            }
+            if entry_name == PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MARKER_FILE {
+                if read_install_marker(&operation_path)?.is_none() {
+                    return Err(invalid_staging_state());
+                }
+                continue;
+            }
+
+            validate_base64url_sha256(entry_name).map_err(|_| invalid_staging_state())?;
+            validate_secure_directory(&operation_path)?;
+            let state = read_private_oram_external_recovery_state_file(
+                &operation_path.join(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_FILE),
+            )?;
+            let state = match state {
+                Some(state) => state,
+                None => {
+                    let Some(state) = reconcile_private_oram_external_recovery_initialization(
+                        storage_path,
+                        &collection_path,
+                        &operation_path,
+                        entry_name,
+                        install_marker.as_ref(),
+                    )?
+                    else {
+                        continue;
+                    };
+                    state
+                }
+            };
+            let staging = PrivateOramExternalRecoveryStaging::new(
+                storage_path,
+                &state.checkpoint_bundle.checkpoint.collection_id,
+                entry_name,
+            )?;
+            if state.operation_id_hash != entry_name
+                || staging.collection_path() != collection_path
+                || staging.operation_path() != operation_path
+            {
+                return Err(invalid_staging_state());
+            }
+            let reserved = private_oram_external_recovery_reservation_bytes(
+                state.checkpoint_bundle.checkpoint.snapshot_size_bytes,
+                limits,
+            )?;
+            if reservations
+                .insert(state.operation_id_hash.clone(), reserved)
+                .is_some()
+            {
+                return Err(invalid_staging_state());
+            }
+        }
+    }
+    Ok(reservations)
 }
 
 impl PrivateOramExternalRecoveryStaging {
@@ -342,7 +833,7 @@ impl PrivateOramExternalRecoveryStaging {
             .map_err(|_| invalid_staging_request())?;
         if checkpoint_bundle.checkpoint.collection_id != self.collection_id
             || checkpoint_bundle.checkpoint.snapshot_size_bytes
-                > PRIVATE_ORAM_EXTERNAL_RECOVERY_MAX_SNAPSHOT_BYTES
+                > PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
             || checkpoint_bundle.checkpoint.snapshot_size_bytes == 0
             || lease_expires_at_unix == 0
             || private_oram_external_recovery_checkpoint_digest(&checkpoint_bundle)?
@@ -356,6 +847,7 @@ impl PrivateOramExternalRecoveryStaging {
         if read_install_marker(&self.install_marker_path())?.is_some() {
             return Err(invalid_install_state());
         }
+        let operation_existed = secure_directory_exists(&self.operation_path())?;
         ensure_secure_directory(&self.operation_path())?;
         let desired = PrivateOramExternalRecoveryStagingState {
             version: PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_VERSION,
@@ -366,10 +858,24 @@ impl PrivateOramExternalRecoveryStaging {
             bytes_received: 0,
             next_chunk_index: 0,
             phase: PrivateOramExternalRecoveryStagingPhase::Uploading,
+            verified_tree_digest: None,
+            verified_private_state_digest: None,
         };
         validate_state(&desired)?;
 
-        if let Some(mut existing) = self.read_state()? {
+        let existing = self.read_state()?;
+        let existing = if existing.is_none() && operation_existed {
+            reconcile_private_oram_external_recovery_initialization(
+                &self.storage_path,
+                &self.collection_path(),
+                &self.operation_path(),
+                &self.operation_id_hash,
+                None,
+            )?
+        } else {
+            existing
+        };
+        if let Some(mut existing) = existing {
             let same_recovery = existing.version == desired.version
                 && existing.operation_id_hash == desired.operation_id_hash
                 && existing.checkpoint_digest == desired.checkpoint_digest
@@ -385,9 +891,27 @@ impl PrivateOramExternalRecoveryStaging {
             return Ok(existing.status());
         }
 
+        ensure_secure_directory(&self.operation_path())?;
         self.create_empty_snapshot_file()?;
         self.write_state(&desired)?;
         Ok(desired.status())
+    }
+
+    pub fn begin_with_limits(
+        &self,
+        checkpoint_digest: &str,
+        checkpoint_bundle: PrivateOramExternalRecoveryCheckpointBundle,
+        lease_expires_at_unix: u64,
+        limits: &PrivateOramExternalRecoveryConfig,
+    ) -> Result<PrivateOramExternalRecoveryStagingStatus, StorageError> {
+        let snapshot_size_bytes = checkpoint_bundle.checkpoint.snapshot_size_bytes;
+        private_oram_external_recovery_reservation_bytes(snapshot_size_bytes, limits)?;
+        ensure_private_oram_external_recovery_free_space(
+            &self.storage_path,
+            snapshot_size_bytes,
+            limits.min_free_space_bytes,
+        )?;
+        self.begin(checkpoint_digest, checkpoint_bundle, lease_expires_at_unix)
     }
 
     pub fn status(&self) -> Result<PrivateOramExternalRecoveryStagingStatus, StorageError> {
@@ -424,6 +948,37 @@ impl PrivateOramExternalRecoveryStaging {
         Ok(state.status())
     }
 
+    pub fn status_and_checkpoint_bundle_for_consensus_lease(
+        &self,
+        checkpoint_digest: &str,
+        backup_generation: u64,
+        lease_expires_at_unix: u64,
+    ) -> Result<
+        (
+            PrivateOramExternalRecoveryStagingStatus,
+            PrivateOramExternalRecoveryCheckpointBundle,
+        ),
+        StorageError,
+    > {
+        validate_base64url_sha256(checkpoint_digest)?;
+        let _collection_lock = self.acquire_collection_lock(false)?;
+        let mut state = self
+            .read_state()?
+            .ok_or_else(|| StorageError::not_found("private ORAM external recovery not found"))?;
+        self.reconcile_snapshot_file(&state)?;
+        if state.checkpoint_digest != checkpoint_digest
+            || state.checkpoint_bundle.checkpoint.backup_generation != backup_generation
+            || lease_expires_at_unix < state.lease_expires_at_unix
+        {
+            return Err(invalid_staging_state());
+        }
+        if lease_expires_at_unix > state.lease_expires_at_unix {
+            state.lease_expires_at_unix = lease_expires_at_unix;
+            self.write_state(&state)?;
+        }
+        Ok((state.status(), state.checkpoint_bundle))
+    }
+
     pub fn append_chunk(
         &self,
         chunk_index: u64,
@@ -445,7 +1000,7 @@ impl PrivateOramExternalRecoveryStaging {
         }
         let expected_len =
             (total_size - expected_offset).min(PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES);
-        let mut chunk = open_regular_file(chunk_path, false, None)?;
+        let mut chunk = open_regular_file(chunk_path, false, None, false)?;
         let chunk_identity = file_identity(&chunk)?;
         if chunk_identity.len != expected_len {
             return Err(invalid_staging_request());
@@ -505,6 +1060,37 @@ impl PrivateOramExternalRecoveryStaging {
         Ok(state.status())
     }
 
+    pub fn append_chunk_with_limits(
+        &self,
+        chunk_index: u64,
+        chunk_path: &Path,
+        chunk_sha256: &str,
+        limits: &PrivateOramExternalRecoveryConfig,
+    ) -> Result<PrivateOramExternalRecoveryStagingStatus, StorageError> {
+        let state = self
+            .read_state()?
+            .ok_or_else(|| StorageError::not_found("private ORAM external recovery not found"))?;
+        private_oram_external_recovery_reservation_bytes(
+            state.checkpoint_bundle.checkpoint.snapshot_size_bytes,
+            limits,
+        )?;
+        let expected_offset = chunk_index
+            .checked_mul(PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES)
+            .ok_or_else(invalid_staging_request)?;
+        let remaining = state
+            .checkpoint_bundle
+            .checkpoint
+            .snapshot_size_bytes
+            .checked_sub(expected_offset)
+            .ok_or_else(invalid_staging_request)?;
+        ensure_private_oram_external_recovery_free_space(
+            &self.storage_path,
+            remaining.min(PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES),
+            limits.min_free_space_bytes,
+        )?;
+        self.append_chunk(chunk_index, chunk_path, chunk_sha256)
+    }
+
     pub fn prepare_verification(
         &self,
     ) -> Result<PrivateOramExternalRecoveryVerification, StorageError> {
@@ -543,6 +1129,39 @@ impl PrivateOramExternalRecoveryStaging {
         })
     }
 
+    pub fn prepare_verification_with_limits(
+        &self,
+        limits: &PrivateOramExternalRecoveryConfig,
+    ) -> Result<
+        (
+            PrivateOramExternalRecoveryVerification,
+            PrivateOramExternalRecoveryArchiveResources,
+        ),
+        StorageError,
+    > {
+        let verification = self.prepare_verification()?;
+        private_oram_external_recovery_reservation_bytes(
+            verification
+                .checkpoint_bundle
+                .checkpoint
+                .snapshot_size_bytes,
+            limits,
+        )?;
+        let archive_resources = verification.validate_archive_resources(limits)?;
+        Ok((verification, archive_resources))
+    }
+
+    pub fn ensure_install_free_space(
+        &self,
+        limits: &PrivateOramExternalRecoveryConfig,
+    ) -> Result<(), StorageError> {
+        ensure_private_oram_external_recovery_free_space(
+            &self.storage_path,
+            0,
+            limits.min_free_space_bytes,
+        )
+    }
+
     pub fn mark_verified(
         &self,
         verification: PrivateOramExternalRecoveryVerification,
@@ -576,6 +1195,16 @@ impl PrivateOramExternalRecoveryStaging {
         {
             return Err(invalid_staging_state());
         }
+        state.verified_tree_digest = Some(
+            private_oram_external_recovery_tree_digest(&verification.verified_collection_path)
+                .map_err(|_| invalid_staging_state())?,
+        );
+        state.verified_private_state_digest = Some(
+            private_oram_external_recovery_private_state_digest(
+                &verification.verified_collection_path,
+            )
+            .map_err(|_| invalid_staging_state())?,
+        );
         state.phase = PrivateOramExternalRecoveryStagingPhase::Verified;
         validate_state(&state)?;
         self.write_state(&state)?;
@@ -651,8 +1280,33 @@ impl PrivateOramExternalRecoveryStaging {
             &self.collection_id,
         )?;
         validate_missing_path(&backup_path)?;
-        common::fs::bulk_sync_dir(&verified_path).map_err(|_| invalid_install_state())?;
-        common::fs::bulk_sync_dir(&live_path).map_err(|_| invalid_install_state())?;
+        bulk_sync_private_oram_external_recovery_install_tree(
+            &verified_path,
+            &self.operation_id_hash,
+            "verified",
+        )
+        .map_err(|_| invalid_install_state())?;
+        bulk_sync_private_oram_external_recovery_install_tree(
+            &live_path,
+            &self.operation_id_hash,
+            "live",
+        )
+        .map_err(|_| invalid_install_state())?;
+
+        let verified_tree_digest = state
+            .verified_tree_digest
+            .clone()
+            .ok_or_else(invalid_install_state)?;
+        let verified_private_state_digest = state
+            .verified_private_state_digest
+            .clone()
+            .ok_or_else(invalid_install_state)?;
+        if private_oram_external_recovery_tree_digest(&verified_path)? != verified_tree_digest
+            || private_oram_external_recovery_private_state_digest(&verified_path)?
+                != verified_private_state_digest
+        {
+            return Err(invalid_install_state());
+        }
 
         let marker = PrivateOramExternalRecoveryInstallMarker {
             version: PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_VERSION,
@@ -672,11 +1326,9 @@ impl PrivateOramExternalRecoveryStaging {
             old_private_state_digest: private_oram_external_recovery_private_state_digest(
                 &live_path,
             )?,
-            new_tree_digest: private_oram_external_recovery_tree_digest(&verified_path)?,
+            new_tree_digest: verified_tree_digest,
             new_config_digest: private_oram_external_recovery_config_digest(&verified_path)?,
-            new_private_state_digest: private_oram_external_recovery_private_state_digest(
-                &verified_path,
-            )?,
+            new_private_state_digest: verified_private_state_digest,
         };
         validate_install_marker(&marker)?;
         write_install_marker(&self.install_marker_path(), None, &marker)?;
@@ -750,35 +1402,7 @@ impl PrivateOramExternalRecoveryStaging {
         &self,
         create: bool,
     ) -> Result<PrivateOramExternalRecoveryLock, StorageError> {
-        let lock_path = self.collection_lock_path();
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(create);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-
-            options
-                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
-                .mode(0o600);
-        }
-        let file = options.open(&lock_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StorageError::not_found("private ORAM external recovery not found")
-            } else {
-                invalid_staging_state()
-            }
-        })?;
-        let opened = file.metadata().map_err(|_| invalid_staging_state())?;
-        validate_secure_file_metadata(&opened, 0)?;
-        FileExt::lock_exclusive(&file).map_err(|_| invalid_staging_state())?;
-        let current = fs::symlink_metadata(&lock_path).map_err(|_| invalid_staging_state())?;
-        ensure_same_file(&opened, &current)?;
-        validate_secure_file_metadata(&current, 0)?;
-        if create {
-            file.sync_all().map_err(|_| invalid_staging_state())?;
-            common::fs::sync_parent_dir(&lock_path).map_err(|_| invalid_staging_state())?;
-        }
-        Ok(PrivateOramExternalRecoveryLock { _file: file })
+        acquire_private_oram_external_recovery_collection_lock(&self.collection_lock_path(), create)
     }
 
     fn create_empty_snapshot_file(&self) -> Result<(), StorageError> {
@@ -824,29 +1448,10 @@ impl PrivateOramExternalRecoveryStaging {
     }
 
     fn read_state(&self) -> Result<Option<PrivateOramExternalRecoveryStagingState>, StorageError> {
-        let state_path = self.state_path();
-        let metadata = match fs::symlink_metadata(&state_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(invalid_staging_state()),
+        let state = read_private_oram_external_recovery_state_file(&self.state_path())?;
+        let Some(state) = state else {
+            return Ok(None);
         };
-        validate_secure_file_metadata(&metadata, PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES)?;
-        let file = open_regular_file(
-            &state_path,
-            true,
-            Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
-        )?;
-        let opened = file.metadata().map_err(|_| invalid_staging_state())?;
-        ensure_same_file(&metadata, &opened)?;
-        let mut bytes = Vec::with_capacity(opened.len() as usize);
-        file.take(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| invalid_staging_state())?;
-        if bytes.len() as u64 != opened.len() {
-            return Err(invalid_staging_state());
-        }
-        let state = serde_json::from_slice(&bytes).map_err(|_| invalid_staging_state())?;
-        validate_state(&state)?;
         if state.operation_id_hash != self.operation_id_hash
             || state.checkpoint_bundle.checkpoint.collection_id != self.collection_id
         {
@@ -877,8 +1482,18 @@ impl PrivateOramExternalRecoveryStaging {
                 .map_err(|_| invalid_staging_state())?;
             file.write_all(&bytes)
                 .map_err(|_| invalid_staging_state())?;
+            #[cfg(all(test, unix))]
+            inject_private_oram_external_recovery_io_fault(
+                PrivateOramExternalRecoveryIoFault::StateTempFileSync,
+            )
+            .map_err(|_| invalid_staging_state())?;
             file.sync_all().map_err(|_| invalid_staging_state())?;
             fs::rename(&temp_path, &state_path).map_err(|_| invalid_staging_state())?;
+            #[cfg(all(test, unix))]
+            inject_private_oram_external_recovery_io_fault(
+                PrivateOramExternalRecoveryIoFault::StateParentDirectorySync,
+            )
+            .map_err(|_| invalid_staging_state())?;
             common::fs::sync_parent_dir(&state_path).map_err(|_| invalid_staging_state())
         })();
         if result.is_err() {
@@ -891,7 +1506,8 @@ impl PrivateOramExternalRecoveryStaging {
         open_regular_file(
             &self.snapshot_path(),
             true,
-            Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_MAX_SNAPSHOT_BYTES),
+            Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES),
+            false,
         )
         .and_then(|file| {
             if write {
@@ -907,7 +1523,7 @@ impl PrivateOramExternalRecoveryStaging {
                 ensure_same_file(&original, &reopened_metadata)?;
                 validate_secure_file_metadata(
                     &reopened_metadata,
-                    PRIVATE_ORAM_EXTERNAL_RECOVERY_MAX_SNAPSHOT_BYTES,
+                    PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES,
                 )?;
                 Ok(reopened)
             } else {
@@ -1699,6 +2315,9 @@ fn validate_install_marker_staging_binding(
         || checkpoint.layout_generation != marker.layout_generation
         || checkpoint.layout_digest != marker.layout_digest
         || checkpoint.index_state_digest != marker.index_state_digest
+        || state.verified_tree_digest.as_deref() != Some(marker.new_tree_digest.as_str())
+        || state.verified_private_state_digest.as_deref()
+            != Some(marker.new_private_state_digest.as_str())
     {
         return Err(invalid_install_state());
     }
@@ -1736,6 +2355,7 @@ fn read_install_marker(
         marker_path,
         true,
         Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_INSTALL_MAX_BYTES),
+        false,
     )
     .map_err(|_| invalid_install_state())?;
     let opened = file.metadata().map_err(|_| invalid_install_state())?;
@@ -1779,8 +2399,18 @@ fn write_install_marker(
             .map_err(|_| invalid_install_state())?;
         file.write_all(&bytes)
             .map_err(|_| invalid_install_state())?;
+        #[cfg(all(test, unix))]
+        inject_private_oram_external_recovery_io_fault(
+            PrivateOramExternalRecoveryIoFault::InstallMarkerTempFileSync,
+        )
+        .map_err(|_| invalid_install_state())?;
         file.sync_all().map_err(|_| invalid_install_state())?;
         fs::rename(&temp_path, marker_path).map_err(|_| invalid_install_state())?;
+        #[cfg(all(test, unix))]
+        inject_private_oram_external_recovery_io_fault(
+            PrivateOramExternalRecoveryIoFault::InstallMarkerParentDirectorySync,
+        )
+        .map_err(|_| invalid_install_state())?;
         common::fs::sync_parent_dir(marker_path).map_err(|_| invalid_install_state())
     })();
     if result.is_err() {
@@ -1852,8 +2482,23 @@ fn rename_install_tree(
         return Err(invalid_install_state());
     }
     validate_missing_path(destination)?;
+    #[cfg(all(test, unix))]
+    inject_private_oram_external_recovery_io_fault(
+        PrivateOramExternalRecoveryIoFault::InstallTreeRename,
+    )
+    .map_err(|_| invalid_install_state())?;
     fs::rename(source, destination).map_err(|_| invalid_install_state())?;
+    #[cfg(all(test, unix))]
+    inject_private_oram_external_recovery_io_fault(
+        PrivateOramExternalRecoveryIoFault::InstallTreeSourceParentDirectorySync,
+    )
+    .map_err(|_| invalid_install_state())?;
     common::fs::sync_parent_dir(source).map_err(|_| invalid_install_state())?;
+    #[cfg(all(test, unix))]
+    inject_private_oram_external_recovery_io_fault(
+        PrivateOramExternalRecoveryIoFault::InstallTreeDestinationParentDirectorySync,
+    )
+    .map_err(|_| invalid_install_state())?;
     common::fs::sync_parent_dir(destination).map_err(|_| invalid_install_state())?;
     validate_owned_directory(destination, require_private)?;
     if private_oram_external_recovery_tree_digest(destination)? != expected_digest {
@@ -1891,7 +2536,11 @@ fn private_oram_external_recovery_private_state_digest(
     validate_owned_directory(collection_path, false)?;
     let mut hasher = Sha256::new();
     hasher.update(PRIVATE_ORAM_EXTERNAL_RECOVERY_PRIVATE_STATE_DIGEST_DOMAIN);
-    for directory_name in [PRIVATE_HNSW_ORAM_DIR, PRIVATE_RESULT_ORAM_DIR] {
+    for directory_name in [
+        PRIVATE_HNSW_ORAM_DIR,
+        PRIVATE_RESULT_ORAM_DIR,
+        PRIVATE_ORAM_MUTATION_JOURNAL_DIR,
+    ] {
         update_length_prefixed(&mut hasher, directory_name.as_bytes());
         let path = collection_path.join(directory_name);
         match fs::symlink_metadata(&path) {
@@ -1974,8 +2623,8 @@ fn update_install_tree_digest(
             hasher.update(b"f");
             update_length_prefixed(hasher, relative_bytes);
             hasher.update(metadata.len().to_be_bytes());
-            let mut file =
-                open_regular_file(&path, false, None).map_err(|_| invalid_install_state())?;
+            let mut file = open_regular_file(&path, false, None, false)
+                .map_err(|_| invalid_install_state())?;
             let opened = file.metadata().map_err(|_| invalid_install_state())?;
             ensure_same_file(&metadata, &opened).map_err(|_| invalid_install_state())?;
             let mut remaining = metadata.len();
@@ -2097,6 +2746,35 @@ fn remove_owned_directory_if_exists(
     }
 }
 
+fn read_private_oram_external_recovery_state_file(
+    state_path: &Path,
+) -> Result<Option<PrivateOramExternalRecoveryStagingState>, StorageError> {
+    let metadata = match fs::symlink_metadata(state_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid_staging_state()),
+    };
+    validate_secure_file_metadata(&metadata, PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES)?;
+    let file = open_regular_file(
+        state_path,
+        true,
+        Some(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES),
+        false,
+    )?;
+    let opened = file.metadata().map_err(|_| invalid_staging_state())?;
+    ensure_same_file(&metadata, &opened)?;
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid_staging_state())?;
+    if bytes.len() as u64 != opened.len() {
+        return Err(invalid_staging_state());
+    }
+    let state = serde_json::from_slice(&bytes).map_err(|_| invalid_staging_state())?;
+    validate_state(&state)?;
+    Ok(Some(state))
+}
+
 fn validate_state(state: &PrivateOramExternalRecoveryStagingState) -> Result<(), StorageError> {
     validate_private_oram_external_recovery_checkpoint_shape(&state.checkpoint_bundle.checkpoint)
         .map_err(|_| invalid_staging_state())?;
@@ -2104,11 +2782,32 @@ fn validate_state(state: &PrivateOramExternalRecoveryStagingState) -> Result<(),
         .map_err(|_| invalid_staging_state())?;
     validate_base64url_sha256(&state.operation_id_hash)?;
     validate_base64url_sha256(&state.checkpoint_digest)?;
+    match state.phase {
+        PrivateOramExternalRecoveryStagingPhase::Uploading => {
+            if state.verified_tree_digest.is_some() || state.verified_private_state_digest.is_some()
+            {
+                return Err(invalid_staging_state());
+            }
+        }
+        PrivateOramExternalRecoveryStagingPhase::Verified => {
+            let verified_tree_digest = state
+                .verified_tree_digest
+                .as_deref()
+                .ok_or_else(invalid_staging_state)?;
+            let verified_private_state_digest = state
+                .verified_private_state_digest
+                .as_deref()
+                .ok_or_else(invalid_staging_state)?;
+            validate_base64url_sha256(verified_tree_digest).map_err(|_| invalid_staging_state())?;
+            validate_base64url_sha256(verified_private_state_digest)
+                .map_err(|_| invalid_staging_state())?;
+        }
+    }
     if state.version != PRIVATE_ORAM_EXTERNAL_RECOVERY_STATE_VERSION
         || state.lease_expires_at_unix == 0
         || state.checkpoint_bundle.checkpoint.snapshot_size_bytes == 0
         || state.checkpoint_bundle.checkpoint.snapshot_size_bytes
-            > PRIVATE_ORAM_EXTERNAL_RECOVERY_MAX_SNAPSHOT_BYTES
+            > PRIVATE_ORAM_EXTERNAL_RECOVERY_HARD_MAX_SNAPSHOT_BYTES
         || state.bytes_received > state.checkpoint_bundle.checkpoint.snapshot_size_bytes
         || state.bytes_received < state.checkpoint_bundle.checkpoint.snapshot_size_bytes
             && state.bytes_received % PRIVATE_ORAM_EXTERNAL_RECOVERY_CHUNK_SIZE_BYTES != 0
@@ -2194,6 +2893,7 @@ fn open_regular_file(
     path: &Path,
     require_private: bool,
     max_bytes: Option<u64>,
+    write: bool,
 ) -> Result<File, StorageError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| invalid_staging_state())?;
     if let Some(max_bytes) = max_bytes {
@@ -2202,7 +2902,7 @@ fn open_regular_file(
         return Err(invalid_staging_state());
     }
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(write);
     secure_open_options(&mut options, false);
     let file = options.open(path).map_err(|_| invalid_staging_state())?;
     let opened = file.metadata().map_err(|_| invalid_staging_state())?;
@@ -2351,6 +3051,25 @@ fn invalid_staging_request() -> StorageError {
     StorageError::bad_request("private ORAM external recovery request is invalid")
 }
 
+fn ensure_private_oram_external_recovery_free_space(
+    path: &Path,
+    additional_bytes: u64,
+    min_free_space_bytes: u64,
+) -> Result<(), StorageError> {
+    let required = additional_bytes
+        .checked_add(min_free_space_bytes)
+        .ok_or_else(invalid_staging_request)?;
+    let available = fs4::available_space(path).map_err(|_| {
+        StorageError::service_error("private ORAM external recovery free-space preflight failed")
+    })?;
+    if available < required {
+        return Err(StorageError::bad_request(
+            "private ORAM external recovery has insufficient free storage",
+        ));
+    }
+    Ok(())
+}
+
 fn invalid_staging_state() -> StorageError {
     StorageError::service_error("private ORAM external recovery staging state is invalid")
 }
@@ -2361,7 +3080,7 @@ fn invalid_install_state() -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
 
     use collection::config::{
         CollectionEncryptionConfig, CollectionParams, CryptoMigrationState, EncryptionRuleRef,
@@ -2376,6 +3095,109 @@ mod tests {
 
     use super::*;
 
+    fn resource_limits() -> PrivateOramExternalRecoveryConfig {
+        PrivateOramExternalRecoveryConfig {
+            min_free_space_bytes: 0,
+            ..Default::default()
+        }
+    }
+
+    fn tar_snapshot(entry_type: tar::EntryType, bytes: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("payload.bin").unwrap();
+            header.set_entry_type(entry_type);
+            header.set_mode(0o600);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, bytes).unwrap();
+            builder.finish().unwrap();
+        }
+        archive
+    }
+
+    fn sparse_tar_snapshot(logical_size: u64, bytes: &[u8]) -> Vec<u8> {
+        assert!(logical_size > bytes.len() as u64);
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("sparse.bin").unwrap();
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_mode(0o600);
+            header.set_size(bytes.len() as u64);
+            let sparse_offset = logical_size - bytes.len() as u64;
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(logical_size);
+            gnu.sparse[0].set_offset(sparse_offset);
+            gnu.sparse[0].set_length(bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, bytes).unwrap();
+            builder.finish().unwrap();
+        }
+        archive
+    }
+
+    fn pax_sized_tar_snapshot(bytes: &[u8]) -> Vec<u8> {
+        let value = format!("size={}\n", bytes.len());
+        let mut record_len = value.len() + 2;
+        let record = loop {
+            let record = format!("{record_len} {value}");
+            if record.len() == record_len {
+                break record;
+            }
+            record_len = record.len();
+        };
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_ustar();
+            header.set_path("PaxHeaders/payload.bin").unwrap();
+            header.set_entry_type(tar::EntryType::XHeader);
+            header.set_mode(0o600);
+            header.set_size(record.len() as u64);
+            header.set_cksum();
+            builder.append(&header, record.as_bytes()).unwrap();
+
+            header.set_path("payload.bin").unwrap();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, bytes).unwrap();
+            builder.finish().unwrap();
+        }
+        archive
+    }
+
+    fn upload_staging_snapshot(
+        temp: &tempfile::TempDir,
+        snapshot: &[u8],
+    ) -> PrivateOramExternalRecoveryStaging {
+        let bundle = bundle(snapshot);
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+        staging
+            .begin_with_limits(&checkpoint_digest, bundle, 1_000, &resource_limits())
+            .unwrap();
+        let chunk_path = temp.path().join(format!("{operation_hash}.chunk"));
+        let chunk_hash = chunk_file(&chunk_path, snapshot);
+        staging
+            .append_chunk_with_limits(0, &chunk_path, &chunk_hash, &resource_limits())
+            .unwrap();
+        staging
+    }
+
     fn bundle(snapshot: &[u8]) -> PrivateOramExternalRecoveryCheckpointBundle {
         PrivateOramExternalRecoveryCheckpointBundle {
             checkpoint: PrivateOramExternalRecoveryCheckpoint {
@@ -2388,6 +3210,7 @@ mod tests {
                 owner_peer_ids: vec![11],
                 layout_digest: BASE64URL_NOPAD.encode(&[1; 32]),
                 index_state_digest: BASE64URL_NOPAD.encode(&[2; 32]),
+                owner_snapshot_authority_digest: BASE64URL_NOPAD.encode(&[5; 32]),
                 snapshot_size_bytes: snapshot.len() as u64,
                 snapshot_sha256: HEXLOWER.encode(&Sha256::digest(snapshot)),
                 client_recovery_state_digest: BASE64URL_NOPAD.encode(&[3; 32]),
@@ -2400,6 +3223,427 @@ mod tests {
                 sig: BASE64URL_NOPAD.encode(&[4; 64]),
             },
         }
+    }
+
+    #[test]
+    fn external_recovery_reservation_uses_archive_and_bounded_unpack_bytes() {
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_snapshot_bytes: 10,
+            max_total_staged_bytes: 20,
+            max_unpacked_bytes: 4,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            private_oram_external_recovery_reservation_bytes(7, &limits).unwrap(),
+            11,
+        );
+        assert!(private_oram_external_recovery_reservation_bytes(11, &limits).is_err());
+        assert!(private_oram_external_recovery_reservation_bytes(0, &limits).is_err());
+    }
+
+    #[test]
+    fn external_recovery_reservations_reload_and_abort_releases_disk_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = b"snapshot";
+        let bundle = bundle(snapshot);
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: snapshot.len() as u64,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+        staging
+            .begin_with_limits(&checkpoint_digest, bundle, 1_000, &limits)
+            .unwrap();
+
+        let reservations =
+            load_private_oram_external_recovery_reservations(temp.path(), &limits).unwrap();
+        assert_eq!(
+            reservations.get(&operation_hash),
+            Some(&(2 * snapshot.len() as u64)),
+        );
+
+        staging.abort().unwrap();
+        assert!(
+            load_private_oram_external_recovery_reservations(temp.path(), &limits)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn unpublished_initial_staging(
+        temp: &tempfile::TempDir,
+    ) -> (PrivateOramExternalRecoveryStaging, Vec<u8>) {
+        let bundle = bundle(b"snapshot");
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+        staging.begin(&checkpoint_digest, bundle, 1_000).unwrap();
+        let state = fs::read(staging.state_path()).unwrap();
+        fs::remove_file(staging.state_path()).unwrap();
+        (staging, state)
+    }
+
+    fn write_initial_state_temp(
+        staging: &PrivateOramExternalRecoveryStaging,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let path = staging
+            .operation_path()
+            .join(format!(".state-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        secure_open_options(&mut options, true);
+        let mut file = options.open(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        common::fs::sync_parent_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn external_recovery_reservations_clean_only_unpublished_initialization() {
+        for cut in [None, Some(0), Some(1), Some(64), Some(127)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, bytes) = unpublished_initial_staging(&temp);
+            match cut {
+                None => fs::remove_file(staging.snapshot_path()).unwrap(),
+                Some(cut) => {
+                    write_initial_state_temp(&staging, &bytes[..cut]);
+                }
+            }
+
+            assert!(
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!staging.operation_path().exists());
+            assert!(
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, _) = unpublished_initial_staging(&temp);
+        assert!(
+            load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!staging.operation_path().exists());
+    }
+
+    #[test]
+    fn external_recovery_reservations_recover_complete_initial_state_before_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, bytes) = unpublished_initial_staging(&temp);
+        let temp_path = write_initial_state_temp(&staging, &bytes);
+        let state: PrivateOramExternalRecoveryStagingState =
+            serde_json::from_slice(&bytes).unwrap();
+        let limits = resource_limits();
+        let reservations =
+            load_private_oram_external_recovery_reservations(temp.path(), &limits).unwrap();
+        assert_eq!(
+            reservations.get(&staging.operation_id_hash),
+            Some(
+                &(state.checkpoint_bundle.checkpoint.snapshot_size_bytes
+                    + limits.max_unpacked_bytes)
+            ),
+        );
+        assert_eq!(fs::read(staging.state_path()).unwrap(), bytes);
+        assert!(!temp_path.exists());
+        assert_eq!(staging.status().unwrap().bytes_received, 0);
+        assert_eq!(
+            load_private_oram_external_recovery_reservations(temp.path(), &limits).unwrap(),
+            reservations,
+        );
+        assert_eq!(
+            staging
+                .begin(
+                    &state.checkpoint_digest,
+                    state.checkpoint_bundle,
+                    state.lease_expires_at_unix,
+                )
+                .unwrap()
+                .bytes_received,
+            0,
+        );
+    }
+
+    #[test]
+    fn external_recovery_reservations_reject_malformed_stateless_directories_unchanged() {
+        for scenario in 0..6 {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, bytes) = unpublished_initial_staging(&temp);
+            match scenario {
+                0 => {
+                    write_initial_state_temp(&staging, b"{not-json");
+                }
+                1 => {
+                    write_initial_state_temp(&staging, &bytes[..64]);
+                    fs::write(staging.snapshot_path(), b"uploaded-data").unwrap();
+                }
+                2 => {
+                    write_initial_state_temp(&staging, &bytes[..64]);
+                    fs::write(staging.operation_path().join("unknown"), b"preserve").unwrap();
+                }
+                3 => {
+                    write_initial_state_temp(&staging, &bytes[..64]);
+                    write_initial_state_temp(&staging, &bytes[..64]);
+                }
+                4 => {
+                    write_initial_state_temp(&staging, &bytes);
+                    fs::remove_file(staging.snapshot_path()).unwrap();
+                }
+                5 => {
+                    let mut state: PrivateOramExternalRecoveryStagingState =
+                        serde_json::from_slice(&bytes).unwrap();
+                    state.operation_id_hash = BASE64URL_NOPAD.encode(&[17; 32]);
+                    write_initial_state_temp(&staging, &serde_json::to_vec(&state).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let contents = || {
+                let mut entries = fs::read_dir(staging.operation_path())
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            fs::read(path).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort();
+                entries
+            };
+            let before = contents();
+            assert!(
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .is_err(),
+                "scenario {scenario}",
+            );
+            assert_eq!(contents(), before, "scenario {scenario}");
+        }
+    }
+
+    #[test]
+    fn external_recovery_reservations_never_clean_an_install_operation_without_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+        let transaction = staging.prepare_install("docs", &lease).unwrap();
+        drop(transaction);
+        fs::remove_file(staging.state_path()).unwrap();
+        let marker = fs::read(staging.install_marker_path()).unwrap();
+        let snapshot = fs::read(staging.snapshot_path()).unwrap();
+
+        assert!(
+            load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                .is_err()
+        );
+        assert_eq!(fs::read(staging.install_marker_path()).unwrap(), marker);
+        assert_eq!(fs::read(staging.snapshot_path()).unwrap(), snapshot);
+        assert!(staging.verified_collection_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_recovery_initialization_reconciliation_retries_ambiguous_fsync_failures() {
+        for recover_complete_state in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, bytes) = unpublished_initial_staging(&temp);
+            let temp_path = write_initial_state_temp(
+                &staging,
+                if recover_complete_state {
+                    &bytes
+                } else {
+                    &bytes[..64]
+                },
+            );
+            let fault_guard =
+                set_private_oram_external_recovery_io_fault(if recover_complete_state {
+                    PrivateOramExternalRecoveryIoFault::StateParentDirectorySync
+                } else {
+                    PrivateOramExternalRecoveryIoFault::InitializationCleanupParentDirectorySync
+                });
+            assert!(
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .is_err()
+            );
+            drop(fault_guard);
+            assert!(!temp_path.exists());
+            let reservations =
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .unwrap();
+            if recover_complete_state {
+                assert!(reservations.contains_key(&staging.operation_id_hash));
+                assert_eq!(fs::read(staging.state_path()).unwrap(), bytes);
+            } else {
+                assert!(reservations.is_empty());
+                assert!(!staging.operation_path().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn external_recovery_begin_limit_failure_has_no_staging_side_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = b"snapshot";
+        let bundle = bundle(snapshot);
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_snapshot_bytes: snapshot.len() as u64 - 1,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        assert!(
+            staging
+                .begin_with_limits(&checkpoint_digest, bundle, 1_000, &limits)
+                .is_err()
+        );
+        assert!(!staging.operation_path().exists());
+    }
+
+    #[test]
+    fn external_recovery_verify_rejects_expanded_bytes_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = tar_snapshot(tar::EntryType::Regular, &[7_u8; 1024]);
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: 512,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        assert!(staging.prepare_verification_with_limits(&limits).is_err());
+        assert!(!staging.verified_collection_path().exists());
+        assert!(
+            !staging
+                .operation_path()
+                .join(PRIVATE_ORAM_EXTERNAL_RECOVERY_VERIFY_TEMP_DIR)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_recovery_verify_accounts_effective_pax_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = [7_u8; 1536];
+        let snapshot = pax_sized_tar_snapshot(&payload);
+        let mut archive = tar::Archive::new(snapshot.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.header().size().unwrap(), 0);
+        assert_eq!(entry.size(), payload.len() as u64);
+        let mut extracted = Vec::new();
+        entry.read_to_end(&mut extracted).unwrap();
+        assert_eq!(extracted, payload);
+
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: payload.len() as u64,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+        let (_, resources) = staging.prepare_verification_with_limits(&limits).unwrap();
+        assert_eq!(
+            resources,
+            PrivateOramExternalRecoveryArchiveResources {
+                entry_count: 1,
+                logical_bytes: payload.len() as u64,
+            },
+        );
+    }
+
+    #[test]
+    fn external_recovery_verify_rejects_effective_pax_size_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = pax_sized_tar_snapshot(&[7_u8; 1536]);
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: 1024,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        assert!(staging.prepare_verification_with_limits(&limits).is_err());
+        assert!(!staging.verified_collection_path().exists());
+        assert!(
+            !staging
+                .operation_path()
+                .join(PRIVATE_ORAM_EXTERNAL_RECOVERY_VERIFY_TEMP_DIR)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_recovery_verify_accepts_bounded_sparse_tar() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = sparse_tar_snapshot(4096, &[9_u8; 64]);
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: 4096,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        let (verification, resources) = staging.prepare_verification_with_limits(&limits).unwrap();
+        assert_eq!(
+            verification.validate_archive_resources(&limits).unwrap(),
+            PrivateOramExternalRecoveryArchiveResources {
+                entry_count: 1,
+                logical_bytes: 4096,
+            }
+        );
+        assert_eq!(resources.logical_bytes, 4096);
+    }
+
+    #[test]
+    fn external_recovery_verify_rejects_sparse_expansion_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = sparse_tar_snapshot(4096, &[9_u8; 64]);
+        let staging = upload_staging_snapshot(&temp, &snapshot);
+        let limits = PrivateOramExternalRecoveryConfig {
+            max_unpacked_bytes: 4095,
+            min_free_space_bytes: 0,
+            ..Default::default()
+        };
+
+        assert!(staging.prepare_verification_with_limits(&limits).is_err());
+        assert!(!staging.verified_collection_path().exists());
     }
 
     fn chunk_file(path: &Path, bytes: &[u8]) -> String {
@@ -2488,6 +3732,16 @@ mod tests {
             b"new-tree",
         )
         .unwrap();
+        let private_state = verification
+            .verify_temp_collection_path()
+            .join(PRIVATE_HNSW_ORAM_DIR);
+        fs::create_dir(&private_state).unwrap();
+        fs::write(private_state.join("state"), b"verified-private-state").unwrap();
+        let parent_state = verification
+            .verify_temp_collection_path()
+            .join(PRIVATE_ORAM_MUTATION_JOURNAL_DIR);
+        fs::create_dir(&parent_state).unwrap();
+        fs::write(parent_state.join("state"), b"verified-parent-state").unwrap();
         verification.promote_verification_output().unwrap();
         staging.mark_verified(verification).unwrap();
 
@@ -2503,10 +3757,468 @@ mod tests {
             backup_generation: bundle.checkpoint.backup_generation,
             issued_at_unix: 100,
             expires_at_unix: 1_000,
+            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
             install_intent_digest: None,
             phase: PrivateOramExternalRecoveryLeasePhase::Staging,
         };
         (staging, lease)
+    }
+
+    #[cfg(unix)]
+    fn assert_no_atomic_write_temp_files(directory: &Path, prefix: &str) {
+        assert!(fs::read_dir(directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix)
+        }),);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_state_write_recovers_from_enospc_and_ambiguous_parent_fsync_failure() {
+        for (fault, state_is_visible_after_failure) in [
+            (PrivateOramExternalRecoveryIoFault::StateTempFileSync, false),
+            (
+                PrivateOramExternalRecoveryIoFault::StateParentDirectorySync,
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let snapshot = b"snapshot";
+            let bundle = bundle(snapshot);
+            let checkpoint_digest =
+                private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+            let operation_hash = private_oram_external_recovery_operation_id_hash(
+                &new_private_oram_external_recovery_operation_token(),
+            )
+            .unwrap();
+            let staging = PrivateOramExternalRecoveryStaging::new(
+                temp.path(),
+                &bundle.checkpoint.collection_id,
+                &operation_hash,
+            )
+            .unwrap();
+
+            let fault_guard = set_private_oram_external_recovery_io_fault(fault);
+            assert!(
+                staging
+                    .begin(&checkpoint_digest, bundle.clone(), 1_000)
+                    .is_err()
+            );
+            drop(fault_guard);
+            assert_eq!(
+                staging.state_path().exists(),
+                state_is_visible_after_failure
+            );
+            assert_no_atomic_write_temp_files(&staging.operation_path(), ".state-");
+
+            let reservations =
+                load_private_oram_external_recovery_reservations(temp.path(), &resource_limits())
+                    .unwrap();
+            assert_eq!(
+                reservations.contains_key(&operation_hash),
+                state_is_visible_after_failure,
+            );
+            assert_eq!(
+                staging.operation_path().exists(),
+                state_is_visible_after_failure
+            );
+
+            let retried = staging.begin(&checkpoint_digest, bundle, 1_000).unwrap();
+            assert_eq!(
+                retried.phase,
+                PrivateOramExternalRecoveryStagingPhase::Uploading
+            );
+            assert_eq!(retried.bytes_received, 0);
+            assert!(staging.state_path().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_marker_write_recovers_from_enospc_and_ambiguous_parent_fsync_failure() {
+        for (fault, marker_is_visible_after_failure) in [
+            (
+                PrivateOramExternalRecoveryIoFault::InstallMarkerTempFileSync,
+                false,
+            ),
+            (
+                PrivateOramExternalRecoveryIoFault::InstallMarkerParentDirectorySync,
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, lease) = install_fixture(&temp);
+
+            let fault_guard = set_private_oram_external_recovery_io_fault(fault);
+            assert!(staging.prepare_install("docs", &lease).is_err());
+            drop(fault_guard);
+            assert_eq!(
+                staging.install_marker_path().exists(),
+                marker_is_visible_after_failure,
+            );
+            assert_no_atomic_write_temp_files(&staging.collection_path(), ".install-");
+
+            let retried = staging.prepare_install("docs", &lease).unwrap();
+            assert_eq!(
+                retried.phase(),
+                PrivateOramExternalRecoveryInstallPhase::Prepared,
+            );
+            retried.cancel_prepared().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_output_promotion_recovers_from_rename_and_parent_sync_errors() {
+        for (fault, pending_is_visible, verified_is_visible) in [
+            (
+                PrivateOramExternalRecoveryIoFault::VerificationOutputRename,
+                true,
+                false,
+            ),
+            (
+                PrivateOramExternalRecoveryIoFault::VerificationOutputParentDirectorySync,
+                false,
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let staging = upload_staging_snapshot(&temp, b"snapshot");
+            let verification = staging.prepare_verification().unwrap();
+            verification.reset_verification_output().unwrap();
+            fs::write(
+                verification.verify_temp_collection_path().join("marker"),
+                b"verified",
+            )
+            .unwrap();
+
+            let fault_guard = set_private_oram_external_recovery_io_fault(fault);
+            assert!(verification.promote_verification_output().is_err());
+            drop(fault_guard);
+            assert_eq!(
+                verification.verify_temp_collection_path().exists(),
+                pending_is_visible,
+            );
+            assert_eq!(
+                verification.verified_collection_path().exists(),
+                verified_is_visible,
+            );
+
+            verification.reset_verification_output().unwrap();
+            fs::write(
+                verification.verify_temp_collection_path().join("marker"),
+                b"verified",
+            )
+            .unwrap();
+            verification.promote_verification_output().unwrap();
+            assert_eq!(
+                fs::read(verification.verified_collection_path().join("marker")).unwrap(),
+                b"verified",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_tree_install_rolls_back_rename_and_parent_sync_errors() {
+        for fault in [
+            PrivateOramExternalRecoveryIoFault::InstallTreeRename,
+            PrivateOramExternalRecoveryIoFault::InstallTreeSourceParentDirectorySync,
+            PrivateOramExternalRecoveryIoFault::InstallTreeDestinationParentDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, lease) = install_fixture(&temp);
+            let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+
+            let fault_guard = set_private_oram_external_recovery_io_fault(fault);
+            assert!(transaction.move_live_to_backup().is_err());
+            drop(fault_guard);
+            transaction.rollback_uncommitted().unwrap();
+            assert_eq!(
+                fs::read(staging.live_collection_path("docs").join("nested/old")).unwrap(),
+                b"old-tree",
+            );
+            assert!(!staging.install_backup_path().exists());
+            assert_eq!(
+                read_install_marker(&staging.install_marker_path())
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                PrivateOramExternalRecoveryInstallPhase::Prepared,
+            );
+
+            let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+            transaction.move_live_to_backup().unwrap();
+            transaction.promote_verified_collection().unwrap();
+            assert_eq!(
+                fs::read(staging.live_collection_path("docs").join("nested/new")).unwrap(),
+                b"new-tree",
+            );
+        }
+
+        for fault in [
+            PrivateOramExternalRecoveryIoFault::InstallTreeRename,
+            PrivateOramExternalRecoveryIoFault::InstallTreeSourceParentDirectorySync,
+            PrivateOramExternalRecoveryIoFault::InstallTreeDestinationParentDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (staging, lease) = install_fixture(&temp);
+            let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+            transaction.move_live_to_backup().unwrap();
+
+            let fault_guard = set_private_oram_external_recovery_io_fault(fault);
+            assert!(transaction.promote_verified_collection().is_err());
+            drop(fault_guard);
+            transaction.rollback_uncommitted().unwrap();
+            assert_eq!(
+                fs::read(staging.live_collection_path("docs").join("nested/old")).unwrap(),
+                b"old-tree",
+            );
+            assert!(!staging.install_backup_path().exists());
+            assert_eq!(
+                read_install_marker(&staging.install_marker_path())
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                PrivateOramExternalRecoveryInstallPhase::Prepared,
+            );
+
+            let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+            transaction.move_live_to_backup().unwrap();
+            transaction.promote_verified_collection().unwrap();
+            assert_eq!(
+                fs::read(staging.live_collection_path("docs").join("nested/new")).unwrap(),
+                b"new-tree",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_tree_install_recovers_after_real_parent_permission_revocation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root can bypass the discretionary write-permission denial this test exercises.
+        if nix::unistd::Uid::effective().as_raw() == 0 {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+        let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+        let operation_path = staging.operation_path();
+        let original_operation_permissions = fs::metadata(&operation_path).unwrap().permissions();
+        fs::set_permissions(&operation_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let move_result = transaction.move_live_to_backup();
+        fs::set_permissions(&operation_path, original_operation_permissions).unwrap();
+        assert!(move_result.is_err());
+        assert_eq!(
+            fs::read(staging.live_collection_path("docs").join("nested/old")).unwrap(),
+            b"old-tree",
+        );
+        assert!(!staging.install_backup_path().exists());
+
+        transaction.move_live_to_backup().unwrap();
+        let collections_path = temp.path().join(COLLECTIONS_DIR);
+        let original_collection_permissions =
+            fs::metadata(&collections_path).unwrap().permissions();
+        fs::set_permissions(&collections_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let promote_result = transaction.promote_verified_collection();
+        fs::set_permissions(&collections_path, original_collection_permissions).unwrap();
+        assert!(promote_result.is_err());
+        assert!(!staging.live_collection_path("docs").exists());
+        assert!(staging.verified_collection_path().exists());
+        assert!(staging.install_backup_path().exists());
+
+        transaction.promote_verified_collection().unwrap();
+        assert_eq!(
+            fs::read(staging.live_collection_path("docs").join("nested/new")).unwrap(),
+            b"new-tree",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux user and mount namespaces"]
+    fn archive_extraction_recovers_from_real_tmpfs_enospc() {
+        const CHILD_MOUNT_ENV: &str = "QDRANT_PRIVATE_ORAM_ENOSPC_CHILD_MOUNT";
+        const TEST_NAME: &str = "content_manager::snapshots::private_oram_external_recovery::tests::archive_extraction_recovers_from_real_tmpfs_enospc";
+
+        let Ok(mount_path) = std::env::var(CHILD_MOUNT_ENV) else {
+            let mount_dir = tempfile::Builder::new()
+                .prefix("qdrant-private-oram-enospc-mount-")
+                .tempdir()
+                .unwrap();
+            let status = std::process::Command::new("unshare")
+                .args(["-Ur", "-m", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_MOUNT_ENV, mount_dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "private ORAM ENOSPC child failed");
+            return;
+        };
+        let mount_path = PathBuf::from(mount_path);
+        struct TmpfsMountGuard(PathBuf);
+
+        impl Drop for TmpfsMountGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount").arg(&self.0).status();
+            }
+        }
+
+        let mount_status = std::process::Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                "size=4m,nr_inodes=1024,mode=700",
+                "qdrant-private-oram-enospc",
+            ])
+            .arg(&mount_path)
+            .status()
+            .unwrap();
+        assert!(mount_status.success(), "failed to mount ENOSPC tmpfs");
+        let mount_guard = TmpfsMountGuard(mount_path.clone());
+
+        let first_bytes = vec![0x31_u8; 128 * 1024];
+        let second_bytes = vec![0x72_u8; 1024 * 1024];
+        let mut snapshot = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut snapshot);
+            for (path, bytes) in [
+                ("first.bin", first_bytes.as_slice()),
+                ("second.bin", second_bytes.as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o600);
+                header.set_size(bytes.len() as u64);
+                header.set_cksum();
+                builder.append(&header, bytes).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let host_temp = tempfile::tempdir().unwrap();
+        let staging = upload_staging_snapshot(&host_temp, &snapshot);
+        let mut verification = staging.prepare_verification().unwrap();
+        // Only verification output moves to tmpfs; archive identity and staging stay production-bound.
+        assert!(!verification.snapshot_path().starts_with(&mount_path));
+        verification.verify_temp_collection_path = mount_path.join("verified.pending");
+        verification.verified_collection_path = mount_path.join("verified");
+        assert_eq!(
+            verification.verify_temp_collection_path(),
+            mount_path.join("verified.pending"),
+        );
+        assert_eq!(
+            verification.verified_collection_path(),
+            mount_path.join("verified"),
+        );
+        verification.reset_verification_output().unwrap();
+
+        let bytes_to_leave = 512 * 1024_u64;
+        let available = fs4::available_space(&mount_path).unwrap();
+        assert!(available > bytes_to_leave);
+        let filler_path = mount_path.join("filler");
+        let mut filler = fs::File::create(&filler_path).unwrap();
+        let mut filler_source = std::io::repeat(0xa5).take(available - bytes_to_leave);
+        assert_eq!(
+            std::io::copy(&mut filler_source, &mut filler).unwrap(),
+            available - bytes_to_leave,
+        );
+        filler.sync_all().unwrap();
+        drop(filler);
+
+        let unpack_error = common::tar_unpack::tar_unpack_file(
+            verification.snapshot_path(),
+            verification.verify_temp_collection_path(),
+        )
+        .unwrap_err();
+        assert_eq!(unpack_error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            fs::read(verification.verify_temp_collection_path().join("first.bin"),).unwrap(),
+            first_bytes,
+        );
+        let partial_second_len = fs::metadata(
+            verification
+                .verify_temp_collection_path()
+                .join("second.bin"),
+        )
+        .unwrap()
+        .len();
+        assert!(partial_second_len < second_bytes.len() as u64);
+        assert!(!verification.verified_collection_path().exists());
+
+        fs::remove_file(&filler_path).unwrap();
+        verification.reset_verification_output().unwrap();
+        assert!(
+            fs::read_dir(verification.verify_temp_collection_path())
+                .unwrap()
+                .next()
+                .is_none(),
+        );
+        common::tar_unpack::tar_unpack_file(
+            verification.snapshot_path(),
+            verification.verify_temp_collection_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(verification.verify_temp_collection_path().join("first.bin"),).unwrap(),
+            first_bytes,
+        );
+        assert_eq!(
+            fs::read(
+                verification
+                    .verify_temp_collection_path()
+                    .join("second.bin"),
+            )
+            .unwrap(),
+            second_bytes,
+        );
+        verification.promote_verification_output().unwrap();
+        assert!(!verification.verify_temp_collection_path().exists());
+        assert!(verification.verified_collection_path().exists());
+
+        drop(verification);
+        drop(staging);
+        let unmount_status = std::process::Command::new("umount")
+            .arg(&mount_path)
+            .status()
+            .unwrap();
+        assert!(unmount_status.success(), "failed to unmount ENOSPC tmpfs");
+        std::mem::forget(mount_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconsumed_io_fault_is_cleared_when_its_guard_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = b"snapshot";
+        let bundle = bundle(snapshot);
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+
+        let fault_guard = set_private_oram_external_recovery_io_fault(
+            PrivateOramExternalRecoveryIoFault::InstallMarkerTempFileSync,
+        );
+        drop(fault_guard);
+
+        assert!(staging.begin(&checkpoint_digest, bundle, 1_000).is_ok());
     }
 
     fn recovery_state(
@@ -2785,6 +4497,83 @@ mod tests {
     }
 
     #[test]
+    fn prepare_install_rejects_verified_tree_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+
+        fs::write(
+            staging.verified_collection_path().join("nested/new"),
+            b"substituted-tree",
+        )
+        .unwrap();
+
+        assert!(staging.prepare_install("docs", &lease).is_err());
+        assert!(!staging.install_marker_path().exists());
+    }
+
+    #[test]
+    fn prepare_install_rejects_verified_private_state_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+        let private_state = staging
+            .verified_collection_path()
+            .join(PRIVATE_HNSW_ORAM_DIR);
+        fs::write(private_state.join("state"), b"substituted-private-state").unwrap();
+
+        assert!(staging.prepare_install("docs", &lease).is_err());
+        assert!(!staging.install_marker_path().exists());
+    }
+
+    #[test]
+    fn legacy_verified_state_without_digests_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+        let state_path = staging.state_path();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let state = state.as_object_mut().unwrap();
+        state.remove("verified_tree_digest");
+        state.remove("verified_private_state_digest");
+        fs::write(&state_path, serde_json::to_vec(state).unwrap()).unwrap();
+
+        assert!(staging.status().is_err());
+        assert!(staging.prepare_install("docs", &lease).is_err());
+        assert!(!staging.install_marker_path().exists());
+    }
+
+    #[test]
+    fn legacy_uploading_state_without_digests_remains_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = b"snapshot".to_vec();
+        let bundle = bundle(&snapshot);
+        let checkpoint_digest = private_oram_external_recovery_checkpoint_digest(&bundle).unwrap();
+        let operation_hash = private_oram_external_recovery_operation_id_hash(
+            &new_private_oram_external_recovery_operation_token(),
+        )
+        .unwrap();
+        let staging = PrivateOramExternalRecoveryStaging::new(
+            temp.path(),
+            &bundle.checkpoint.collection_id,
+            &operation_hash,
+        )
+        .unwrap();
+        staging.begin(&checkpoint_digest, bundle, 1_000).unwrap();
+
+        let state_path = staging.state_path();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let state = state.as_object_mut().unwrap();
+        state.remove("verified_tree_digest");
+        state.remove("verified_private_state_digest");
+        fs::write(&state_path, serde_json::to_vec(state).unwrap()).unwrap();
+
+        assert_eq!(
+            staging.status().unwrap().phase,
+            PrivateOramExternalRecoveryStagingPhase::Uploading,
+        );
+    }
+
+    #[test]
     fn durable_install_reconciles_every_persisted_phase() {
         for phase in [
             PrivateOramExternalRecoveryInstallPhase::Prepared,
@@ -3040,11 +4829,6 @@ mod tests {
     fn loaded_install_rejects_private_state_substitution() {
         let temp = tempfile::tempdir().unwrap();
         let (staging, lease) = install_fixture(&temp);
-        let private_state = staging
-            .verified_collection_path()
-            .join(PRIVATE_HNSW_ORAM_DIR);
-        fs::create_dir(&private_state).unwrap();
-        fs::write(private_state.join("state"), b"verified-private-state").unwrap();
 
         let mut transaction = staging.prepare_install("docs", &lease).unwrap();
         transaction.move_live_to_backup().unwrap();
@@ -3059,6 +4843,31 @@ mod tests {
                 .join(PRIVATE_HNSW_ORAM_DIR)
                 .join("state"),
             b"substituted-private-state",
+        )
+        .unwrap();
+        assert!(reconcile_fixture(&temp, committed_recovery_state(&staging, &lease)).is_err());
+        assert!(staging.install_marker_path().exists());
+        assert!(staging.install_backup_path().exists());
+    }
+
+    #[test]
+    fn loaded_install_rejects_parent_journal_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (staging, lease) = install_fixture(&temp);
+
+        let mut transaction = staging.prepare_install("docs", &lease).unwrap();
+        transaction.move_live_to_backup().unwrap();
+        transaction.promote_verified_collection().unwrap();
+        transaction.mark_load_in_progress().unwrap();
+        transaction.mark_ready_to_commit().unwrap();
+        drop(transaction);
+
+        fs::write(
+            staging
+                .live_collection_path("docs")
+                .join(PRIVATE_ORAM_MUTATION_JOURNAL_DIR)
+                .join("state"),
+            b"substituted-parent-state",
         )
         .unwrap();
         assert!(reconcile_fixture(&temp, committed_recovery_state(&staging, &lease)).is_err());

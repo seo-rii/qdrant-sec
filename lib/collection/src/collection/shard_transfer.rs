@@ -196,8 +196,10 @@ fn write_private_oram_fixed_transfer_preinstall_intent(
         }
         if existing.reservation_lease_id_hash == intent.reservation_lease_id_hash {
             let intent_path = private_oram_fixed_transfer_preinstall_intent_path(collection_path);
+            // Windows FlushFileBuffers, used by sync_all, requires write access.
             OpenOptions::new()
                 .read(true)
+                .write(cfg!(windows))
                 .open(&intent_path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
@@ -223,8 +225,10 @@ fn write_private_oram_fixed_transfer_preinstall_intent(
         fs_err::set_permissions(&intent_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
     }
+    // Windows FlushFileBuffers, used by sync_all, requires write access.
     OpenOptions::new()
         .read(true)
+        .write(cfg!(windows))
         .open(&intent_path)
         .and_then(|file| file.sync_all())
         .map_err(|_| invalid_private_oram_fixed_transfer_preinstall_intent())?;
@@ -1183,25 +1187,47 @@ mod tests {
             assert_eq!(mode & 0o077, 0);
         }
 
-        let different = ShardTransfer {
+        let different_target = ShardTransfer {
             to: 33,
             ..transfer.clone()
         };
-        let error = write_private_oram_fixed_transfer_preinstall_intent(
-            dir.path(),
-            &different,
-            &second_lease_id_hash,
-        )
-        .unwrap_err();
-        let rendered = format!("{error:?}");
-        assert!(rendered.contains("source preinstall intent is invalid"));
-        assert!(!rendered.contains("private-source-intent"));
-        remove_private_oram_fixed_transfer_preinstall_intent(dir.path(), &different).unwrap_err();
-        let intent = read_private_oram_fixed_transfer_preinstall_intent(dir.path())
-            .unwrap()
+        let mut different_generation = transfer.clone();
+        let transition = different_generation
+            .private_oram_layout_transition
+            .as_mut()
             .unwrap();
-        assert_eq!(intent.transfer, transfer);
-        assert_eq!(intent.reservation_lease_id_hash, first_lease_id_hash);
+        transition.expected.generation += 1;
+        transition.new.generation += 1;
+        assert_eq!(different_generation.key(), transfer.key());
+
+        for different in [different_target, different_generation] {
+            // Each candidate is valid on its own, but cannot replace this exact intent.
+            validate_private_oram_fixed_transfer_preinstall_intent(
+                &PrivateOramFixedTransferPreinstallIntent {
+                    version: PRIVATE_ORAM_FIXED_TRANSFER_PREINSTALL_INTENT_VERSION,
+                    transfer: different.clone(),
+                    reservation_lease_id_hash: second_lease_id_hash.clone(),
+                },
+            )
+            .unwrap();
+            let error = write_private_oram_fixed_transfer_preinstall_intent(
+                dir.path(),
+                &different,
+                &second_lease_id_hash,
+            )
+            .unwrap_err();
+            let rendered = format!("{error:?}");
+            assert!(rendered.contains("source preinstall intent is invalid"));
+            assert!(!rendered.contains("private-source-intent"));
+
+            // A stale finish or abort must not fail consensus or remove another intent.
+            remove_private_oram_fixed_transfer_preinstall_intent(dir.path(), &different).unwrap();
+            let intent = read_private_oram_fixed_transfer_preinstall_intent(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(intent.transfer, transfer);
+            assert_eq!(intent.reservation_lease_id_hash, first_lease_id_hash);
+        }
 
         write_private_oram_fixed_transfer_preinstall_intent(
             dir.path(),

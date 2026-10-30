@@ -16,6 +16,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use collection::PrivateOramOwnerPrestageReceiptV2;
 use collection::shards::shard::PeerId;
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Serialize};
@@ -634,6 +635,7 @@ pub struct PrivateOramMutationClearedPendingArchivePermitV2 {
     collection_id: String,
     vector_name: String,
     owner_signing_key_id: String,
+    owner_prestage_receipt: PrivateOramOwnerPrestageReceiptV2,
     generation: u64,
     owner_peer_id: PeerId,
     descriptor_digest: String,
@@ -667,6 +669,12 @@ impl PrivateOramMutationClearedPendingArchivePermitV2 {
 
     pub fn owner_signing_key_id(&self) -> &str {
         &self.owner_signing_key_id
+    }
+
+    pub(in crate::content_manager) fn owner_prestage_receipt(
+        &self,
+    ) -> &PrivateOramOwnerPrestageReceiptV2 {
+        &self.owner_prestage_receipt
     }
 
     pub(in crate::content_manager) const fn generation(&self) -> u64 {
@@ -883,8 +891,15 @@ impl PrivateOramMutationCleanupLifecycleV2 {
                 .recovery_manifest_canonical_json,
         )?;
         let (package, _) = recovery_manifest.coordinator_recovery_envelope()?;
+        let owner_prestage_receipt = recovery_manifest
+            .owner_receipt(expected_owner_peer_id)
+            .cloned()
+            .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
         if package.collection_id != collection_id
             || package.coordinator_peer_id != expected_owner_peer_id
+            || owner_prestage_receipt.collection_id() != collection_id
+            || owner_prestage_receipt.owner_peer_id() != expected_owner_peer_id
+            || owner_prestage_receipt.lease_generation() != expected_generation
         {
             return Err(PrivateOramMutationJournalError::InvalidTransition);
         }
@@ -892,6 +907,7 @@ impl PrivateOramMutationCleanupLifecycleV2 {
             collection_id,
             vector_name: package.vector_name.clone(),
             owner_signing_key_id: package.owner_signing_key_id.clone(),
+            owner_prestage_receipt,
             generation: cleared.generation,
             owner_peer_id: cleared.owner_peer_id,
             descriptor_digest: cleared.descriptor_digest.clone(),
@@ -961,6 +977,11 @@ impl PrivateOramMutationClearedStateV2 {
     #[cfg(test)]
     pub(crate) fn clear_receipt_digest(&self) -> &str {
         &self.clear_receipt_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tombstone_digest(&self) -> &str {
+        &self.tombstone_digest
     }
 
     pub(crate) fn resolution(&self) -> &PrivateOramMutationClearResolutionV2 {
@@ -2846,10 +2867,27 @@ pub(crate) fn private_oram_cleared_pending_archive_permit_for_test(
     {
         return Err(PrivateOramMutationJournalError::InvalidTransition);
     }
+    let recovery_manifest = decode_private_oram_mutation_admission_recovery_manifest_v2(
+        &cleared
+            .cleanup_witness
+            .admitted
+            .recovery_manifest_canonical_json,
+    )?;
+    let owner_prestage_receipt = recovery_manifest
+        .owner_receipt(expected_owner_peer_id)
+        .cloned()
+        .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+    if owner_prestage_receipt.collection_id() != collection_id
+        || owner_prestage_receipt.owner_peer_id() != expected_owner_peer_id
+        || owner_prestage_receipt.lease_generation() != expected_generation
+    {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
     Ok(PrivateOramMutationClearedPendingArchivePermitV2 {
         collection_id,
         vector_name,
         owner_signing_key_id,
+        owner_prestage_receipt,
         generation: cleared.generation,
         owner_peer_id: cleared.owner_peer_id,
         descriptor_digest: cleared.descriptor_digest.clone(),
@@ -2860,6 +2898,22 @@ pub(crate) fn private_oram_cleared_pending_archive_permit_for_test(
         clear_receipt_digest: cleared.clear_receipt_digest.clone(),
         tombstone_digest: cleared.tombstone_digest.clone(),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn replace_private_oram_archive_prestage_receipt_for_test(
+    mut permit: PrivateOramMutationClearedPendingArchivePermitV2,
+    receipt: PrivateOramOwnerPrestageReceiptV2,
+) -> Result<PrivateOramMutationClearedPendingArchivePermitV2, PrivateOramMutationJournalError> {
+    if receipt.collection_id() != permit.collection_id
+        || receipt.owner_peer_id() != permit.owner_peer_id
+        || receipt.lease_generation() != permit.generation
+        || receipt.parent_descriptor_digest() != permit.descriptor_digest
+    {
+        return Err(PrivateOramMutationJournalError::InvalidTransition);
+    }
+    permit.owner_prestage_receipt = receipt;
+    Ok(permit)
 }
 
 #[cfg(test)]

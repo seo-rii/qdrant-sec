@@ -1,4 +1,5 @@
 import json
+import re
 from inspect import isfunction
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -35,6 +36,11 @@ TOKEN_COLL_R = encode_jwt({"access": [{"collection": COLL_NAME, "access": "r"}]}
 
 # Collection read-write access token
 TOKEN_COLL_RW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "rw"}]}, SECRET)
+
+# Collection read access with the separate raw snapshot export capability.
+TOKEN_COLL_SNAPSHOT_EXPORT = encode_jwt(
+    {"access": [{"collection": COLL_NAME, "access": "r", "snapshot_export": True}]}, SECRET
+)
 
 # Collection points read-write access token, the one user for serverless
 TOKEN_COLL_PRW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "prw"}]}, SECRET)
@@ -88,13 +94,14 @@ def setup(jwt_cluster):
 
 
 class Access:
-    def __init__(self, r, coll_rw, m=True, coll_r=None, everything=None, coll_prw=None):
+    def __init__(self, r, coll_rw, m=True, coll_r=None, everything=None, coll_prw=None, coll_snapshot_export=None):
         self.read = r
         self.coll_rw = coll_rw
         self.manage = m
         self.coll_r = r if coll_r is None else coll_r
         self.coll_prw = coll_prw
         self.everything = everything
+        self.coll_snapshot_export = coll_snapshot_export
 
 
 class EndpointAccess:
@@ -281,12 +288,13 @@ ACTION_ACCESS = {
     ),
     ### Collection Snapshots ###
     "list_collection_snapshots": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/snapshots",
         "qdrant.Snapshots/List",
         coll_prw=False,
+        coll_snapshot_export=True,
     ),
     "create_collection_snapshot": EndpointAccess(
         False,
@@ -305,11 +313,12 @@ ACTION_ACCESS = {
         coll_prw=False,
     ),
     "download_collection_snapshot": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/snapshots/{snapshot_name}",
         coll_prw=False,
+        coll_snapshot_export=True,
     ),
     "upload_collection_snapshot": EndpointAccess(
         False, False, True, "POST /collections/{collection_name}/snapshots/upload"
@@ -353,10 +362,11 @@ ACTION_ACCESS = {
         "DELETE /collections/{collection_name}/shards/{shard_id}/snapshots/{snapshot_name}",
     ),
     "download_shard_snapshot": EndpointAccess(
-        True,
-        True,
+        False,
+        False,
         True,
         "GET /collections/{collection_name}/shards/{shard_id}/snapshots/{snapshot_name}",
+        coll_snapshot_export=True,
     ),
     "stream_shard_snapshot": EndpointAccess(
         False,
@@ -366,12 +376,13 @@ ACTION_ACCESS = {
     ),
     ### Full Snapshots ###
     "list_full_snapshots": EndpointAccess(
-        True,
+        False,
         False,
         True,
         "GET /snapshots",
         "qdrant.Snapshots/ListFull",
         coll_r=False,
+        coll_snapshot_export=False,
     ),
     "create_full_snapshot": EndpointAccess(
         False, False, True, "POST /snapshots", "qdrant.Snapshots/CreateFull"
@@ -380,7 +391,8 @@ ACTION_ACCESS = {
         False, False, True, "DELETE /snapshots/{snapshot_name}", "qdrant.Snapshots/DeleteFull"
     ),
     "download_full_snapshot": EndpointAccess(
-        True, False, True, "GET /snapshots/{snapshot_name}", coll_r=False
+        False, False, True, "GET /snapshots/{snapshot_name}", coll_r=False,
+        coll_snapshot_export=False
     ),
     ### Cluster ###
     "get_cluster": EndpointAccess(True, False, True, "GET /cluster", coll_r=False),
@@ -592,6 +604,73 @@ ACTION_ACCESS = {
 }
 
 
+# These encrypted APIs require populated signed manifests and sessions. Their read/write
+# permission matrix lives with those fixtures; list every endpoint explicitly so new APIs
+# still fail the inventory checks below until they have coverage.
+PRIVATE_ORAM_ACCESS_COVERAGE = [
+    {
+        "tests": [
+            ("src/actix/api/private_hnsw_api.rs", "private_hnsw_common_ops_require_write_access_for_mutations"),
+            ("src/tonic/api/private_hnsw_api.rs", "grpc_private_hnsw_mutations_require_write_access_without_private_oram_details"),
+        ],
+        "endpoints": [
+            ("GET /collections/{collection_name}/private-hnsw/{vector_name}/manifest", "qdrant.PrivateHnswOram/GetPrivateHnswManifest"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/manifest", "qdrant.PrivateHnswOram/UploadPrivateHnswManifest"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/buckets", "qdrant.PrivateHnswOram/UploadPrivateHnswBuckets"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/session", "qdrant.PrivateHnswOram/OpenPrivateHnswSession"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/oram/read_paths", "qdrant.PrivateHnswOram/ReadPrivateHnswPaths"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/oram/commit", "qdrant.PrivateHnswOram/CommitPrivateHnswPaths"),
+            ("POST /collections/{collection_name}/private-hnsw/{vector_name}/session/{session_id}/close", "qdrant.PrivateHnswOram/ClosePrivateHnswSession"),
+        ],
+    },
+    {
+        "tests": [
+            ("src/actix/api/private_result_oram_api.rs", "private_result_oram_common_ops_require_write_access_for_mutations"),
+            ("src/tonic/api/private_result_oram_api.rs", "grpc_private_result_oram_mutations_require_write_access_without_private_oram_details"),
+        ],
+        "endpoints": [
+            ("GET /collections/{collection_name}/private-result-oram/manifest", "qdrant.PrivateResultOram/GetPrivateResultOramManifest"),
+            ("POST /collections/{collection_name}/private-result-oram/manifest", "qdrant.PrivateResultOram/UploadPrivateResultOramManifest"),
+            ("POST /collections/{collection_name}/private-result-oram/buckets", "qdrant.PrivateResultOram/UploadPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/session", "qdrant.PrivateResultOram/OpenPrivateResultOramSession"),
+            ("POST /collections/{collection_name}/private-result-oram/oram/read_buckets", "qdrant.PrivateResultOram/ReadPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/oram/commit", "qdrant.PrivateResultOram/CommitPrivateResultOramBuckets"),
+            ("POST /collections/{collection_name}/private-result-oram/session/{session_id}/close", "qdrant.PrivateResultOram/ClosePrivateResultOramSession"),
+        ],
+    },
+]
+
+
+def dedicated_private_oram_access_endpoints():
+    endpoints = []
+    for coverage in PRIVATE_ORAM_ACCESS_COVERAGE:
+        for source_path, test_name in coverage["tests"]:
+            source = (PROJECT_ROOT / source_path).read_text()
+            assert re.search(rf"(?m)^\s*fn {re.escape(test_name)}\(", source), (
+                f"Dedicated access test {test_name} is missing from {source_path}"
+            )
+        endpoints.extend(coverage["endpoints"])
+    return endpoints
+
+
+@pytest.mark.parametrize(
+    "rest_endpoint,grpc_endpoint",
+    [endpoint for coverage in PRIVATE_ORAM_ACCESS_COVERAGE for endpoint in coverage["endpoints"]],
+)
+def test_private_oram_endpoints_require_credentials(rest_endpoint, grpc_endpoint):
+    # Exercise the transport boundary here in addition to the populated-fixture
+    # read-only/write tests referenced above. Empty bodies must not bypass auth.
+    method, path = rest_endpoint.split(" ")
+    path = path.format(collection_name=COLL_NAME, vector_name="text", session_id="no-auth-session")
+    response = requests.request(method, f"{REST_URI}{path}", json={}, timeout=5)
+    assert response.status_code == 401, response.text
+
+    with grpc.insecure_channel(GRPC_URI) as channel:
+        with pytest.raises(grpc.RpcError) as error:
+            channel.unary_unary(f"/{grpc_endpoint}")(b"", timeout=5)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
 def test_all_actions_have_tests():
     # for each action
     for action_name in ACTION_ACCESS.keys():
@@ -616,6 +695,7 @@ def test_all_rest_endpoints_are_covered():
 
     # check that all endpoints are covered in ACTION_ACCESS
     covered_endpoints = set(v.rest_endpoint for v in ACTION_ACCESS.values())
+    covered_endpoints.update(rest for rest, _ in dedicated_private_oram_access_endpoints())
     for endpoint in endpoint_paths:
         assert (
                 endpoint in covered_endpoints
@@ -642,6 +722,7 @@ def test_all_grpc_endpoints_are_covered():
 
     # check that all endpoints are covered in ACTION_ACCESS
     covered_endpoints = set(v.grpc_endpoint for v in ACTION_ACCESS.values())
+    covered_endpoints.update(grpc for _, grpc in dedicated_private_oram_access_endpoints())
 
     for service_name in client.service_names:
         service = client.service(service_name)
@@ -734,6 +815,10 @@ class GrpcClients:
             GRPC_URI,
             interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_COLL_RW}")])],
         )
+        self.coll_snapshot_export = grpc_requests.Client(
+            GRPC_URI,
+            interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_COLL_SNAPSHOT_EXPORT}")])],
+        )
         self.m = grpc_requests.Client(
             GRPC_URI, interceptors=[MetadataInterceptor([("authorization", f"Bearer {TOKEN_M}")])]
         )
@@ -812,6 +897,17 @@ def check_access(
             rest_req_kwargs,
         )
 
+    if allowed_for.coll_snapshot_export is not None:
+        check_rest_access(
+            method,
+            path,
+            rest_request,
+            allowed_for.coll_snapshot_export,
+            TOKEN_COLL_SNAPSHOT_EXPORT,
+            path_params,
+            rest_req_kwargs,
+        )
+
     check_rest_access(
         method, path, rest_request, allowed_for.manage, TOKEN_M, path_params, rest_req_kwargs
     )
@@ -850,6 +946,11 @@ def check_access(
         check_grpc_access(grpc.r, service, method, grpc_request, allowed_for.read)
         check_grpc_access(grpc.coll_r, service, method, grpc_request, allowed_for.coll_r)
         check_grpc_access(grpc.coll_rw, service, method, grpc_request, allowed_for.coll_rw)
+        if allowed_for.coll_snapshot_export is not None:
+            check_grpc_access(
+                grpc.coll_snapshot_export, service, method, grpc_request,
+                allowed_for.coll_snapshot_export,
+            )
         check_grpc_access(grpc.m, service, method, grpc_request, allowed_for.manage)
 
         # Check that API key is the same as manage token

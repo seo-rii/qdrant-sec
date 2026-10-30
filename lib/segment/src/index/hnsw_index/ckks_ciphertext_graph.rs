@@ -1220,8 +1220,7 @@ fn validate_private_graph_parent(path: &Path) -> io::Result<()> {
             }
             let mode = metadata.permissions().mode();
             if mode & 0o022 != 0 {
-                let sticky_ancestor =
-                    Some(directory) != direct_parent && mode & nix::libc::S_ISVTX != 0;
+                let sticky_ancestor = Some(directory) != direct_parent && mode & 0o1000 != 0;
                 if sticky_ancestor {
                     parent = directory.parent();
                     continue;
@@ -1356,6 +1355,14 @@ fn compare_hits(
 mod tests {
     use super::*;
     use crate::index::vector_index_base::VectorIndexEnum;
+
+    fn graph_test_directory() -> tempfile::TempDir {
+        // macOS exposes its default temporary directory through a symlinked ancestor.
+        tempfile::Builder::new()
+            .prefix("ckks-graph-path-sentinel-")
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap()
+    }
 
     #[test]
     fn ckks_ciphertext_debug_redacts_graph_records_and_scores() {
@@ -2078,7 +2085,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_persists_graph_as_index_file() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::build(
             vec![
@@ -2135,10 +2142,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_group_accessible_graph_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::Builder::new()
-            .prefix("ckks-graph-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::from_graph(
             vec![
@@ -2166,7 +2170,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_rejects_oversized_graph_file() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -2199,7 +2203,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_graph_symlink_on_open() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let target_file = directory.path().join("graph-target");
         let mut index = CkksCiphertextVectorIndex::from_graph(
@@ -2230,7 +2234,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_temp_graph_symlink_on_persist() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let temp_graph_file = graph_file.with_extension("json.tmp");
         let external_file = directory.path().join("external-target");
@@ -2257,7 +2261,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_writable_graph_parent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::from_graph(
             vec![
@@ -2296,7 +2300,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_writable_graph_ancestor() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let ancestor = directory.path().join("writable-ancestor");
         let direct_parent = ancestor.join("graph-parent");
         std::fs::create_dir(&ancestor).unwrap();
@@ -2325,7 +2329,7 @@ mod tests {
     fn ciphertext_vector_index_rejects_symlink_graph_parent() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let real_parent = directory.path().join("real-parent");
         let symlink_parent = directory.path().join("symlink-parent");
         std::fs::create_dir(&real_parent).unwrap();
@@ -2361,7 +2365,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_ignores_graph_record_count_mismatch_on_open() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::from_graph(
             vec![
@@ -2390,10 +2394,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_rejects_graph_version_mismatch_on_open() {
-        let directory = tempfile::Builder::new()
-            .prefix("ckks-graph-path-sentinel-")
-            .tempdir()
-            .unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let graph = CkksCiphertextHnswGraphFile {
             version: CKKS_CIPHERTEXT_HNSW_GRAPH_FILE_VERSION + 1,
@@ -2426,7 +2427,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_rejects_graph_unknown_fields_on_open() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let graph = serde_json::json!({
             "version": CKKS_CIPHERTEXT_HNSW_GRAPH_FILE_VERSION,
@@ -2459,7 +2460,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_ignores_graph_records_digest_mismatch_on_open() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::from_graph(
             vec![
@@ -2502,7 +2503,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_digest_tracks_full_sidecar_identity() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let mut index = CkksCiphertextVectorIndex::from_graph(
             vec![CkksCiphertextIndexedRecord::new_with_sidecar_identity(
@@ -2533,7 +2534,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_ignores_invalid_graph_links_on_open() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let invalid_graph = CkksCiphertextHnswGraphFile {
             version: CKKS_CIPHERTEXT_HNSW_GRAPH_FILE_VERSION,
@@ -2567,7 +2568,7 @@ mod tests {
 
     #[test]
     fn ciphertext_vector_index_ignores_graph_degree_above_persisted_limit_on_open() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = graph_test_directory();
         let graph_file = CkksCiphertextVectorIndex::graph_file_path(directory.path());
         let records = vec![
             CkksCiphertextIndexedRecord::new(0, b"ciphertext-a".to_vec()),

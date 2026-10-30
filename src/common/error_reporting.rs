@@ -27,6 +27,10 @@ impl ErrorReporter {
     }
 
     pub fn report(error: &str, reporting_id: &str, backtrace: Option<&str>) {
+        Self::report_to_url(error, reporting_id, backtrace, &Self::get_url());
+    }
+
+    fn report_to_url(error: &str, reporting_id: &str, backtrace: Option<&str>, url: &str) {
         let client = match reqwest::blocking::Client::builder()
             .user_agent(APP_USER_AGENT.as_str())
             .build()
@@ -41,7 +45,7 @@ impl ErrorReporter {
         let data = Self::build_report_payload(error, reporting_id, backtrace);
 
         if let Err(err) = client
-            .post(Self::get_url())
+            .post(url)
             .body(data)
             .header("Content-Type", "application/json")
             .timeout(Duration::from_secs(1))
@@ -166,6 +170,12 @@ pub(crate) fn redact_crypto_material_for_report(value: &str) -> String {
         "clientstatekey",
         "clientstatesnapshot",
         "clientstatesnapshots",
+        "clientrecoverystate",
+        "clientrecoverystates",
+        "clientrecoverystatebackup",
+        "clientrecoverystatebackups",
+        "clientrecoverystatedigest",
+        "clientrecoverystatedigests",
         "commitsignature",
         "distance",
         "distances",
@@ -241,6 +251,8 @@ pub(crate) fn redact_crypto_material_for_report(value: &str) -> String {
         "oldleaves",
         "oldleafid",
         "oldleafids",
+        "operationtoken",
+        "operationtokens",
         "orampath",
         "orampaths",
         "orampositionmap",
@@ -410,6 +422,11 @@ pub(crate) fn redact_crypto_material_for_report(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use super::ErrorReporter;
 
     #[test]
@@ -446,6 +463,93 @@ mod tests {
         assert!(!payload.contains("ciphertext-sentinel"));
         assert!(!payload.contains("wrapped-sentinel"));
         assert!(!payload.contains("x-vault-token"));
+    }
+
+    #[test]
+    fn test_build_report_payload_redacts_private_result_and_recovery_fixture_sentinels() {
+        let result_payload = "qsec-v2-private-result-payload-3f7a9c";
+        let client_recovery_payload = "qsec-v2-client-recovery-state-payload-8d4c1a";
+        let report = ErrorReporter::build_report_payload(
+            &format!(r#"payload_plaintext={{"body":"{result_payload}"}}"#),
+            "node-private-oram-leakage-gate",
+            Some(&format!(
+                "client_recovery_state={{\"stash\":\"{client_recovery_payload}\"}}"
+            )),
+        );
+
+        assert!(report.contains("crypto material omitted"));
+        assert!(!report.contains(result_payload));
+        assert!(!report.contains(client_recovery_payload));
+    }
+
+    #[test]
+    fn test_panic_report_transport_body_redacts_private_oram_fixture_sentinels() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "panic report request timed out");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("failed to accept panic report request: {err}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "panic report request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .expect("panic report request must include content-length");
+                break (header_end + 4, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "panic report request body was truncated");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
+        });
+
+        let result_payload = "qsec-v2-private-result-payload-3f7a9c";
+        let client_recovery_payload = "qsec-v2-client-recovery-state-payload-8d4c1a";
+        ErrorReporter::report_to_url(
+            &format!(r#"payload_plaintext={{"body":"{result_payload}"}}"#),
+            "node-private-oram-transport-gate",
+            Some(&format!(
+                "client_recovery_state={{\"stash\":\"{client_recovery_payload}\"}}"
+            )),
+            &format!("http://{address}"),
+        );
+        let body = server.join().unwrap();
+
+        assert!(body.contains("crypto material omitted"));
+        assert!(!body.contains(result_payload));
+        assert!(!body.contains(client_recovery_payload));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use api::grpc::qdrant::{
 };
 use itertools::Itertools;
 use raft::eraftpb::Message as RaftMessage;
-use storage::content_manager::consensus_manager::ConsensusStateRef;
+use storage::content_manager::consensus_manager::{ConsensusProposalOutcome, ConsensusStateRef};
 use storage::content_manager::consensus_ops::ConsensusOperations;
 use tokio::sync::mpsc::Sender;
 use tonic::transport::Uri;
@@ -132,17 +132,41 @@ impl Raft for RaftService {
                 })?;
         }
 
-        // the consensus operation can take up to DEFAULT_META_OP_WAIT
-        self.consensus_state
-            .propose_consensus_op_with_await(
-                ConsensusOperations::AddPeer {
-                    peer_id: peer.id,
-                    uri: uri.to_string(),
-                },
-                None,
-            )
-            .await
-            .map_err(|err| Status::internal(format!("Failed to add peer: {err}")))?;
+        // A timed-out proposal can already be applied by the time bootstrap retries. Preserve
+        // its current voter/learner role instead of proposing AddLearnerNode again.
+        if !self
+            .consensus_state
+            .complete_registered_peer_add(peer.id, &uri)
+        {
+            match self
+                .consensus_state
+                .propose_consensus_op_with_outcome(
+                    ConsensusOperations::AddPeer {
+                        peer_id: peer.id,
+                        uri: uri.to_string(),
+                    },
+                    None,
+                )
+                .await
+            {
+                ConsensusProposalOutcome::Applied(_) => {}
+                ConsensusProposalOutcome::Indeterminate(error) => {
+                    if !self
+                        .consensus_state
+                        .complete_registered_peer_add(peer.id, &uri)
+                    {
+                        // This includes proposals declined while the local Raft log catches up.
+                        // Only the bootstrap client retries this transient status, under its
+                        // existing overall deadline; permanent URI refusals remain immediate.
+                        return Err(Status::unavailable(format!("Failed to add peer: {error}")));
+                    }
+                }
+                ConsensusProposalOutcome::NotSubmitted(error)
+                | ConsensusProposalOutcome::Failed(error) => {
+                    return Err(Status::internal(format!("Failed to add peer: {error}")));
+                }
+            }
+        }
 
         let mut addresses = self.consensus_state.peer_address_by_id();
 
@@ -193,6 +217,82 @@ impl Raft for RaftService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_peer_bootstrap_preserves_voters_and_learners_without_proposal() {
+        use collection::operations::types::PeerMetadata;
+        use collection::operations::verification::new_unchecked_verification_pass;
+        use storage::content_manager::consensus::operation_sender::OperationSender;
+        use storage::content_manager::consensus::persistent::Persistent;
+        use storage::content_manager::consensus_manager::ConsensusManager;
+        use storage::rbac::{Access, Auth};
+
+        let (temp, dispatcher) = crate::common::private_hnsw_wire_fixture::test_dispatcher();
+        let toc = dispatcher
+            .toc(
+                &Auth::new_internal(Access::full("registered peer bootstrap test")),
+                &new_unchecked_verification_pass(),
+            )
+            .clone();
+        let persistent = Persistent::load_or_init(temp.path(), true, false, Some(11)).unwrap();
+        let (proposal_sender, proposal_receiver) = std::sync::mpsc::channel();
+        let state: ConsensusStateRef = ConsensusManager::new(
+            persistent,
+            toc,
+            OperationSender::new(proposal_sender),
+            temp.path(),
+            PeerMetadata::current(),
+        )
+        .unwrap()
+        .into();
+        state
+            .add_peer(11, "http://voter:6335".parse().unwrap())
+            .unwrap();
+        state
+            .add_peer(12, "http://learner:6335".parse().unwrap())
+            .unwrap();
+        state
+            .set_conf_state(raft::eraftpb::ConfState {
+                voters: vec![11],
+                learners: vec![12],
+                ..Default::default()
+            })
+            .unwrap();
+        let before = state.conf_state();
+        let (message_sender, _message_receiver) = tokio::sync::mpsc::channel(1);
+        let service = RaftService::new(message_sender, state.clone(), false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for (id, uri) in [(11, "http://voter:6335"), (12, "http://learner:6335")] {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    service.add_peer_to_known(Request::new(AddPeerToKnownMessage {
+                        id,
+                        uri: Some(uri.to_string()),
+                        port: None,
+                    })),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .into_inner();
+                let registered_peer = response
+                    .all_peers
+                    .iter()
+                    .find(|peer| peer.id == id)
+                    .expect("bootstrap response must retain the registered peer");
+                assert_eq!(
+                    registered_peer.uri.parse::<Uri>().unwrap(),
+                    uri.parse::<Uri>().unwrap(),
+                );
+                assert_eq!(state.conf_state(), before);
+                assert!(matches!(
+                    proposal_receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+            }
+        });
+    }
 
     #[test]
     fn raft_message_parse_error_does_not_reflect_payload_or_decoder_detail() {

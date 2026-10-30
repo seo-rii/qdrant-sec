@@ -10323,9 +10323,12 @@ mod tests {
             private_oram_mutation_v2_binary_capability_digest(),
             "476bxEnworZ3LqmqqKrsc1Udw7AjtJdwjNq_gyPsxok",
         );
+        // Wire 9 adds owner-archive-history=1 to the release capability descriptor.
+        // The previous-binary upgrade fixture retains its separate wire-7 known answer.
+        assert_eq!(PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION, 9);
         assert_eq!(
             private_oram_mutation_v3_binary_capability_digest(),
-            "dAtfKtcZBHNaXhM-amdoNULrgFbKmnO_EWz8LcJy3l4",
+            "9lVhunXiPul1X0wJpDapumHTMBPpg7jlnc2NHGwsODg",
         );
     }
 
@@ -14922,7 +14925,7 @@ mod tests {
                     "openfhe_bridge_v1".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/qdrant-sec-openfhe".to_string()),
+                        program: Some(test_backend_program_path("qdrant-sec-openfhe")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -15149,7 +15152,7 @@ mod tests {
                     "openfhe_bridge_v1".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/qdrant-sec-openfhe".to_string()),
+                        program: Some(test_backend_program_path("qdrant-sec-openfhe")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -16259,15 +16262,16 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         let dir = tempfile::Builder::new()
-            .prefix("qdrant-sec-material-socket-symlink-")
+            // Keep the complete socket path below macOS's sockaddr_un path limit.
+            .prefix("qs-")
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let mut dir_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
         dir_permissions.set_mode(0o700);
         std::fs::set_permissions(dir.path(), dir_permissions).unwrap();
 
-        let socket_path = dir.path().join("payload.key.sock.target");
-        let symlink_path = dir.path().join("payload.key.sock");
+        let socket_path = dir.path().join("target.sock");
+        let symlink_path = dir.path().join("link.sock");
         let _listener = UnixListener::bind(&socket_path).unwrap();
         let mut socket_permissions = std::fs::symlink_metadata(&socket_path)
             .unwrap()
@@ -18093,7 +18097,7 @@ mod tests {
                 "openfhe_local",
                 &CryptoBackendConfig {
                     kind: "shell".to_string(),
-                    program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                    program: Some(test_backend_program_path("openfhe-bridge")),
                     sha256_b64: None,
                     signature_public_key_b64: None,
                     signature_b64: None,
@@ -18108,6 +18112,15 @@ mod tests {
                 kind: "shell".to_string(),
             }),
         );
+    }
+
+    fn test_backend_program_path(program_name: &str) -> String {
+        // Metadata-only fixtures need an absolute path in the host platform's syntax.
+        std::env::current_dir()
+            .unwrap()
+            .join(program_name)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn test_bridge_program() -> (tempfile::TempDir, String, String) {
@@ -18630,7 +18643,7 @@ mod tests {
     fn sanitized_backend_policy_fingerprints_landlock_read_allow_roots_for_strict_kinds() {
         let strict = landlock_strict_backend_config(
             OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_STRICT_NETNS,
-            "/usr/local/bin/openfhe-bridge".to_string(),
+            test_backend_program_path("openfhe-bridge"),
             "sha256".to_string(),
             Some(2),
             &["/opt/openfhe"],
@@ -18661,7 +18674,7 @@ mod tests {
 
         let write_deny = landlock_strict_backend_config(
             OPENFHE_BACKEND_KIND_PROCESS_POOL_LANDLOCK_NETNS,
-            "/usr/local/bin/openfhe-bridge".to_string(),
+            test_backend_program_path("openfhe-bridge"),
             "sha256".to_string(),
             Some(2),
             &[],
@@ -18803,6 +18816,7 @@ mod tests {
         assert!(!rendered.contains("signature_b64"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_tracks_crypto_material_env_names() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -18889,6 +18903,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_reuses_cached_pool_for_matching_backend_policy() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -18944,6 +18959,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openfhe_backend_factory_evicts_only_lru_pool_when_cache_is_full() {
         let _guard = openfhe_backend_factory_test_guard();
@@ -19120,7 +19136,7 @@ mod tests {
                 "openfhe_local",
                 &CryptoBackendConfig {
                     kind: "process_pool".to_string(),
-                    program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                    program: Some(test_backend_program_path("openfhe-bridge")),
                     sha256_b64: None,
                     signature_public_key_b64: None,
                     signature_b64: None,
@@ -19141,7 +19157,7 @@ mod tests {
                 "openfhe_local",
                 &CryptoBackendConfig {
                     kind: "process".to_string(),
-                    program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                    program: Some(test_backend_program_path("openfhe-bridge")),
                     sha256_b64: None,
                     signature_public_key_b64: None,
                     signature_b64: None,
@@ -23457,7 +23473,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -23638,7 +23654,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -23724,7 +23740,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: None,
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -23773,7 +23789,7 @@ mod tests {
         );
 
         let backend = settings.crypto.backends.get_mut("openfhe_local").unwrap();
-        backend.program = Some("/usr/local/bin/openfhe-bridge".to_string());
+        backend.program = Some(test_backend_program_path("openfhe-bridge"));
         backend.sha256_b64 = Some(format!("{}+", "A".repeat(BASE64URL_NOPAD_32_BYTE_LEN - 1)));
         let err = validate_collection_crypto_runtime_inner(&settings, "docs", &params).unwrap_err();
         assert!(
@@ -24194,6 +24210,7 @@ mod tests {
         assert_bad_input_redacted(sidecar_err, "client CKKS vector sidecar entry is invalid");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_redacts_client_ckks_query_validation_errors() {
         let (_bridge_dir, bridge_program, bridge_sha256_b64) = test_bridge_program();
@@ -24604,6 +24621,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn vector_write_plan_rejects_client_ckks_query_envelopes_in_clustered_mode() {
         let (_bridge_dir, bridge_program, bridge_sha256_b64) = test_bridge_program();
@@ -26005,7 +26023,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -26087,7 +26105,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -26172,7 +26190,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -26257,7 +26275,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,
@@ -26328,7 +26346,7 @@ mod tests {
                     "openfhe_local".to_string(),
                     CryptoBackendConfig {
                         kind: "process_pool".to_string(),
-                        program: Some("/usr/local/bin/openfhe-bridge".to_string()),
+                        program: Some(test_backend_program_path("openfhe-bridge")),
                         sha256_b64: Some(BASE64URL_NOPAD.encode(&[17_u8; 32])),
                         signature_public_key_b64: None,
                         signature_b64: None,

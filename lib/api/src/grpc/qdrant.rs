@@ -16275,6 +16275,10 @@ pub struct RequestPrivateOramShardRecoveryRequest {
     pub active_transfer_resume: ::core::option::Option<
         PrivateOramActiveTransferResumeContext,
     >,
+    /// Source recovery retries must leave a running or finished transfer task alone.
+    /// Requires an exact durable source preinstall intent and active_transfer_resume.
+    #[prost(bool, tag = "6")]
+    pub resume_if_task_missing: bool,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]

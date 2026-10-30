@@ -288,6 +288,17 @@ impl PrivateOramPeerRecoveryIdentity {
             .map_err(|_| PrivateOramPeerIdentityError::CryptographicValidationFailed)
     }
 
+    pub(crate) fn sign_owner_enrollment_genesis_commitment(
+        &self,
+        prepared: &PrivateOramOwnerEnrollmentPreparedV1,
+    ) -> Result<PrivateOramOwnerEnrollmentGenesisCommitmentV1, PrivateOramPeerIdentityError> {
+        if prepared.owner_peer_id != self.peer_id {
+            return Err(PrivateOramPeerIdentityError::PeerIdMismatch);
+        }
+        sign_private_oram_owner_enrollment_genesis_commitment_v1(&self.key_pair, prepared)
+            .map_err(|_| PrivateOramPeerIdentityError::CryptographicValidationFailed)
+    }
+
     pub(crate) fn sign_owner_reservation_prepare(
         &self,
         challenge: PrivateOramOwnerReservationPrepareChallengeV1,
@@ -620,7 +631,7 @@ mod platform {
                 return Err(PrivateOramPeerIdentityError::InvalidStorageRoot);
             }
         } else if mode & 0o022 != 0 {
-            let root_owned_sticky = owner == 0 && mode & nix::libc::S_ISVTX != 0;
+            let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
             if !root_owned_sticky {
                 return Err(PrivateOramPeerIdentityError::InvalidStorageRoot);
             }

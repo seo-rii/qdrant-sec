@@ -471,8 +471,8 @@ def test_search_groups_lookup_with_non_existing_collection(collection_name):
     assert response.status_code == 404
 
     assert (
-        f"Collection {non_existing_collection} not found"
-        in response.json()["status"]["error"]
+        response.json()["status"]["error"]
+        == f"Not found: Collection `{non_existing_collection}` doesn't exist!"
     )
 
 def test_search_groups_with_full_lookup(collection_name, lookup_collection_name):

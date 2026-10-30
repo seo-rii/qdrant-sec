@@ -252,16 +252,23 @@ def test_reject_rejoin_cluster_same_uri(tmp_path: pathlib.Path, uris_in_env):
         elif os.path.isdir(file_path):
             shutil.rmtree(file_path)
 
+    log_folder = pathlib.Path(init_pytest_log_folder())
+    bootstrap_log = log_folder / "peer_0_0.log"
+    rejection_message = f"already used by peer {broken_peer_id} which still has shards"
     for i in range(2):
+        rejection_count = bootstrap_log.read_text().count(rejection_message)
         # Restart last node
         broken_peer_port = 10000 + 2 * 100 # same port this peer used before
-        new_url = start_peer(peer_dirs[-1], "peer_2_restarted.log", bootstrap_uri, port=broken_peer_port, uris_in_env=uris_in_env)
+        new_url = start_peer(peer_dirs[-1], "peer_2_restarted.log", bootstrap_uri, port=broken_peer_port, uris_in_env=uris_in_env, capture_stderr=True)
         peer_api_uris[-1] = new_url
 
-        # Expect the process to crash, it cannot join the cluster with the same URL
-        # Expect exit code 101, see <https://doc.rust-lang.org/std/macro.panic.html#current-implementation>
+        # Startup returns the handled consensus error instead of panicking.
         processes[-1].proc.wait(timeout=20)
-        assert processes[-1].proc.returncode == 101
+        assert processes[-1].proc.returncode == 1
+        assert "Can't initialize consensus:" in (
+            log_folder / "peer_2_restarted.log"
+        ).read_text()
+        assert bootstrap_log.read_text().count(rejection_message) == rejection_count + 1
         processes.pop().kill()
 
         # Cluster consensus still have the same number of peers
@@ -586,11 +593,19 @@ def test_reject_replace_peer_with_shards_same_uri(tmp_path: pathlib.Path):
 
     # Bootstrap a new peer reusing the same port (= same URI) as the killed peer
     broken_peer_port = 10000 + (N_PEERS - 1) * 100
-    new_url = start_peer(peer_dirs[-1], "peer_replaced_rejected.log", bootstrap_uri, port=broken_peer_port)
+    log_folder = pathlib.Path(init_pytest_log_folder())
+    bootstrap_log = log_folder / "peer_0_0.log"
+    rejection_message = f"already used by peer {target_peer_id} which still has shards"
+    rejection_count = bootstrap_log.read_text().count(rejection_message)
+    new_url = start_peer(peer_dirs[-1], "peer_replaced_rejected.log", bootstrap_uri, port=broken_peer_port, capture_stderr=True)
 
-    # Expect the process to crash because the old peer still has shards
+    # Reject startup with a handled error because the old peer still has shards.
     processes[-1].proc.wait(timeout=20)
-    assert processes[-1].proc.returncode == 101
+    assert processes[-1].proc.returncode == 1
+    assert "Can't initialize consensus:" in (
+        log_folder / "peer_replaced_rejected.log"
+    ).read_text()
+    assert bootstrap_log.read_text().count(rejection_message) == rejection_count + 1
     processes.pop().kill()
 
     # The old peer must still be registered in consensus with its original state

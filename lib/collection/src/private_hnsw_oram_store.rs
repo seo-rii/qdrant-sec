@@ -69,6 +69,12 @@ const OWNER_EXACT_NEW_STORE_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-owner-hnsw-store-exact-new/v1";
 const OWNER_EPOCH_DIRECTORY_DOMAIN: &[u8] =
     b"qdrant-sec/private-oram-owner-hnsw-epoch-directory/v1";
+#[cfg(debug_assertions)]
+const STAGING_PRE_RENAME_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_HNSW_ORAM_PRE_RENAME_PAUSE_FILE";
+#[cfg(debug_assertions)]
+const STAGING_POST_RENAME_PRE_DIR_FSYNC_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_HNSW_ORAM_POST_RENAME_PRE_DIR_FSYNC_PAUSE_FILE";
 
 #[derive(Clone)]
 pub struct PrivateHnswOramStore {
@@ -1582,6 +1588,20 @@ impl PrivateHnswOramStore {
         Ok(epoch)
     }
 
+    pub fn read_current_epoch_with_writeback_digest(
+        &self,
+    ) -> CollectionResult<(PrivateHnswOramEpochState, Option<String>)> {
+        self.with_owner_store_lock_v1(|_| {
+            let (manifest, _) = self.read_manifest()?;
+            validate_private_hnsw_oram_manifest_shape(&manifest)
+                .map_err(private_hnsw_oram_error)?;
+            self.ensure_no_pending_live_replication()?;
+            let current = self.read_current_epoch()?;
+            let writeback_digest = self.live_writeback_digest(&manifest, &current)?;
+            Ok((current, writeback_digest))
+        })
+    }
+
     pub fn compare_and_swap_epoch(
         &self,
         old: &PrivateHnswOramEpochState,
@@ -2835,6 +2855,7 @@ impl PrivateHnswOwnerStoreLockV1<'_> {
         &'lock self,
         context: PrivateHnswOwnerStoreVerificationContextV1<'_>,
     ) -> CollectionResult<PrivateHnswOwnerExactNewStoreTokenV1<'lock>> {
+        self.ensure_owner_recovery_temp_dir_v1()?;
         let mut evidence = self.classify_owner_recovery_state_v1(context)?;
         let written_bucket_count = match evidence.phase {
             PrivateHnswOwnerRecoveryPhaseV1::S0 => 0,
@@ -2887,6 +2908,94 @@ impl PrivateHnswOwnerStoreLockV1<'_> {
             return Err(owner_store_state_mismatch());
         }
         self.verify_exact_new(context)
+    }
+
+    fn ensure_owner_recovery_temp_dir_v1(&self) -> CollectionResult<()> {
+        validate_owner_store_directory_identity(&self.directory, &self.store.root)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let name = CString::new(TEMP_DIR).map_err(|_| {
+                CollectionError::service_error(
+                    "private HNSW ORAM recovery directory name is invalid",
+                )
+            })?;
+            // SAFETY: `name` is NUL-terminated and the locked root descriptor stays alive.
+            let created =
+                unsafe { nix::libc::mkdirat(self.directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            let created = if created == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(nix::libc::EEXIST) {
+                    return Err(CollectionError::service_error(
+                        "failed to create private HNSW ORAM recovery directory",
+                    ));
+                }
+                false
+            };
+
+            // SAFETY: `name` is NUL-terminated and openat does not retain either pointer.
+            let descriptor = unsafe {
+                nix::libc::openat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_NOFOLLOW
+                        | nix::libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(CollectionError::service_error(
+                    "private HNSW ORAM recovery directory is invalid",
+                ));
+            }
+            // SAFETY: the checked descriptor is uniquely transferred into this File.
+            let directory = unsafe { File::from_raw_fd(descriptor) };
+            let opened = directory.metadata().map_err(|_| {
+                CollectionError::service_error(
+                    "failed to inspect private HNSW ORAM recovery directory",
+                )
+            })?;
+            let current = fs::symlink_metadata(self.store.temp_dir()).map_err(|_| {
+                CollectionError::service_error(
+                    "failed to inspect private HNSW ORAM recovery directory",
+                )
+            })?;
+            let effective_uid = nix::unistd::Uid::effective().as_raw();
+            if !opened.file_type().is_dir()
+                || current.file_type().is_symlink()
+                || !current.file_type().is_dir()
+                || opened.uid() != effective_uid
+                || current.uid() != effective_uid
+                || opened.permissions().mode() & 0o077 != 0
+                || current.permissions().mode() & 0o077 != 0
+                || opened.dev() != current.dev()
+                || opened.ino() != current.ino()
+            {
+                return Err(CollectionError::service_error(
+                    "private HNSW ORAM recovery directory is invalid",
+                ));
+            }
+            if created {
+                self.directory.sync_all().map_err(|_| {
+                    CollectionError::service_error(
+                        "failed to sync private HNSW ORAM recovery directory",
+                    )
+                })?;
+            }
+            validate_owner_store_directory_identity(&self.directory, &self.store.root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(CollectionError::service_error(
+                "private HNSW ORAM owner recovery is unsupported on this platform",
+            ))
+        }
     }
 
     fn classify_owner_recovery_state_v1(
@@ -4907,6 +5016,11 @@ fn write_json_atomic_with_limit<T: Serialize>(
             })?;
         drop(file);
         sync_dir(temp_dir)?;
+        #[cfg(debug_assertions)]
+        staging_private_hnsw_atomic_write_pause(
+            STAGING_PRE_RENAME_PAUSE_FILE_ENV,
+            "Private HNSW ORAM staging atomic write pre-rename pause reached",
+        );
         fs::rename(&temp_path, target)
             .map_err(|_| CollectionError::service_error("failed to replace private HNSW ORAM file"))
     })();
@@ -4916,6 +5030,11 @@ fn write_json_atomic_with_limit<T: Serialize>(
         let _ = fs::remove_file(&temp_path);
         return Err(err);
     }
+    #[cfg(debug_assertions)]
+    staging_private_hnsw_atomic_write_pause(
+        STAGING_POST_RENAME_PRE_DIR_FSYNC_PAUSE_FILE_ENV,
+        "Private HNSW ORAM staging atomic write post-rename pre-directory-fsync pause reached",
+    );
     if let Some(parent) = target.parent() {
         sync_dir(parent)?;
     }
@@ -4939,6 +5058,20 @@ fn manifest_refresh_preserves_immutable_fields(
     expected.dummy_node_count = refreshed.dummy_node_count;
     expected.created_at_unix = refreshed.created_at_unix;
     expected == *refreshed
+}
+
+#[cfg(debug_assertions)]
+fn staging_private_hnsw_atomic_write_pause(env_name: &str, marker: &str) {
+    let Some(pause_file) = std::env::var_os(env_name) else {
+        return;
+    };
+    if pause_file.is_empty() || !Path::new(&pause_file).exists() {
+        return;
+    }
+    log::warn!("{marker}");
+    while Path::new(&pause_file).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 fn remove_private_file(path: &Path, parent: &Path, max_bytes: u64) -> CollectionResult<()> {
@@ -6216,6 +6349,90 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_epoch_with_writeback_digest_validates_initial_and_committed_state() {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[57; 32]).unwrap();
+        let public_key = key_pair.public_key();
+        let (bundle, updated_bucket, new, signature) = fixture_signed_commit_update(&key_pair);
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+        let old = store.write_initial_upload_bundle(&bundle, 4096).unwrap();
+        let verification = || PrivateHnswSignatureVerification {
+            expected_key_id: "tenant-a/private-hnsw-signing-v1",
+            public_key: public_key.as_ref(),
+        };
+
+        assert_eq!(
+            store.read_current_epoch_with_writeback_digest().unwrap(),
+            (old.clone(), None),
+        );
+
+        let consensus_writeback = store
+            .prepare_durable_writeback_with_signature(
+                &old,
+                &new,
+                bundle.bucket_count(),
+                std::slice::from_ref(&updated_bucket),
+                4096,
+                &signature,
+                verification(),
+            )
+            .unwrap();
+        store
+            .commit_prepared_writeback_with_signature(4096, verification())
+            .unwrap();
+        assert_eq!(
+            store.read_current_epoch_with_writeback_digest().unwrap(),
+            (
+                new.clone(),
+                Some(consensus_writeback.writeback_digest.clone()),
+            ),
+        );
+
+        let commit_path = store.commit_epoch_path(new.index_epoch);
+        fs::remove_file(&commit_path).unwrap();
+        let missing = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("current commit is missing"));
+
+        write_json_atomic(
+            &store.root,
+            &store.temp_dir(),
+            &commit_path,
+            &PrivateHnswOramEpochCommit {
+                index_epoch: new.index_epoch,
+                root_hash: root_hash(91),
+                writeback_digest: Some(consensus_writeback.writeback_digest),
+            },
+        )
+        .unwrap();
+        let mismatch = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("commit does not match current state"));
+
+        write_json_atomic(
+            &store.root,
+            &store.temp_dir(),
+            &commit_path,
+            &PrivateHnswOramEpochCommit {
+                index_epoch: new.index_epoch,
+                root_hash: new.root_hash,
+                writeback_digest: None,
+            },
+        )
+        .unwrap();
+        let missing_digest = store
+            .read_current_epoch_with_writeback_digest()
+            .unwrap_err()
+            .to_string();
+        assert!(missing_digest.contains("current commit has no consensus digest"));
+    }
+
     fn fixture_owner_states(
         manifest: &PrivateHnswOramManifest,
         new_epoch: &PrivateHnswOramEpochState,
@@ -6522,6 +6739,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_upload_bundle_with_signature_verifies_manifest_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
@@ -6666,6 +6884,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_upload_bundle_preflights_existing_epoch_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[18; 32]).unwrap();
@@ -6724,6 +6943,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_upload_bundle_matching_epoch_requires_existing_files_to_match() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[19; 32]).unwrap();
@@ -6774,6 +6994,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_upload_bundle_matching_epoch_requires_existing_manifest_to_match() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[20; 32]).unwrap();
@@ -6807,6 +7028,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_upload_bundle_matching_epoch_requires_existing_merkle_tree_to_match() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[21; 32]).unwrap();
@@ -6855,6 +7077,20 @@ mod tests {
         assert!(matches!(err, CollectionError::NotFound { .. }));
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn canonical_writers_fail_closed_without_owner_lock_support() {
+        let temp = TempDir::new().unwrap();
+        let store = fixture_store(&temp);
+
+        let error = store.ensure_layout().unwrap_err();
+
+        assert!(error.to_string().contains("unsupported on this platform"));
+        assert!(!store.root_path().exists());
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_roundtrip_writes_private_files() {
         let temp = TempDir::new().unwrap();
@@ -6977,6 +7213,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_bucket_set_validates_entire_bundle_before_writes_and_does_not_self_deadlock() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -7094,6 +7331,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_epoch_if_absent_creates_private_layout() {
         let temp = TempDir::new().unwrap();
@@ -7110,6 +7348,7 @@ mod tests {
         assert_eq!(store.read_current_epoch().unwrap(), epoch);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn initial_epoch_reupload_is_idempotent_and_conflict_preserves_current() {
         let temp = TempDir::new().unwrap();
@@ -7145,6 +7384,7 @@ mod tests {
         assert_eq!(store.read_current_epoch().unwrap(), epoch);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn current_manifest_reupload_requires_existing_manifest_to_match() {
         let temp = TempDir::new().unwrap();
@@ -7187,6 +7427,7 @@ mod tests {
         assert_eq!(store.read_manifest().unwrap(), (manifest, signature));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn current_manifest_reupload_repairs_a_torn_signature() {
         let temp = TempDir::new().unwrap();
@@ -7224,6 +7465,7 @@ mod tests {
         assert_eq!(store.read_manifest().unwrap(), (manifest, signature));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_commit_manifest_refresh_allows_current_epoch_ahead_of_stored_manifest() {
         let temp = TempDir::new().unwrap();
@@ -7271,6 +7513,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn post_commit_manifest_refresh_rejects_stale_epoch_without_overwriting() {
         let temp = TempDir::new().unwrap();
@@ -7317,6 +7560,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manifest_initial_epoch_publish_requires_manifest_write_success() {
         let temp = TempDir::new().unwrap();
@@ -7343,6 +7587,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_write_rejects_hash_mismatch_and_oversize() {
         let temp = TempDir::new().unwrap();
@@ -7411,6 +7656,7 @@ mod tests {
         assert!(!rendered.contains("16"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_read_rejects_file_id_mismatch_without_ciphertext_leak() {
         let temp = TempDir::new().unwrap();
@@ -7437,6 +7683,7 @@ mod tests {
         assert!(!err.contains(&mismatched_bucket.ciphertext));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn store_accepts_client_sealed_buckets_and_merkle_root_roundtrips() {
         let temp = TempDir::new().unwrap();
@@ -7490,6 +7737,7 @@ mod tests {
         assert_eq!(proof.leaves[1].leaf_hash, commitments[1]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn client_commit_plan_matches_store_merkle_commit_root() {
         let temp = TempDir::new().unwrap();
@@ -7531,6 +7779,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_read_accepts_unchanged_bucket_from_prior_committed_epoch() {
         let temp = TempDir::new().unwrap();
@@ -7576,6 +7825,7 @@ mod tests {
         assert!(!rendered.contains("1"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_rejects_non_advancing_epoch_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -7619,6 +7869,7 @@ mod tests {
         assert_eq!(proof.leaves[0].leaf_hash, original_bucket.bucket_commitment);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_preflights_stale_current_epoch_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -7665,6 +7916,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_rejects_invalid_bucket_and_wrong_root_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -7818,7 +8070,7 @@ mod tests {
     /// Fault injection (PLAN V2-D5): a commit on a store whose directories are not writable
     /// must fail closed (old epoch and buckets intact, no pending write-back) and succeed on
     /// retry once permissions are restored.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_fails_closed_on_read_only_store_and_retries_cleanly() {
         if nix::unistd::Uid::effective().is_root() {
@@ -8105,6 +8357,7 @@ mod tests {
     /// directories) fails in turn. After each failure the store must hold the old epoch with no
     /// pending write-back (and a retry commits), keep a pending write-back that recovery
     /// finishes, or already hold the new epoch; it must never be left stuck.
+    #[cfg(target_os = "linux")]
     #[test]
     fn signed_commit_survives_an_fsync_failure_at_every_sync() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -8319,6 +8572,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_with_signature_verifies_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -8572,6 +8826,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn durable_signed_writeback_resumes_across_finalize_crash_windows() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[31; 32]).unwrap();
@@ -8723,6 +8978,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn replicated_signed_writeback_is_bound_to_consensus_before_prepare() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[35; 32]).unwrap();
@@ -8899,6 +9155,7 @@ mod tests {
         assert!(!advanced.contains(&new.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_replication_bundle_installs_advanced_signed_state() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[53; 32]).unwrap();
@@ -9011,6 +9268,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn durable_signed_writeback_rejects_tampered_journal_before_finalize() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[37; 32]).unwrap();
@@ -9071,6 +9329,7 @@ mod tests {
         assert!(store.pending_writeback_path().exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn durable_signed_writeback_abort_requires_unmodified_old_view() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[43; 32]).unwrap();
@@ -9137,6 +9396,7 @@ mod tests {
         assert_eq!(partially_written_store.read_current_epoch().unwrap(), old);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_rejects_bucket_commitment_context_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[29; 32]).unwrap();
@@ -9182,6 +9442,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_allows_manifest_epoch_root_to_remain_at_upload_anchor() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[31; 32]).unwrap();
@@ -9218,6 +9479,7 @@ mod tests {
         assert_eq!(store.read_manifest().unwrap().0, tampered_manifest);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn writeback_commit_preflights_manifest_bucket_count_before_writes() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[37; 32]).unwrap();
@@ -9274,6 +9536,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sdk_upload_search_fixture_roundtrips_store_read_paths_and_commit() {
         let temp = TempDir::new().unwrap();
@@ -9570,6 +9833,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn epoch_compare_and_swap_rejects_stale_root() {
         let temp = TempDir::new().unwrap();
@@ -9606,6 +9870,7 @@ mod tests {
         assert!(!rendered.contains(&newer.root_hash), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn crash_window_before_epoch_cas_fails_closed_instead_of_serving_mixed_root() {
         let temp = TempDir::new().unwrap();
@@ -9658,7 +9923,7 @@ mod tests {
         assert!(err.to_string().contains("epoch mismatch"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_symlink_rejects() {
         use std::os::unix::fs::symlink;
@@ -9685,7 +9950,7 @@ mod tests {
         assert!(!rendered.contains(&bucket.bucket_commitment), "{rendered}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_hardlink_rejects_without_path_or_body_leak() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -9708,7 +9973,7 @@ mod tests {
         assert!(!error.contains(&bucket.bucket_commitment));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn current_epoch_symlink_rejects_without_path_or_target_leak() {
         use std::os::unix::fs::symlink;
@@ -9728,7 +9993,7 @@ mod tests {
         assert!(!rendered.contains("private_hnsw_oram"), "{rendered}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn current_epoch_group_world_accessible_rejects_without_epoch_or_path_leak() {
         use std::os::unix::fs::PermissionsExt;
@@ -9755,7 +10020,7 @@ mod tests {
         assert!(!rendered.contains("private_hnsw_oram"), "{rendered}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn ensure_layout_rejects_root_symlink_without_chmod_target() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -9780,7 +10045,7 @@ mod tests {
         assert_eq!(outside_mode, 0o755);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn parent_directory_group_world_accessible_rejects_without_path_leak() {
         use std::os::unix::fs::PermissionsExt;
@@ -9802,7 +10067,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn temp_directory_symlink_rejects_without_path_or_temp_name_leak() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -9835,7 +10100,7 @@ mod tests {
         assert_eq!(outside_mode, 0o755);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn temp_directory_group_world_accessible_rejects_without_path_leak() {
         use std::os::unix::fs::PermissionsExt;
@@ -9865,7 +10130,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_directory_group_world_accessible_rejects() {
         use std::os::unix::fs::PermissionsExt;
@@ -9885,7 +10150,7 @@ mod tests {
         assert!(!rendered.contains("private_hnsw_oram"), "{rendered}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn bucket_file_group_world_accessible_rejects() {
         use std::os::unix::fs::PermissionsExt;
@@ -9909,6 +10174,7 @@ mod tests {
         assert!(!rendered.contains(&bucket.bucket_commitment), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn merkle_tree_roundtrip_returns_batch_proof_for_requested_buckets() {
         let temp = TempDir::new().unwrap();
@@ -9972,6 +10238,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_bucket_batch_with_proof_checks_current_epoch_and_commitments() {
         let temp = TempDir::new().unwrap();
@@ -10027,6 +10294,7 @@ mod tests {
         assert!(rendered.contains("bucket batch is empty"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_bucket_batch_with_proof_preflights_stale_current_epoch() {
         let temp = TempDir::new().unwrap();
@@ -10076,6 +10344,7 @@ mod tests {
         assert!(!rendered.contains(&tree.root_hash), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn merkle_commit_updates_root_and_rejects_wrong_new_root() {
         let temp = TempDir::new().unwrap();
@@ -10130,6 +10399,7 @@ mod tests {
         assert!(err.to_string().contains("must update at least one bucket"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn merkle_commit_rejects_duplicate_updated_bucket() {
         let temp = TempDir::new().unwrap();
@@ -10162,11 +10432,59 @@ mod tests {
         assert!(!rendered.contains("2"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_from_s0() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S0);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_recovery_recreates_snapshot_omitted_temp_dir() {
+        let temp = TempDir::new().unwrap();
+        let fixture = OwnerRecoveryFixture::new(&temp);
+        fs::remove_dir(fixture.store.temp_dir()).unwrap();
+        let lock = fixture.store.lock_owner_store_v1().unwrap();
+
+        lock.resume_owner_recovery_context_to_exact_new_v1(fixture.context())
+            .unwrap();
+
+        validate_private_dir(&fixture.store.temp_dir()).unwrap();
+        assert_eq!(
+            lock.classify_owner_recovery_state_v1(fixture.context())
+                .unwrap()
+                .phase,
+            PrivateHnswOwnerRecoveryPhaseV1::S4,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_recovery_rejects_symlinked_missing_temp_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let fixture = OwnerRecoveryFixture::new(&temp);
+        fs::remove_dir(fixture.store.temp_dir()).unwrap();
+        let outside = temp.path().join("outside-recovery-temp");
+        create_private_dir(&outside).unwrap();
+        symlink(&outside, fixture.store.temp_dir()).unwrap();
+        let lock = fixture.store.lock_owner_store_v1().unwrap();
+
+        let rendered = lock
+            .resume_owner_recovery_context_to_exact_new_v1(fixture.context())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            rendered.contains("recovery directory is invalid"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("outside-recovery-temp"), "{rendered}");
+        assert!(fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_from_s1_partial_prefix() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S1 {
@@ -10174,6 +10492,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_from_s1_full_prefix_before_merkle_publish() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S1 {
@@ -10181,21 +10500,25 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_from_s2() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S2);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_from_s3() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S3);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_resumes_idempotently_from_s4() {
         assert_owner_recovery_resumes_from_phase(PrivateHnswOwnerRecoveryPhaseV1::S4);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_publish_steps_require_exact_source_phase() {
         let temp = TempDir::new().unwrap();
@@ -10231,6 +10554,7 @@ mod tests {
         assert_eq!(fixture.store.read_current_epoch().unwrap(), old);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_non_prefix_bucket_progress() {
         let temp = TempDir::new().unwrap();
@@ -10257,6 +10581,7 @@ mod tests {
         assert!(!error.contains(&second.ciphertext));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_wrong_bucket_body_hash_and_commitment() {
         for mutation in 0..3 {
@@ -10296,6 +10621,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_wrong_merkle_state() {
         let temp = TempDir::new().unwrap();
@@ -10325,6 +10651,7 @@ mod tests {
         assert!(!error.contains(&fixture.new_state.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_wrong_commit_state() {
         let temp = TempDir::new().unwrap();
@@ -10347,6 +10674,7 @@ mod tests {
         assert!(!error.contains(&fixture.new_state.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_invalid_current_transition() {
         let temp = TempDir::new().unwrap();
@@ -10368,6 +10696,7 @@ mod tests {
         assert!(!error.contains(&fixture.new_state.root_hash));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_recovery_rejects_legacy_pending_writeback() {
         let temp = TempDir::new().unwrap();
@@ -10390,6 +10719,7 @@ mod tests {
         assert!(error.contains("rejects legacy pending writeback"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_store_canonical_digest_binds_historical_epoch_commits() {
         let temp = TempDir::new().unwrap();
@@ -10446,6 +10776,7 @@ mod tests {
         assert_ne!(first_history, replaced_history);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_store_rejects_excessive_epoch_directory_entries() {
         let temp = TempDir::new().unwrap();
@@ -10474,6 +10805,7 @@ mod tests {
         assert!(error.contains("canonical store state does not match"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_store_tokens_require_exact_old_or_exact_new_canonical_state() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -10539,6 +10871,7 @@ mod tests {
         assert!(!new_debug.contains(new_token.canonical_state_digest()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_store_exact_old_rejects_legacy_pending_and_concurrent_verifier() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();
@@ -10621,6 +10954,7 @@ mod tests {
         assert!(!error.contains(&future_digest));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn owner_store_exact_new_rejects_missing_digest_commit_and_bucket_mismatch() {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&[23; 32]).unwrap();

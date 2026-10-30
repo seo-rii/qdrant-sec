@@ -8488,8 +8488,20 @@
               "$ref": "#/components/schemas/SparseVectorParams"
             },
             "nullable": true
+          },
+          "encryption": {
+            "description": "Capability-oriented collection encryption rules. Secret key material is never stored here.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CollectionEncryptionConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "VectorsConfig": {
         "description": "Vector params separator for single and multiple vector modes Single mode:\n\n{ \"size\": 128, \"distance\": \"Cosine\" }\n\nor multiple mode:\n\n{ \"default\": { \"size\": 128, \"distance\": \"Cosine\" } }",
@@ -8875,6 +8887,149 @@
         "enum": [
           "none",
           "idf"
+        ]
+      },
+      "CollectionEncryptionConfig": {
+        "description": "Capability-oriented collection encryption rules.\n\nSecret key material is never stored here. Metadata selectors support server-side metadata value AEAD and client-generated exact-match blind-index token fields; range, geo, and full-text filtering remain unsupported over encrypted metadata values.",
+        "type": "object",
+        "required": [
+          "rules",
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 1
+          },
+          "key_id": {
+            "description": "Public key id recorded in encryption envelopes. Key material is resolved from runtime config.",
+            "type": "string",
+            "nullable": true
+          },
+          "crypto_schema_version": {
+            "default": 1,
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 1
+          },
+          "encryption_epoch": {
+            "default": 0,
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "migration_state": {
+            "$ref": "#/components/schemas/CryptoMigrationState"
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EncryptionRuleRef"
+            }
+          }
+        }
+      },
+      "CryptoMigrationState": {
+        "type": "string",
+        "enum": [
+          "disabled",
+          "encrypting",
+          "active",
+          "rotating",
+          "decrypting"
+        ]
+      },
+      "EncryptionRuleRef": {
+        "type": "object",
+        "required": [
+          "id",
+          "instance",
+          "selector"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "selector": {
+            "$ref": "#/components/schemas/EncryptionSelector"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "binding": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "EncryptionSelector": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "paths"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "payload_paths"
+                ]
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "names"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "vector_names"
+                ]
+              },
+              "names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "description": "Client-generated exact-match blind-index token fields.\n\nThese fields are ordinary searchable payload fields carrying opaque tokens. They must not overlap encrypted payload paths.",
+            "type": "object",
+            "required": [
+              "keys",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "metadata_keys"
+                ]
+              },
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
         ]
       },
       "HnswConfig": {
@@ -9866,7 +10021,47 @@
             }
           },
           {
+            "$ref": "#/components/schemas/PayloadEncryptedReadPolicy"
+          },
+          {
             "$ref": "#/components/schemas/PayloadSelector"
+          }
+        ]
+      },
+      "PayloadEncryptedReadPolicy": {
+        "type": "object",
+        "required": [
+          "encrypted_payload"
+        ],
+        "properties": {
+          "encrypted_payload": {
+            "$ref": "#/components/schemas/EncryptedPayloadReadMode"
+          }
+        },
+        "additionalProperties": false
+      },
+      "EncryptedPayloadReadMode": {
+        "oneOf": [
+          {
+            "description": "Return stored server/client encrypted markers unchanged.",
+            "type": "string",
+            "enum": [
+              "raw"
+            ]
+          },
+          {
+            "description": "Return payloads, but replace encrypted marker values with redaction sentinels.",
+            "type": "string",
+            "enum": [
+              "redacted"
+            ]
+          },
+          {
+            "description": "Request API-runtime server-side decryption for server-managed AEAD payload envelopes. Collection-internal reads reject this mode, and client-side envelopes remain opaque.",
+            "type": "string",
+            "enum": [
+              "decrypted"
+            ]
           }
         ]
       },
@@ -10206,12 +10401,121 @@
             }
           },
           {
+            "$ref": "#/components/schemas/NamedCkksEncryptedQueryVector"
+          },
+          {
             "$ref": "#/components/schemas/NamedVector"
           },
           {
             "$ref": "#/components/schemas/NamedSparseVector"
           }
         ]
+      },
+      "NamedCkksEncryptedQueryVector": {
+        "type": "object",
+        "required": [
+          "$qdrant_sec_ckks_query"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "$qdrant_sec_ckks_query": {
+            "$ref": "#/components/schemas/CkksEncryptedQueryVectorEnvelope"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CkksEncryptedQueryVectorEnvelope": {
+        "type": "object",
+        "required": [
+          "ciphertext",
+          "ciphertext_sha256",
+          "collection_id",
+          "context_digest",
+          "key_id",
+          "query_nonce",
+          "rk_epoch",
+          "rk_id",
+          "scheme",
+          "security_profile",
+          "signature",
+          "slots",
+          "vector_name",
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "scheme": {
+            "type": "string"
+          },
+          "security_profile": {
+            "type": "string"
+          },
+          "collection_id": {
+            "type": "string"
+          },
+          "vector_name": {
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "rk_id": {
+            "type": "string"
+          },
+          "rk_epoch": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "query_nonce": {
+            "type": "string"
+          },
+          "context_digest": {
+            "type": "string"
+          },
+          "slots": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "ciphertext_sha256": {
+            "type": "string"
+          },
+          "ciphertext": {
+            "type": "string"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/CkksEncryptedQuerySignature"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CkksEncryptedQuerySignature": {
+        "type": "object",
+        "required": [
+          "alg",
+          "key_id",
+          "sig"
+        ],
+        "properties": {
+          "alg": {
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "sig": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "NamedVector": {
         "description": "Dense vector data with name",
@@ -11543,6 +11847,17 @@
             },
             "nullable": true
           },
+          "encryption": {
+            "description": "Capability-oriented collection encryption rules. Secret key material is never stored here.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CollectionEncryptionConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
           "strict_mode_config": {
             "description": "Strict-mode config.",
             "anyOf": [
@@ -12056,7 +12371,8 @@
             "type": "boolean",
             "nullable": true
           }
-        }
+        },
+        "additionalProperties": false
       },
       "SparseVectorsConfig": {
         "type": "object",
@@ -13450,6 +13766,16 @@
                 "nullable": true
               }
             ]
+          },
+          "private_oram_external_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrivateOramExternalRecoveryTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
       },
@@ -13513,6 +13839,10 @@
           },
           "hide_jwt_dashboard": {
             "type": "boolean",
+            "nullable": true
+          },
+          "crypto_runtime_capability_fingerprint": {
+            "type": "string",
             "nullable": true
           },
           "startup": {
@@ -14366,6 +14696,37 @@
                 "$ref": "#/components/schemas/HnswConfig"
               }
             }
+          },
+          {
+            "description": "Use a CKKS ciphertext HNSW graph over encrypted vector sidecar payloads.\n\nThis index type is intentionally separate from the plaintext-vector HNSW file format because graph construction needs an OpenFHE scoring runtime.",
+            "type": "object",
+            "required": [
+              "options",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ckks_ciphertext_hnsw"
+                ]
+              },
+              "options": {
+                "type": "object",
+                "required": [
+                  "hnsw_config",
+                  "vector_name"
+                ],
+                "properties": {
+                  "hnsw_config": {
+                    "$ref": "#/components/schemas/HnswConfig"
+                  },
+                  "vector_name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
           }
         ]
       },
@@ -15160,6 +15521,11 @@
           "version": {
             "description": "Peer Qdrant version",
             "type": "string"
+          },
+          "crypto_runtime_capability_fingerprint": {
+            "description": "Non-secret digest of the crypto runtime capability policy.",
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -15338,6 +15704,49 @@
           "vector_io_write": {
             "type": "integer",
             "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "PrivateOramExternalRecoveryTelemetry": {
+        "type": "object",
+        "required": [
+          "preflight_scanned_entries",
+          "preflight_scanned_logical_bytes",
+          "reserved_bytes",
+          "staging_reservations",
+          "worker_limit",
+          "workers_in_use"
+        ],
+        "properties": {
+          "reserved_bytes": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "staging_reservations": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "worker_limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "workers_in_use": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "preflight_scanned_logical_bytes": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "preflight_scanned_entries": {
+            "type": "integer",
+            "format": "uint64",
             "minimum": 0
           }
         }
@@ -16949,9 +17358,24 @@
             "$ref": "#/components/schemas/Image"
           },
           {
+            "$ref": "#/components/schemas/CkksEncryptedQueryVector"
+          },
+          {
             "$ref": "#/components/schemas/InferenceObject"
           }
         ]
+      },
+      "CkksEncryptedQueryVector": {
+        "type": "object",
+        "required": [
+          "$qdrant_sec_ckks_query"
+        ],
+        "properties": {
+          "$qdrant_sec_ckks_query": {
+            "$ref": "#/components/schemas/CkksEncryptedQueryVectorEnvelope"
+          }
+        },
+        "additionalProperties": false
       },
       "Query": {
         "anyOf": [
@@ -18551,6 +18975,15 @@
             "additionalProperties": {
               "$ref": "#/components/schemas/DistributedPeerInfo"
             }
+          },
+          "crypto_runtime_capability_mismatches": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "nullable": true
           }
         }
       },
@@ -18632,6 +19065,11 @@
           },
           "consensus_thread_status": {
             "$ref": "#/components/schemas/ConsensusThreadStatus"
+          },
+          "crypto_runtime_capability_fingerprint": {
+            "description": "Non-secret crypto runtime capability fingerprint for peer parity checks.",
+            "type": "string",
+            "nullable": true
           }
         }
       }

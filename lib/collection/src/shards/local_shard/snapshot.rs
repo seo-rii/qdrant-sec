@@ -116,7 +116,7 @@ impl LocalShard {
                 #[cfg(feature = "staging")]
                 {
                     let delay_secs: f64 =
-                        std::env::var("QDRANT__STAGING__SNAPSHOT_SHARD_CLOCKS_DELAY")
+                        std::env::var("QDRANT_STAGING_SNAPSHOT_SHARD_CLOCKS_DELAY")
                             .ok()
                             .and_then(|str| str.parse().ok())
                             .unwrap_or(0.0);

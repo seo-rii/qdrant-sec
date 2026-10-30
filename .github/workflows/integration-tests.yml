@@ -73,7 +73,24 @@ jobs:
         run: uv --project tests run bash ./tests/integration-tests.sh distributed
         shell: bash
       - name: Run integration tests - multiple peers - pytest
-        run: uv --project tests run pytest tests/consensus_tests --durations=10
+        shell: bash
+        env:
+          PRIVATE_ORAM_CI_EVENT: ${{ github.event_name }}
+          PRIVATE_ORAM_CI_BASE: ${{ github.base_ref }}
+        run: |
+          pytest_args=()
+          # Match qdrant-sec-ci.yml's PR base filters, where '*' cannot include a slash.
+          if [[ "$PRIVATE_ORAM_CI_EVENT" == "pull_request" && "$PRIVATE_ORAM_CI_BASE" != */*/* ]]; then
+            case "$PRIVATE_ORAM_CI_BASE" in
+              sec | feat/oram-* | fix/oram-*)
+                # The dedicated cluster job runs this exact glob with the required crash hooks.
+                for test_file in tests/consensus_tests/test_private_oram_*.py; do
+                  pytest_args+=(--ignore="$test_file")
+                done
+                ;;
+            esac
+          fi
+          uv --project tests run pytest tests/consensus_tests --durations=10 -m "not private_oram_upgrade" "${pytest_args[@]}"
         timeout-minutes: 60
       - name: upload logs
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

@@ -13,6 +13,23 @@ N_REPLICAS = 1
 COLLECTION_NAME = "test_collection_strict_mode"
 
 
+
+def assert_storage_limit_rejection(response, limit, peer_urls, peer_url, point, shard_key=None):
+    assert response.status_code == 400, response.text
+    error = response.json()["status"]["error"]
+    # Remote shard errors intentionally expose only the gRPC status code.
+    assert limit in error or error == "Wrong input: InvalidArgument", error
+
+    # The exact rejected request must succeed when the configured limit is disabled.
+    # This distinguishes a limit rejection from another sanitized InvalidArgument error.
+    set_strict_mode(peer_url, COLLECTION_NAME, {"enabled": False})
+    for url in peer_urls:
+        wait_for_strict_mode_disabled(url, COLLECTION_NAME)
+    upsert_points(
+        peer_url, [point], collection_name=COLLECTION_NAME, shard_key=shard_key
+    ).raise_for_status()
+
+
 def test_vector_storage_strict_mode_upsert(tmp_path: pathlib.Path):
     peer_urls, peer_dirs, bootstrap_url = start_cluster(tmp_path, 4)
 
@@ -34,7 +51,9 @@ def test_vector_storage_strict_mode_upsert(tmp_path: pathlib.Path):
             point = {"id": 1001, "payload": {}, "vector": random_dense_vector()}
             res = upsert_points(peer_url, [point], collection_name=COLLECTION_NAME)
             if not res.ok:
-                assert "Max vector storage size" in res.json()['status']['error']
+                assert_storage_limit_rejection(
+                    res, "Max vector storage size", peer_urls, peer_url, point
+                )
                 return
 
     raise AssertionError("Should have blocked upsert but didn't")
@@ -76,8 +95,10 @@ def test_vector_storage_strict_mode_upsert_no_local_shard(tmp_path: pathlib.Path
         point = {"id": 3, "payload": {}, "vector": random_dense_vector()}
         res = upsert_points(peer_urls[0], [point], collection_name=COLLECTION_NAME, shard_key="non_leader")
         if not res.ok:
-            assert "Max vector storage size" in res.json()['status']['error']
-            assert not res.ok
+            assert_storage_limit_rejection(
+                res, "Max vector storage size", peer_urls, peer_urls[0], point,
+                shard_key="non_leader",
+            )
             return
 
     raise AssertionError("Should have blocked upsert but didn't")
@@ -109,8 +130,9 @@ def test_vector_storage_strict_mode_upsert_local_shard(tmp_path: pathlib.Path):
         point = {"id": 3, "payload": {}, "vector": random_dense_vector()}
         res = upsert_points(peer_urls[0], [point], collection_name=COLLECTION_NAME)
         if not res.ok:
-            assert "Max vector storage size" in res.json()['status']['error']
-            assert not res.ok
+            assert_storage_limit_rejection(
+                res, "Max vector storage size", peer_urls, peer_urls[0], point
+            )
             return
 
     raise AssertionError("Should have blocked upsert but didn't")
@@ -138,7 +160,9 @@ def test_payload_strict_mode_upsert(tmp_path: pathlib.Path):
             point = {"id": 1001, "payload": {"city": "Berlin"}, "vector": random_dense_vector()}
             res = upsert_points(peer_url, [point], collection_name=COLLECTION_NAME)
             if not res.ok:
-                assert "Max payload storage size" in res.json()['status']['error']
+                assert_storage_limit_rejection(
+                    res, "Max payload storage size", peer_urls, peer_url, point
+                )
                 return
 
     raise AssertionError("Should have blocked upsert but didn't")
@@ -183,8 +207,10 @@ def test_payload_strict_mode_upsert_no_local_shard(tmp_path: pathlib.Path):
         point = {"id": 3, "payload": payload, "vector": random_dense_vector()}
         res = upsert_points(peer_urls[0], [point], collection_name=COLLECTION_NAME, shard_key="non_leader")
         if not res.ok:
-            assert "Max payload storage size" in res.json()['status']['error']
-            assert not res.ok
+            assert_storage_limit_rejection(
+                res, "Max payload storage size", peer_urls, peer_urls[0], point,
+                shard_key="non_leader",
+            )
             return
 
     raise AssertionError("Should have blocked upsert but didn't")

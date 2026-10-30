@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::Path;
 use std::str;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -13,6 +14,7 @@ use chrono::Utc;
 use collection::collection_state;
 use collection::common::is_ready::IsReady;
 use collection::operations::types::PeerMetadata;
+use collection::private_oram_owner_journal::PrivateOramOwnerNewGenerationReadinessExpectationV2;
 use collection::shards::CollectionId;
 use collection::shards::shard::PeerId;
 use common::defaults;
@@ -49,6 +51,8 @@ use tonic::transport::Uri;
 
 use super::CollectionContainer;
 use super::alias_mapping::AliasMapping;
+#[cfg(feature = "staging")]
+use super::collection_meta_ops::CollectionMetaOperations;
 use super::consensus_ops::{
     ApplyPrivateOramMutationMaterialV2, ConfirmPrivateOramMutationAuthorityV2, ConsensusOperations,
     PrivateOramCollectionLayoutTransition, PrivateOramConsensusCollectionStateV2,
@@ -82,13 +86,20 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::append_res
     private_oram_mutation_reservation_intent_v3,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
-    DecodedPrivateOramMutationAuthorityWireV2, PrivateOramMutationPendingReservationChallengeV1,
+    DecodedPrivateOramMutationAuthorityWireV2,
+    PrivateOramMutationOwnerEnrollmentPlanV2 as InternalPrivateOramOwnerEnrollmentPlanV2,
+    PrivateOramMutationPendingReservationChallengeV1,
     PrivateOramMutationRecoveryCapsulesCertificateV2,
     PrivateOramMutationReservationChallengeOutcomeKindV1,
     encode_private_oram_mutation_reservation_challenge_cancellation_v1,
     encode_private_oram_mutation_reservation_outcome_acknowledgement_v1,
     private_oram_mutation_reservation_challenge_cancellation_v1,
     private_oram_mutation_reservation_outcome_acknowledgement_v1,
+};
+pub use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
+    PrivateOramMutationPreadmissionRecoveryCandidateV2,
+    PrivateOramMutationPreparedAppendSnapshotV2,
+    PrivateOramMutationRejectedAdmissionAcknowledgementV2,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::format::PrivateOramMutationFormatFloorV2;
 use crate::content_manager::consensus::private_oram_mutation_cleanup::owner_checkpoint::{
@@ -129,6 +140,51 @@ pub mod prelude {
 
 /// Allow us updating our peer metadata once every 60 seconds
 const CONSENSUS_PEER_METADATA_UPDATE_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(feature = "staging")]
+const PRIVATE_ORAM_STAGING_APPLY_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_EXTERNAL_RECOVERY_APPLY_PAUSE_FILE";
+#[cfg(feature = "staging")]
+const PRIVATE_ORAM_STAGING_SNAPSHOT_AUTHORITY_APPLY_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_SNAPSHOT_AUTHORITY_APPLY_PAUSE_FILE";
+
+#[cfg(feature = "staging")]
+fn private_oram_staging_pause_before_consensus_apply(operation: &ConsensusOperations) {
+    let (pause_file_env, reached_message, released_message) = match operation {
+        ConsensusOperations::ApplyPrivateOramExternalRecovery(_) => (
+            PRIVATE_ORAM_STAGING_APPLY_PAUSE_FILE_ENV,
+            "Private ORAM staging external recovery consensus apply pause reached",
+            "Private ORAM staging external recovery consensus apply pause released",
+        ),
+        ConsensusOperations::CollectionMeta(operation)
+            if matches!(
+                operation.as_ref(),
+                CollectionMetaOperations::UpdateCollection(_)
+            ) =>
+        {
+            (
+                PRIVATE_ORAM_STAGING_SNAPSHOT_AUTHORITY_APPLY_PAUSE_FILE_ENV,
+                "Private ORAM staging snapshot authority consensus apply pause reached",
+                "Private ORAM staging snapshot authority consensus apply pause released",
+            )
+        }
+        _ => return,
+    };
+    let Some(pause_file) = std::env::var_os(pause_file_env) else {
+        return;
+    };
+    let pause_file = Path::new(&pause_file);
+    if !pause_file.exists() {
+        return;
+    }
+    log::warn!("{reached_message}");
+    while pause_file.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    log::warn!("{released_message}");
+}
+
+#[cfg(not(feature = "staging"))]
+fn private_oram_staging_pause_before_consensus_apply(_operation: &ConsensusOperations) {}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SnapshotData {
@@ -279,6 +335,15 @@ impl LinearizablePrivateOramMutationReconcileSnapshotV2 {
 
     pub(in crate::content_manager) const fn applied_index(&self) -> u64 {
         self.applied_index
+    }
+
+    #[doc(hidden)]
+    pub fn active_parent_watermark_sequence(&self) -> Option<u64> {
+        let active_generation = self.snapshot.lease_slot().active.as_ref()?.generation;
+        self.snapshot
+            .parent_watermark()
+            .filter(|watermark| watermark.lease_generation() == active_generation)
+            .map(PrivateOramMutationParentWatermarkV2::sequence)
     }
 
     pub(in crate::content_manager) fn into_snapshot(
@@ -468,6 +533,23 @@ pub enum PrivateOramMutationV2ActivationStatus {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub enum PrivateOramOwnerEnrollmentPlanV2 {
+    Missing(PrivateOramOwnerEnrollmentPreparedV1),
+    Pending(PrivateOramOwnerEnrollmentPreparedV1),
+    Active,
+}
+
+impl fmt::Debug for PrivateOramOwnerEnrollmentPlanV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(_) => formatter.write_str("Missing([redacted])"),
+            Self::Pending(_) => formatter.write_str("Pending([redacted])"),
+            Self::Active => formatter.write_str("Active"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PrivateOramPeerRecoverySignerPin {
     signer: PrivateOramPeerRecoveryPublicKeyV1,
     registry_generation: u64,
@@ -613,6 +695,8 @@ impl PrivateOramReservationChallengeDispositionV3 {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PrivateOramReservationOutcomeRecoveryV3 {
     outcome_digest: String,
+    controller_peer_id: PeerId,
+    preparing_lease: PrivateOramMutationLease,
     owner_contexts: Vec<PrivateOramOwnerReservationPrepareContextV3>,
     disposition: PrivateOramReservationChallengeDispositionV3,
 }
@@ -622,6 +706,7 @@ impl fmt::Debug for PrivateOramReservationOutcomeRecoveryV3 {
         formatter
             .debug_struct("PrivateOramReservationOutcomeRecoveryV3")
             .field("outcome_digest", &"[redacted]")
+            .field("controller_peer_id", &self.controller_peer_id)
             .field("owner_count", &self.owner_contexts.len())
             .field("disposition", &self.disposition)
             .finish()
@@ -631,6 +716,27 @@ impl fmt::Debug for PrivateOramReservationOutcomeRecoveryV3 {
 impl PrivateOramReservationOutcomeRecoveryV3 {
     pub fn outcome_digest(&self) -> &str {
         &self.outcome_digest
+    }
+
+    pub fn matches_active_controller_lease(
+        &self,
+        controller_peer_id: PeerId,
+        active_lease: &PrivateOramMutationLease,
+    ) -> bool {
+        let preparing = &self.preparing_lease;
+        self.controller_peer_id == controller_peer_id
+            && preparing.owner_peer_id == controller_peer_id
+            && preparing.generation == active_lease.generation
+            && preparing.collection_id == active_lease.collection_id
+            && preparing.owner_peer_id == active_lease.owner_peer_id
+            && preparing.mutation_id == active_lease.mutation_id
+            && preparing.signed_mutation_digest == active_lease.signed_mutation_digest
+            && preparing.transition_digest == active_lease.transition_digest
+            && preparing.base_record_digest == active_lease.base_record_digest
+            && preparing.base_state_sequence == active_lease.base_state_sequence
+            && preparing.writer_lease_digest == active_lease.writer_lease_digest
+            && preparing.writer_fence == active_lease.writer_fence
+            && preparing.issued_at_unix == active_lease.issued_at_unix
     }
 
     pub fn owner_contexts(&self) -> &[PrivateOramOwnerReservationPrepareContextV3] {
@@ -735,6 +841,8 @@ pub struct ConsensusManager<C: CollectionContainer> {
     current_peer_metadata: PeerMetadata,
     /// Last time we attempted to update the peer metadata
     next_peer_metadata_update_attempt: Mutex<Instant>,
+    private_oram_snapshot_barrier_process_incarnation: [u8; 16],
+    private_oram_snapshot_barrier_sequence: AtomicU64,
 }
 
 enum NormalEntryCursorDisposition {
@@ -844,6 +952,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             message_send_failures: Default::default(),
             current_peer_metadata,
             next_peer_metadata_update_attempt: Mutex::new(Instant::now()),
+            private_oram_snapshot_barrier_process_incarnation: *uuid::Uuid::new_v4().as_bytes(),
+            private_oram_snapshot_barrier_sequence: AtomicU64::new(1),
         })
     }
 
@@ -1612,6 +1722,100 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.private_oram_mutation_v2_expected_aggregate_digest(key)
     }
 
+    pub fn private_oram_mutation_owner_new_generation_readiness_expectation_v2(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: PeerId,
+    ) -> Result<PrivateOramOwnerNewGenerationReadinessExpectationV2, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM mutation V2 is not active".to_string(),
+            });
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_owner_new_generation_readiness_expectation_v2(key, owner_peer_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn private_oram_mutation_v2_owner_enrollment_plan(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: PeerId,
+        owner_signer: PrivateOramOwnerCleanupSignerV1,
+        owner_store_incarnation_digest: String,
+        owner_enrollment_id: String,
+        authority_registry_digest: String,
+        owner_registry_digest: String,
+        enrollment_operation_id: String,
+    ) -> Result<PrivateOramOwnerEnrollmentPlanV2, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM mutation V2 is not active".to_string(),
+            });
+        }
+        let persistent = self.persistent.read();
+        let layout = persistent
+            .private_oram_layout(&PrivateOramLayoutKey {
+                collection_id: key.collection_id.clone(),
+            })
+            .ok_or_else(|| {
+                StorageError::bad_request("private ORAM mutation owner layout is unavailable")
+            })?;
+        if layout.owner_peer_ids.binary_search(&owner_peer_id).is_err() {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation owner enrollment peer is not in the collection layout",
+            ));
+        }
+        let plan = persistent.private_oram_mutation_v2_owner_enrollment_plan(
+            key,
+            owner_peer_id,
+            owner_signer,
+            owner_store_incarnation_digest,
+            owner_enrollment_id,
+            authority_registry_digest,
+            owner_registry_digest,
+            enrollment_operation_id,
+        )?;
+        Ok(match plan {
+            InternalPrivateOramOwnerEnrollmentPlanV2::Missing(prepared) => {
+                PrivateOramOwnerEnrollmentPlanV2::Missing(prepared)
+            }
+            InternalPrivateOramOwnerEnrollmentPlanV2::Pending(prepared) => {
+                PrivateOramOwnerEnrollmentPlanV2::Pending(prepared)
+            }
+            InternalPrivateOramOwnerEnrollmentPlanV2::Active => {
+                PrivateOramOwnerEnrollmentPlanV2::Active
+            }
+        })
+    }
+
+    pub fn private_oram_mutation_v2_owner_roster_is_active(
+        &self,
+        key: &PrivateOramMutationKey,
+        layout: &PrivateOramConsensusLayout,
+    ) -> Result<bool, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(false);
+        }
+        let persistent = self.persistent.read();
+        if persistent.private_oram_layout(&PrivateOramLayoutKey {
+            collection_id: key.collection_id.clone(),
+        }) != Some(layout.clone())
+        {
+            return Ok(false);
+        }
+        Ok(persistent
+            .private_oram_mutation_v2_owner_checkpoint_table(key)?
+            .enrollment_roster_is_active(&layout.owner_peer_ids))
+    }
+
     pub fn private_oram_mutation_v2_append_authority_context(
         &self,
         key: &PrivateOramMutationKey,
@@ -2065,7 +2269,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                         "private ORAM reservation outcome predates owner resolution recovery"
                             .to_string(),
                 })?;
-        let owner_contexts =
+        let (controller_peer_id, preparing_lease, owner_contexts) =
             Self::private_oram_mutation_v3_owner_reservation_contexts_from_canonical(
                 challenge_canonical_json,
                 outcome.challenge_digest(),
@@ -2088,6 +2292,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         };
         Ok(Some(PrivateOramReservationOutcomeRecoveryV3 {
             outcome_digest: outcome.outcome_digest().to_string(),
+            controller_peer_id,
+            preparing_lease,
             owner_contexts,
             disposition,
         }))
@@ -2136,13 +2342,21 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             expected_challenge_digest,
             challenge_applied,
         )
+        .map(|(_, _, owner_contexts)| owner_contexts)
     }
 
     fn private_oram_mutation_v3_owner_reservation_contexts_from_canonical(
         challenge_canonical_json: &str,
         expected_challenge_digest: &str,
         challenge_applied: &PrivateOramRaftApplyLocatorV2,
-    ) -> Result<Vec<PrivateOramOwnerReservationPrepareContextV3>, StorageError> {
+    ) -> Result<
+        (
+            PeerId,
+            PrivateOramMutationLease,
+            Vec<PrivateOramOwnerReservationPrepareContextV3>,
+        ),
+        StorageError,
+    > {
         let prepared = decode_private_oram_mutation_prepared_reservation_challenge_v3(
             challenge_canonical_json,
         )
@@ -2167,7 +2381,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         let owner_count = u32::try_from(expectations.len()).map_err(|_| {
             StorageError::service_error("private ORAM reservation challenge owner set is corrupt")
         })?;
-        targets
+        let owner_contexts = targets
             .iter()
             .zip(expectations)
             .zip(nonces)
@@ -2238,7 +2452,12 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     expected_owner_signer: expectation.owner_signer().clone(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            base.controller_peer_id(),
+            base.preparing_lease().clone(),
+            owner_contexts,
+        ))
     }
 
     pub fn private_oram_mutation_v3_append_reservation_operation(
@@ -2501,6 +2720,104 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         ))
     }
 
+    pub(crate) fn private_oram_mutation_v2_prepared_rejection_operation(
+        &self,
+        lease: &PrivateOramMutationLease,
+        manifest: &PrivateOramMutationAllOwnersPrestagedV2,
+        expected: &str,
+    ) -> Result<ConsensusOperations, StorageError> {
+        let key = PrivateOramMutationKey {
+            collection_id: lease.collection_id.clone(),
+        };
+        let candidate = self
+            .private_oram_mutation_v2_preadmission_recovery_candidate(&key)?
+            .ok_or_else(|| StorageError::PreconditionFailed {
+                description: "private ORAM prepared append is no longer retained".to_string(),
+            })?;
+        let prepared =
+            candidate
+                .prepared_snapshot()
+                .ok_or_else(|| StorageError::PreconditionFailed {
+                    description: "private ORAM append is no longer prepared".to_string(),
+                })?;
+        if candidate.lease() != lease
+            || candidate.manifest() != manifest
+            || prepared.expected_aggregate_digest() != expected
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM prepared rejection authority changed".to_string(),
+            });
+        }
+        let canonical = encode_private_oram_mutation_admission_recovery_manifest_v2(manifest)
+            .map_err(|_| {
+                StorageError::bad_request("private ORAM prepared rejection manifest is invalid")
+            })?;
+        self.private_oram_mutation_v2_admission_rejected_operation_at_expected(
+            lease.clone(),
+            canonical,
+            expected.to_string(),
+        )
+    }
+
+    /// Captures reservation, prepared manifest and aggregate authority under one read guard.
+    pub fn private_oram_mutation_v2_preadmission_recovery_candidate(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Result<Option<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(None);
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_preadmission_recovery_candidate(key)
+    }
+
+    pub fn private_oram_mutation_v2_preadmission_recovery_candidates(
+        &self,
+    ) -> Result<Vec<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(Vec::new());
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_preadmission_recovery_candidates()
+    }
+
+    pub fn private_oram_mutation_v2_rejected_admission_acknowledgement(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+    ) -> Result<Option<PrivateOramMutationRejectedAdmissionAcknowledgementV2>, StorageError> {
+        if self.private_oram_mutation_v2_activation_status()?
+            != PrivateOramMutationV2ActivationStatus::Active
+        {
+            return Ok(None);
+        }
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_rejected_admission_acknowledgement(key, lease)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_retained_admission_outcome(
+        &self,
+        lease: &PrivateOramMutationLease,
+        manifest_digest: &str,
+    ) -> Result<Option<bool>, StorageError> {
+        self.persistent
+            .read()
+            .private_oram_mutation_v2_retained_admission_outcome(
+                &PrivateOramMutationKey {
+                    collection_id: lease.collection_id.clone(),
+                },
+                lease,
+                manifest_digest,
+            )
+    }
+
     pub fn private_oram_mutation_v2_renewal_operation(
         &self,
         lease: PrivateOramMutationLease,
@@ -2514,6 +2831,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         ))
     }
 
+    #[cfg(test)]
     pub fn private_oram_mutation_v2_abort_decision_operation(
         &self,
         lease: PrivateOramMutationLease,
@@ -3209,6 +3527,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         context: NormalEntryApplyContext,
     ) -> Result<NormalEntryApplyOutcome, StorageError> {
         let operation: ConsensusOperations = entry.try_into()?;
+        private_oram_staging_pause_before_consensus_apply(&operation);
         let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
         let mut cursor_disposition = NormalEntryCursorDisposition::NeedsSeparateCommit;
         let result = match operation {
@@ -3318,6 +3637,29 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     )),
                 }
             }
+            ConsensusOperations::EnrollPrivateOramMutationStateV2(operation) => match context {
+                NormalEntryApplyContext::CommittedAtCurrentCursor => match self
+                    .persistent
+                    .write()
+                    .enroll_private_oram_mutation_state_v2_at_applied_entry(&operation, entry.index)
+                {
+                    Ok(PrivateOramMutationAtEntryOutcome::Applied) => {
+                        cursor_disposition = NormalEntryCursorDisposition::Committed(entry.index);
+                        Ok(true)
+                    }
+                    Ok(PrivateOramMutationAtEntryOutcome::Rejected(error)) => {
+                        cursor_disposition = NormalEntryCursorDisposition::Committed(entry.index);
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                },
+                #[cfg(test)]
+                NormalEntryApplyContext::DetachedForTest => self
+                    .persistent
+                    .write()
+                    .enroll_private_oram_mutation_state_v2(&operation)
+                    .map(|()| true),
+            },
             ConsensusOperations::CompareAndSwapPrivateOramMutationLease(operation) => match context
             {
                 NormalEntryApplyContext::CommittedAtCurrentCursor => match self
@@ -3449,6 +3791,10 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     "private ORAM V2 material operation requires a committed Raft entry",
                 )),
             },
+            ConsensusOperations::PrivateOramSnapshotBarrierV2(operation) => {
+                operation.validate()?;
+                Ok(true)
+            }
             ConsensusOperations::ApplyPrivateOramExternalRecovery(operation) => self
                 .persistent
                 .write()
@@ -3762,6 +4108,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             )?;
             persistent.validate_private_oram_mutation_floor_for_snapshot(
                 private_oram_mutation_format_floor.as_ref(),
+                &private_oram_mutation_states,
                 &private_oram_mutation_lease_slots,
                 meta.index,
             )?;
@@ -3882,6 +4229,39 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
     pub fn add_peer(&self, peer_id: PeerId, uri: Uri) -> Result<(), StorageError> {
         self.persistent.write().insert_peer(peer_id, uri)
+    }
+
+    /// Completes an exact AddPeer retry that is already present in stable committed membership.
+    /// No Raft entry or configuration change is needed: re-adding a voter as a learner would
+    /// demote it. An address by itself is insufficient, since bootstrap preloads peer addresses.
+    pub fn complete_registered_peer_add(&self, peer_id: PeerId, uri: &Uri) -> bool {
+        let persistent = self.persistent.read();
+        let configuration = &persistent.state().conf_state;
+        let is_member =
+            configuration.voters.contains(&peer_id) || configuration.learners.contains(&peer_id);
+        if !configuration.voters_outgoing.is_empty()
+            || !configuration.learners_next.is_empty()
+            || !is_member
+            || persistent.peer_address_by_id.read().get(&peer_id) != Some(uri)
+        {
+            return false;
+        }
+        let operation = ConsensusOperations::AddPeer {
+            peer_id,
+            uri: uri.to_string(),
+        };
+        let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
+        drop(persistent);
+        if let Some(on_apply) = on_apply
+            && on_apply
+                .send(Ok(ConsensusApplyReceipt::configuration_change(true)))
+                .is_err()
+        {
+            log::warn!(
+                "Failed to notify on consensus operation completion: channel receiver is dropped"
+            );
+        }
+        true
     }
 
     pub fn remove_peer(&self, peer_id: PeerId) -> Result<(), StorageError> {
@@ -4110,6 +4490,56 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             .await
     }
 
+    /// Orders a private ORAM snapshot validation after every previously committed Raft entry.
+    fn next_private_oram_snapshot_barrier_operation(
+        &self,
+    ) -> Result<ConsensusOperations, StorageError> {
+        let sequence = self
+            .private_oram_snapshot_barrier_sequence
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| {
+                StorageError::service_error(
+                    "private ORAM snapshot consensus barrier sequence exhausted",
+                )
+            })?;
+        Ok(ConsensusOperations::PrivateOramSnapshotBarrierV2(
+            crate::content_manager::consensus_ops::PrivateOramSnapshotBarrierV2 {
+                version:
+                    crate::content_manager::consensus_ops::PRIVATE_ORAM_SNAPSHOT_BARRIER_VERSION,
+                requester_peer_id: self.this_peer_id(),
+                process_incarnation: self.private_oram_snapshot_barrier_process_incarnation,
+                sequence,
+            },
+        ))
+    }
+
+    /// Orders a private ORAM snapshot validation after every previously committed Raft entry.
+    pub async fn linearizable_private_oram_snapshot_barrier(
+        &self,
+        wait_timeout: Option<Duration>,
+    ) -> Result<u64, StorageError> {
+        let receipt = self
+            .propose_consensus_op_with_local_apply_receipt(
+                self.next_private_oram_snapshot_barrier_operation()?,
+                wait_timeout,
+            )
+            .await?;
+        if !receipt.applied {
+            return Err(StorageError::service_error(
+                "private ORAM snapshot consensus barrier was not applied",
+            ));
+        }
+        receipt.local_applied_index.ok_or_else(|| {
+            StorageError::service_error(
+                "private ORAM snapshot consensus barrier has no local apply receipt",
+            )
+        })
+    }
+
     pub fn peer_address_by_id(&self) -> PeerAddressById {
         self.persistent.read().peer_address_by_id()
     }
@@ -4226,6 +4656,21 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             activation_authority: persistent.private_oram_activation_authority_locator(),
             cleanup_lifecycle: persistent.private_oram_mutation_cleanup_lifecycle(key),
         })
+    }
+
+    /// Captures the commit state and lease slot under one applied-state read guard.
+    pub(crate) fn private_oram_mutation_commit_projection_v2(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Option<(
+        PrivateOramConsensusCollectionStateV2,
+        PrivateOramMutationLeaseSlotV2,
+    )> {
+        let persistent = self.persistent.read();
+        Some((
+            persistent.private_oram_mutation_state(key)?,
+            persistent.private_oram_mutation_lease_slot(key)?,
+        ))
     }
 
     /// Confirms one exact active mutation generation through Raft and captures its paired state.
@@ -4760,7 +5205,11 @@ mod tests {
     use tempfile::Builder;
     use uuid::Uuid;
 
-    use super::{ConsensusManager, SnapshotData};
+    use super::{
+        ConsensusManager, PrivateOramReservationChallengeDispositionKindV3,
+        PrivateOramReservationChallengeDispositionV3, PrivateOramReservationOutcomeRecoveryV3,
+        SnapshotData,
+    };
     use crate::content_manager::CollectionContainer;
     use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
     use crate::content_manager::consensus::entry_queue::EntryApplyProgressQueue;
@@ -4780,15 +5229,15 @@ mod tests {
         PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION, PrivateOramCollectionLayoutTransition,
         PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
         PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2,
-        PrivateOramEpochKey, PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryLease,
-        PrivateOramExternalRecoveryLeasePhase, PrivateOramExternalRecoveryOperation,
-        PrivateOramExternalRecoveryPhase, PrivateOramExternalRecoveryState, PrivateOramIndexKind,
-        PrivateOramLayoutIndexStateBinding, PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding,
-        PrivateOramLayoutTransitionState, PrivateOramMutationKey, PrivateOramMutationLease,
-        PrivateOramMutationLeasePhase, PrivateOramMutationLeaseSlotV2,
-        PrivateOramReshardingLayoutTransition, PrivateOramReshardingOperation,
-        PrivateOramSessionLease, PrivateOramShardTransferFinish, PrivateOramShardTransferStart,
-        canonical_private_oram_consensus_state_record_digest,
+        PrivateOramEpochKey, PrivateOramExternalRecoveryAuthority, PrivateOramExternalRecoveryKey,
+        PrivateOramExternalRecoveryLease, PrivateOramExternalRecoveryLeasePhase,
+        PrivateOramExternalRecoveryOperation, PrivateOramExternalRecoveryPhase,
+        PrivateOramExternalRecoveryState, PrivateOramIndexKind, PrivateOramLayoutIndexStateBinding,
+        PrivateOramLayoutKey, PrivateOramLayoutLeaseBinding, PrivateOramLayoutTransitionState,
+        PrivateOramMutationKey, PrivateOramMutationLease, PrivateOramMutationLeasePhase,
+        PrivateOramMutationLeaseSlotV2, PrivateOramReshardingLayoutTransition,
+        PrivateOramReshardingOperation, PrivateOramSessionLease, PrivateOramShardTransferFinish,
+        PrivateOramShardTransferStart, canonical_private_oram_consensus_state_record_digest,
         canonical_private_oram_index_state_digest,
     };
 
@@ -4847,6 +5296,48 @@ mod tests {
             raft_state: StateRole::Leader,
         });
         manager
+    }
+
+    #[test]
+    fn private_oram_reservation_recovery_authorizes_only_immutable_controller_lease_lineage() {
+        let digest = |byte| BASE64URL_NOPAD.encode(&[byte; 32]);
+        let preparing_lease = PrivateOramMutationLease {
+            generation: 7,
+            collection_id: "collection-uuid".to_string(),
+            owner_peer_id: 11,
+            mutation_id: digest(1),
+            signed_mutation_digest: digest(2),
+            transition_digest: digest(3),
+            base_record_digest: digest(4),
+            base_state_sequence: 9,
+            writer_lease_digest: digest(5),
+            writer_fence: 7,
+            issued_at_unix: 100,
+            expires_at_unix: 200,
+            renewal_revision: 0,
+            phase: PrivateOramMutationLeasePhase::Preparing,
+        };
+        let recovery = PrivateOramReservationOutcomeRecoveryV3 {
+            outcome_digest: digest(6),
+            controller_peer_id: 11,
+            preparing_lease: preparing_lease.clone(),
+            owner_contexts: Vec::new(),
+            disposition: PrivateOramReservationChallengeDispositionV3 {
+                kind: PrivateOramReservationChallengeDispositionKindV3::Finalized,
+                resolution_applied_term: 3,
+                resolution_applied_index: 20,
+                finalized_reservation_digest: Some(digest(7)),
+            },
+        };
+
+        assert!(recovery.matches_active_controller_lease(11, &preparing_lease));
+        let mut renewed = preparing_lease.clone();
+        renewed.expires_at_unix = 300;
+        renewed.renewal_revision = 1;
+        assert!(recovery.matches_active_controller_lease(11, &renewed));
+        assert!(!recovery.matches_active_controller_lease(13, &renewed));
+        renewed.mutation_id = digest(8);
+        assert!(!recovery.matches_active_controller_lease(11, &renewed));
     }
 
     #[test]
@@ -4971,6 +5462,49 @@ mod tests {
         assert!(
             manager
                 .require_private_oram_activation_coordinator_is_local_leader()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn private_oram_activation_proposal_ignores_applied_pending_conf_index() {
+        let dir = Builder::new()
+            .prefix("private_oram_activation_applied_conf")
+            .tempdir()
+            .unwrap();
+        let manager = setup_private_oram_activation_probe_manager(dir.path());
+        let fixture = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+        manager
+            .set_hard_state(HardState {
+                term: fixture.current_term,
+                commit: fixture.base_index,
+                ..Default::default()
+            })
+            .unwrap();
+        {
+            let mut persistent = manager.persistent.write();
+            persistent.latest_snapshot_meta.index = fixture.base_index;
+            persistent.latest_snapshot_meta.term = fixture.base_entry_term;
+        }
+
+        manager
+            .validate_private_oram_mutation_activation_proposal(
+                &fixture.prepare_operation,
+                fixture.current_term,
+                fixture.base_index,
+                fixture.base_index,
+                fixture.base_index,
+            )
+            .unwrap();
+        assert!(
+            manager
+                .validate_private_oram_mutation_activation_proposal(
+                    &fixture.prepare_operation,
+                    fixture.current_term,
+                    fixture.base_index,
+                    fixture.base_index,
+                    fixture.base_index + 1,
+                )
                 .is_err()
         );
     }
@@ -5143,6 +5677,49 @@ mod tests {
 
         let state_loaded = Persistent::load_or_init(dir.path(), false, false, None).unwrap();
         assert_eq!(state_loaded.this_peer_id, 101);
+    }
+
+    #[test]
+    fn private_oram_snapshot_barrier_identity_is_unique_across_processes_and_sequences() {
+        let root = Builder::new()
+            .prefix("private_oram_snapshot_barrier_identity")
+            .tempdir()
+            .unwrap();
+        let manager = |path: &std::path::Path| {
+            let persistent = Persistent::load_or_init(path, true, false, Some(101)).unwrap();
+            let (sender, _) = mpsc::channel();
+            ConsensusManager::new(
+                persistent,
+                Arc::new(NoCollections::default()),
+                OperationSender::new(sender),
+                path,
+                PeerMetadata::current(),
+            )
+            .unwrap()
+        };
+        let first_manager = manager(&root.path().join("first"));
+        let second_manager = manager(&root.path().join("second"));
+
+        let first = first_manager
+            .next_private_oram_snapshot_barrier_operation()
+            .unwrap();
+        let next = first_manager
+            .next_private_oram_snapshot_barrier_operation()
+            .unwrap();
+        let restarted = second_manager
+            .next_private_oram_snapshot_barrier_operation()
+            .unwrap();
+
+        assert_ne!(first, next);
+        assert_ne!(first, restarted);
+        assert_ne!(next, restarted);
+        for operation in [first, next, restarted] {
+            let ConsensusOperations::PrivateOramSnapshotBarrierV2(barrier) = operation else {
+                panic!("expected private ORAM snapshot barrier operation");
+            };
+            barrier.validate().unwrap();
+            assert_eq!(barrier.requester_peer_id, 101);
+        }
     }
 
     #[test]
@@ -6301,6 +6878,108 @@ mod tests {
     }
 
     #[test]
+    fn registered_peer_add_completes_exact_members_without_rewriting_membership() {
+        let dir = Builder::new()
+            .prefix("registered_peer_add")
+            .tempdir()
+            .unwrap();
+        let (manager, _) = setup_storages(Vec::new(), dir.path());
+        let voter_uri: tonic::transport::Uri = "http://voter:6335".parse().unwrap();
+        let learner_uri: tonic::transport::Uri = "http://learner:6335".parse().unwrap();
+        let address_only_uri: tonic::transport::Uri = "http://address-only:6335".parse().unwrap();
+        manager.add_peer(11, voter_uri.clone()).unwrap();
+        manager.add_peer(12, learner_uri.clone()).unwrap();
+        manager.add_peer(13, address_only_uri.clone()).unwrap();
+        manager
+            .set_conf_state(ConfState {
+                voters: vec![11],
+                learners: vec![12],
+                ..Default::default()
+            })
+            .unwrap();
+        let configuration = manager.conf_state();
+        let state_bytes = std::fs::read(dir.path().join("raft_state.json")).unwrap();
+        let last_index = manager.last_index().unwrap();
+
+        for (peer_id, uri) in [(11, &voter_uri), (12, &learner_uri)] {
+            for _ in 0..2 {
+                let operation = ConsensusOperations::AddPeer {
+                    peer_id,
+                    uri: uri.to_string(),
+                };
+                let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+                manager
+                    .on_consensus_op_apply
+                    .lock()
+                    .insert(operation.clone(), sender);
+                assert!(manager.complete_registered_peer_add(peer_id, uri));
+                let receipt = receiver.try_recv().unwrap().unwrap();
+                assert!(receipt.applied());
+                assert_eq!(receipt.local_applied_index, None);
+                assert!(
+                    !manager
+                        .on_consensus_op_apply
+                        .lock()
+                        .contains_key(&operation)
+                );
+            }
+        }
+        for (peer_id, uri) in [
+            (11, &learner_uri),
+            (13, &address_only_uri),
+            (14, &voter_uri),
+        ] {
+            let operation = ConsensusOperations::AddPeer {
+                peer_id,
+                uri: uri.to_string(),
+            };
+            let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+            manager
+                .on_consensus_op_apply
+                .lock()
+                .insert(operation.clone(), sender);
+            assert!(!manager.complete_registered_peer_add(peer_id, uri));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            assert!(
+                manager
+                    .on_consensus_op_apply
+                    .lock()
+                    .contains_key(&operation)
+            );
+        }
+        assert_eq!(manager.conf_state(), configuration);
+        assert_eq!(manager.last_index().unwrap(), last_index);
+        assert_eq!(
+            std::fs::read(dir.path().join("raft_state.json")).unwrap(),
+            state_bytes
+        );
+
+        // A retiring voter is still in the outgoing half of a joint configuration, but an
+        // AddPeer retry must not claim completion just before the removal becomes final.
+        manager
+            .set_conf_state(ConfState {
+                voters: vec![12],
+                voters_outgoing: vec![11, 12],
+                auto_leave: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let joint_configuration = manager.conf_state();
+        let joint_state_bytes = std::fs::read(dir.path().join("raft_state.json")).unwrap();
+        assert!(!manager.complete_registered_peer_add(11, &voter_uri));
+        assert!(!manager.complete_registered_peer_add(12, &learner_uri));
+        assert_eq!(manager.conf_state(), joint_configuration);
+        assert_eq!(manager.last_index().unwrap(), last_index);
+        assert_eq!(
+            std::fs::read(dir.path().join("raft_state.json")).unwrap(),
+            joint_state_bytes
+        );
+    }
+
+    #[test]
     fn private_oram_epoch_cas_replays_and_survives_raft_snapshot_restore() {
         let source_dir = Builder::new()
             .prefix("private_oram_raft_source")
@@ -6769,6 +7448,7 @@ mod tests {
                 backup_generation: 7,
                 issued_at_unix: 100,
                 expires_at_unix: 160,
+                authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),

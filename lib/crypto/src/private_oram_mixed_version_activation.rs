@@ -688,6 +688,22 @@ mod tests {
         signers: &[(u64, Ed25519KeyPair)],
         uris: &BTreeMap<u64, String>,
     ) -> Vec<PrivateOramPeerActivationEvidenceV1> {
+        evidence_for_wire(
+            authority,
+            configuration,
+            signers,
+            uris,
+            crate::PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+        )
+    }
+
+    fn evidence_for_wire(
+        authority: &VerifiedSignedPrivateOramActivationAuthorityManifestV1,
+        configuration: &PrivateOramConsensusConfigurationV1,
+        signers: &[(u64, Ed25519KeyPair)],
+        uris: &BTreeMap<u64, String>,
+        wire_protocol: u16,
+    ) -> Vec<PrivateOramPeerActivationEvidenceV1> {
         let configuration_digest =
             try_private_oram_consensus_configuration_digest_v1(configuration).unwrap();
         signers
@@ -704,8 +720,7 @@ mod tests {
                     target_peer_id: *peer_id,
                     target_peer_uri_digest: uris[peer_id].clone(),
                     membership_generation: 1,
-                    required_consensus_wire_protocol:
-                        crate::PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+                    required_consensus_wire_protocol: wire_protocol,
                     expected_current_term: 7,
                     expected_hard_commit: 41,
                     expected_last_applied: 41,
@@ -733,10 +748,8 @@ mod tests {
                         .expected_runtime_capability_fingerprint
                         .clone(),
                     membership_generation: challenge.membership_generation,
-                    supported_consensus_wire_protocol_min:
-                        crate::PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
-                    supported_consensus_wire_protocol_max:
-                        crate::PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+                    supported_consensus_wire_protocol_min: wire_protocol,
+                    supported_consensus_wire_protocol_max: wire_protocol,
                     observed_current_term: challenge.expected_current_term,
                     observed_hard_commit: challenge.expected_hard_commit,
                     observed_last_applied: challenge.expected_last_applied,
@@ -769,7 +782,10 @@ mod tests {
             false,
         )
         .unwrap();
-        let mut acknowledgements = evidence(&authority, &configuration, &signers, &uris);
+        // Pin the historical known answer across reader upgrades. Other evidence fixtures use
+        // the current protocol and exercise its all-peer signature verification.
+        let mut acknowledgements =
+            evidence_for_wire(&authority, &configuration, &signers, &uris, 8);
         acknowledgements.reverse();
         let proof = package_private_oram_mixed_version_activation_proof_v1(
             &authority,
@@ -789,12 +805,12 @@ mod tests {
         let _verified =
             validate_private_oram_mixed_version_activation_proof_v1(&proof, &authority, &uris)
                 .unwrap();
-        // Known answer for the canonical proof digest of this fixture. The value pinned when
-        // the test was introduced never matched the shipped digest construction (no digest
-        // input changed since), so it is re-pinned to the deterministic output of this code.
+        // This fixture uses wire protocol 8 in the challenge and signed observations; those
+        // version fields bind the acknowledgement signatures and the canonical proof digest.
+        assert_eq!(proof.required_consensus_wire_protocol(), 8);
         assert_eq!(
             proof.proof_digest(),
-            "hjlG6sNvnOj6TCtaE8uMBCFknRQM-60qbfY_aZfvqFA"
+            "qoGR8cP7F2u8CSobgsHCkmmP9AUofSNfA8VY-yIqsZQ"
         );
 
         let mut missing = proof.clone();

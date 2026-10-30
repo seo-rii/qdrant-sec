@@ -49,7 +49,11 @@ use uuid::Uuid;
 
 use super::auth::Auth;
 use super::private_hnsw::begin_private_hnsw_collection_snapshot;
+use super::private_oram_mutation_session::acquire_private_oram_mutation_snapshot_guard_v2;
 use super::private_result_oram::begin_private_result_oram_collection_snapshot;
+use super::snapshots::{
+    private_oram_snapshot_pause_after_prepare, validate_snapshot_collection_identity,
+};
 use crate::settings::Settings;
 #[cfg(feature = "staging")]
 use crate::tonic::api::qdrant_internal_api::apply_private_oram_preinstall_restart_pause;
@@ -229,7 +233,7 @@ pub async fn do_list_snapshots(
 }
 
 pub async fn do_create_snapshot(
-    toc: Arc<TableOfContent>,
+    dispatcher: Arc<Dispatcher>,
     auth: &Auth,
     collection_name: &str,
 ) -> Result<SnapshotDescription, StorageError> {
@@ -241,17 +245,60 @@ pub async fn do_create_snapshot(
         )?
         .into_static();
 
+    let pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &pass).clone();
+    let collection_lifecycle_guard = toc.acquire_snapshot_collection_lifecycle_guard().await;
     let collection = toc.get_collection(&collection_pass).await?;
     let config = collection.config_snapshot().await;
+    // An owner execution guard can itself be waiting for a Raft operation. Never hold
+    // the namespace mutex while acquiring it: an earlier metadata apply needs that mutex.
+    drop(collection_lifecycle_guard);
+    let private_oram_mutation_snapshot_guard = acquire_private_oram_mutation_snapshot_guard_v2(
+        &dispatcher,
+        Arc::clone(&collection),
+        &config,
+    )
+    .await?;
     let private_hnsw_snapshot_guard =
         begin_private_hnsw_collection_snapshot(collection.name(), &config)?;
     let private_result_snapshot_guard =
         begin_private_result_oram_collection_snapshot(collection.name(), &config)?;
+    let protected = private_oram_mutation_snapshot_guard.is_some()
+        || private_hnsw_snapshot_guard.is_some()
+        || private_result_snapshot_guard.is_some();
+    if protected {
+        let _namespace = toc.acquire_snapshot_collection_lifecycle_guard().await;
+        validate_snapshot_collection_identity(&toc, &collection_pass, &collection, &config).await?;
+    }
 
+    let post_dispatcher = Arc::clone(&dispatcher);
     let result = tokio::spawn(async move {
+        let private_oram_mutation_snapshot_guard = private_oram_mutation_snapshot_guard;
         let _private_hnsw_snapshot_guard = private_hnsw_snapshot_guard;
         let _private_result_snapshot_guard = private_result_snapshot_guard;
-        toc.create_snapshot(&collection_pass).await
+        let prepared = toc.prepare_snapshot(&collection).await?;
+        private_oram_snapshot_pause_after_prepare("collection").await;
+        if private_oram_mutation_snapshot_guard.is_some() {
+            post_dispatcher
+                .linearizable_private_oram_snapshot_barrier(None)
+                .await?;
+        }
+        // The barrier must finish before taking the namespace mutex. Metadata committed
+        // before it can now apply, and a changed target/config invalidates the staged file.
+        let _namespace = if protected {
+            Some(toc.acquire_snapshot_collection_lifecycle_guard().await)
+        } else {
+            None
+        };
+        if protected {
+            validate_snapshot_collection_identity(&toc, &collection_pass, &collection, &config)
+                .await?;
+        }
+        if let Some(guard) = &private_oram_mutation_snapshot_guard {
+            guard.validate_held(&post_dispatcher).await?;
+        }
+        let snapshot = toc.publish_snapshot(&collection, prepared).await?;
+        Ok::<SnapshotDescription, StorageError>(snapshot)
     })
     .await??;
 
@@ -2072,8 +2119,72 @@ mod tests {
     };
     use data_encoding::BASE64URL_NOPAD;
     use qdrant_sec::{CKKS_PROFILE_OPENFHE_128_N16384_D4_SCALE50, VECTOR_OPENFHE_CKKS_PROVIDER};
+    use storage::content_manager::collection_meta_ops::DeleteCollectionOperation;
+    use storage::rbac::Access;
 
     use super::*;
+    use crate::common::private_hnsw_wire_fixture::{create_plain_collection, test_dispatcher};
+
+    #[test]
+    fn ordinary_collection_snapshot_does_not_block_unrelated_collection_deletion() {
+        let (_temp, dispatcher) = test_dispatcher();
+        let dispatcher = Arc::new(dispatcher);
+
+        actix_web::rt::System::new().block_on(async {
+            let source_name = "snapshot-source";
+            let unrelated_name = "snapshot-unrelated";
+            create_plain_collection(&dispatcher, source_name).await;
+            create_plain_collection(&dispatcher, unrelated_name).await;
+            let auth = Auth::new_internal(Access::full("snapshot lifecycle concurrency test"));
+            let pass = new_unchecked_verification_pass();
+            let toc = dispatcher.toc(&auth, &pass).clone();
+            let collection_pass = auth
+                .check_collection_access(source_name, AccessRequirements::new(), "test")
+                .unwrap();
+            let collection = toc.get_collection(&collection_pass).await.unwrap();
+
+            // Keep preparation pending so deletion cannot pass just because the snapshot
+            // happened to finish before the lifecycle operation started.
+            let shard_guard = collection.shards_holder().write_owned().await;
+            let snapshot_dispatcher = Arc::clone(&dispatcher);
+            let snapshot_auth = auth.clone();
+            let snapshot = tokio::spawn(async move {
+                do_create_snapshot(snapshot_dispatcher, &snapshot_auth, source_name).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while toc
+                    .snapshot_telemetry_collector(source_name)
+                    .running_snapshots
+                    .get(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("snapshot preparation must start");
+            assert!(!snapshot.is_finished());
+
+            let deletion = tokio::time::timeout(
+                Duration::from_secs(2),
+                dispatcher.submit_collection_meta_op(
+                    CollectionMetaOperations::DeleteCollection(DeleteCollectionOperation(
+                        unrelated_name.to_string(),
+                    )),
+                    auth,
+                    None,
+                ),
+            )
+            .await;
+            drop(shard_guard);
+            snapshot.await.unwrap().unwrap();
+            assert!(
+                deletion
+                    .expect("an ordinary snapshot must not hold the global lifecycle lock")
+                    .expect("unrelated collection deletion must succeed")
+            );
+        });
+    }
 
     fn assert_no_cluster_fingerprint_leak(rendered: &str, sentinels: &[&str]) {
         for sentinel in sentinels {

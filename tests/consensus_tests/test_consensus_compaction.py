@@ -153,6 +153,9 @@ def test_consensus_snapshot_create_collection(tmp_path: pathlib.Path, replicatio
     # Start cluster
     peers, peer_dirs, bootstrap_uri = start_cluster(tmp_path, N_PEERS, extra_env=env)
 
+    # Keep a voting quorum when the last peer is stopped below.
+    wait_for(lambda: all(get_cluster_info(peer)["raft_info"]["is_voter"] for peer in peers))
+
     # Get last peer ID
     last_peer_id = get_cluster_info(peers[-1])['peer_id']
 

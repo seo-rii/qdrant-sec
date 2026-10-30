@@ -39,8 +39,10 @@ from .test_private_oram_sessions import (
     _open_hnsw_owner_session,
     _open_result_owner_session,
     _post_result,
+    _private_oram_consensus_protocol_projection,
     _upload_hnsw,
     _upload_result_oram,
+    _wait_for_private_oram_consensus_protocol_projection,
 )
 from .test_private_oram_v2_activation import (
     _activation_bundle,
@@ -350,8 +352,22 @@ def _wait_until_state_opens(peer_urls: list[str], current_open: dict, stale_open
     wait_for(current_state_opens, wait_for_timeout=600, wait_for_interval=0.5)
     leader_url = reopened["leader_url"]
     assert_http_ok(_mutation_post(leader_url, "close", {"session_id": reopened["session_id"]}))
-    stale = _mutation_post(leader_url, "open", stale_open)
-    assert stale.status_code == 400, stale.text
+
+    def stale_state_is_rejected() -> bool:
+        leader_url = _leader_url(peer_urls)
+        if leader_url is None:
+            return False
+        stale = _mutation_post(leader_url, "open", stale_open)
+        # Leadership can change after discovery or while the newly opened session closes.
+        # Only the explicit routing failure is retried; the stale state must still get 400.
+        if stale.status_code == 500 and stale.json().get("status", {}).get("error") == (
+            "Pre-condition failure: private ORAM mutation must be coordinated by the current leader"
+        ):
+            return False
+        assert stale.status_code == 400, stale.text
+        return True
+
+    wait_for(stale_state_is_rejected, wait_for_timeout=30, wait_for_interval=0.5)
     return reopened["old_state_digest"]
 
 
@@ -472,13 +488,20 @@ def _start_tls_append_cluster(
     append_client: AppendClient,
     log_prefix: str,
     coordinator_env: dict[str, str] | None = None,
+    follower_tick_period_ms: tuple[int, int] = (1000, 1000),
     tree_height: int = 2,
 ) -> TlsAppendCluster:
     """Three pinned peers with internal TLS and V2 active; a paired collection with a replica of
     both indexes (Path ORAM trees of `tree_height`) on every peer, uploaded and written back
     once. The first peer leads Raft and so coordinates appends; `coordinator_env` is added to its
     environment."""
-    tls_env = _generate_tls_certs(tmp_path / "tls")
+    tls_env = {
+        **_generate_tls_certs(tmp_path / "tls"),
+        # Applying the real client's large recovery entries can occupy the debug consensus
+        # thread for several seconds. Keep the initial leader until the intended fault,
+        # as in the large session fixtures; a test can stagger the followers' election ticks.
+        "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000",
+    }
     peer_dirs = make_peer_folders(tmp_path, len(TLS_PEER_IDS))
     base_ports = [_free_port_triple() for _ in TLS_PEER_IDS]
     identities = [
@@ -526,7 +549,13 @@ def _start_tls_append_cluster(
                 f"{log_prefix}_peer_{index}.log",
                 bootstrap_uri,
                 port=base_ports[index],
-                extra_env={**tls_env, "QDRANT__CLUSTER__PEER_ID": str(TLS_PEER_IDS[index])},
+                extra_env={
+                    **tls_env,
+                    "QDRANT__CLUSTER__PEER_ID": str(TLS_PEER_IDS[index]),
+                    "QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": str(
+                        follower_tick_period_ms[index - 1]
+                    ),
+                },
                 p2p_tls=True,
             )
         )
@@ -622,11 +651,30 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
     after admission until another peer has taken over leadership, then resumed: as the lease
     owner it must still drive the append to commit and cleanup under the new term, while the
     new leader coordinates the next mutation session."""
+    pause_file = tmp_path / "private-oram-v2-post-admission.pause"
+    pause_file.write_text("pause")
     peer_urls, peer_dirs, leader_url, _, _ = _start_tls_append_cluster(
-        tmp_path, append_client, "v2_leader_change"
+        tmp_path,
+        append_client,
+        "v2_leader_change",
+        coordinator_env={
+            "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE": str(
+                pause_file
+            ),
+        },
+        # Campaign windows of 20-40 s and 60-120 s leave time for the first follower's
+        # vote to reach the other over a new TLS channel, avoiding a split vote.
+        follower_tick_period_ms=(1000, 3000),
     )
     genesis_state_digest = _enroll(leader_url, append_client)
     appended = _append_one_point(leader_url, append_client, genesis_state_digest)
+    # Hold the admitted job before owner adoption so the leadership change cannot accidentally
+    # exercise an append that has already committed and cleaned up.
+    status = _mutation_post(
+        leader_url, "status", {"session_id": appended["session"]["session_id"]}
+    )
+    assert_http_ok(status)
+    assert status.json()["result"]["append_phase"] == "admitted_ack_pending", status.text
 
     old_leader = get_cluster_info(leader_url)["peer_id"]
     (coordinator,) = [
@@ -643,8 +691,9 @@ def test_private_oram_paired_append_commits_across_a_leader_change(
 
     coordinator.proc.send_signal(signal.SIGSTOP)
     try:
-        wait_for(followers_elected_another_leader, wait_for_timeout=30)
+        wait_for(followers_elected_another_leader, wait_for_timeout=60)
     finally:
+        pause_file.unlink()
         coordinator.proc.send_signal(signal.SIGCONT)
 
     _wait_for_appended_state(peer_urls, append_client, genesis_state_digest)
@@ -677,7 +726,7 @@ def _freeze_leader_until_replaced(peer_urls: list[str]) -> None:
 
     leader.proc.send_signal(signal.SIGSTOP)
     try:
-        wait_for(others_elected_another_leader, wait_for_timeout=30)
+        wait_for(others_elected_another_leader, wait_for_timeout=60)
     finally:
         leader.proc.send_signal(signal.SIGCONT)
 
@@ -689,7 +738,11 @@ def test_private_oram_paired_append_commits_through_repeated_leader_changes(
     over, four times, so elections drop proposals while the coordinator's handoff and its
     supervisor's recovery are in flight. The append must still commit."""
     peer_urls, peer_dirs, leader_url, _, _ = _start_tls_append_cluster(
-        tmp_path, append_client, "v2_leader_churn"
+        tmp_path,
+        append_client,
+        "v2_leader_churn",
+        # Alternate the two faster voters while the third waits 60-120 seconds.
+        follower_tick_period_ms=(1000, 3000),
     )
     genesis_state_digest = _enroll(leader_url, append_client)
     appended = _append_one_point(leader_url, append_client, genesis_state_digest)
@@ -704,23 +757,7 @@ def test_private_oram_paired_append_commits_through_repeated_leader_changes(
     os.environ.get("QDRANT_PRIVATE_ORAM_CRASH_TESTS") != "1",
     reason="needs a qdrant binary built with --features private-oram-crash-points",
 )
-@pytest.mark.parametrize(
-    "crash_point",
-    [
-        pytest.param(
-            point,
-            marks=pytest.mark.xfail(
-                run=False,
-                reason="after a restart following the parent materialization, the admitted "
-                "reconcile's re-validation of the retained owner prepare fails (mutation "
-                "contract), so the supervisor never commits",
-            ),
-        )
-        if point == "mutation_v2_after_parent_materialized"
-        else point
-        for point in ADMITTED_HANDOFF_POINTS
-    ],
-)
+@pytest.mark.parametrize("crash_point", ADMITTED_HANDOFF_POINTS)
 def test_private_oram_paired_append_commits_after_the_coordinator_restarts(
     tmp_path: pathlib.Path, append_client: AppendClient, crash_point: str
 ):
@@ -770,24 +807,28 @@ def test_private_oram_paired_append_recovers_a_failed_live_handoff(
     _append_one_point(cluster.leader_url, append_client, genesis_state_digest)
     _wait_for_appended_state(cluster.peer_urls, append_client, genesis_state_digest)
 
+    coordinator_log = (
+        pathlib.Path(init_pytest_log_folder()) / f"v2_fault_{fault_point}_peer_0.log"
+    ).read_text()
+    assert coordinator_log.count(f"failing at private ORAM fault point {fault_point}") == 1
+
 
 @pytest.mark.skipif(
     os.environ.get("QDRANT_PRIVATE_ORAM_CRASH_TESTS") != "1",
     reason="needs a qdrant binary built with --features private-oram-crash-points",
 )
-def test_private_oram_paired_append_aborts_once_its_signed_lease_expired(
+def test_private_oram_paired_append_stays_fenced_after_its_signed_lease_expired(
     tmp_path: pathlib.Path, append_client: AppendClient
 ):
     """The coordinator is killed once recovery readiness is certified, before its decision, and
-    restarted only after the mutation's signed lease (shortened to 90 s) expired. A mutation is
-    never applied after its validity window: the restarted lease owner fences it with an abort
-    decision, the terminal resume rolls every owner back, and the genesis state opens again while
-    the appended state is refused."""
+    restarted only after the mutation's signed lease (shortened to 90 s) expired. Expiry supplies
+    no durable abort intent: repeated supervisor scans must leave the exact old state and the
+    Preparing lease fenced, refuse both old/new session opens, and admit no new generation."""
     crash_point = "mutation_v2_before_consensus_commit"
     cluster = _start_tls_append_cluster(
         tmp_path,
         append_client,
-        "v2_expired_abort",
+        "v2_expired_fenced",
         coordinator_env={CRASH_POINT_ENV: crash_point, MUTATION_LEASE_ENV: "90"},
     )
     genesis_state_digest = _enroll(cluster.leader_url, append_client)
@@ -799,13 +840,57 @@ def test_private_oram_paired_append_aborts_once_its_signed_lease_expired(
     _restart_dead_coordinator(
         cluster,
         crash_point,
-        "v2_expired_abort_restarted.log",
+        "v2_expired_fenced_restarted.log",
         not_before_unix=expires_at_unix + 2,
     )
 
+    wait_for(lambda: _leader_url(cluster.peer_urls) is not None, wait_for_timeout=60)
+    observed_status = {}
+
+    def owner_requires_recovery() -> bool:
+        supervisor = _status(cluster.leader_url)["supervisor"]
+        if (
+            supervisor["state"] != "blocked"
+            or supervisor["block_reason"] != "reconcile_failure"
+            or supervisor["failed"] != 1
+            or supervisor["reconciled"] != 0
+        ):
+            return False
+        observed_status.update(supervisor)
+        return True
+
+    wait_for(owner_requires_recovery, wait_for_timeout=60)
+    fenced = _wait_for_private_oram_consensus_protocol_projection(cluster.peer_dirs)
+    states = fenced["private_oram_mutation_states"]
+    authorities = fenced["private_oram_mutation_lease_slots"]
+    assert len(states) == len(authorities) == 1
+    state = next(iter(states.values()))
+    authority = next(iter(authorities.values()))["authority"]
+    assert authority["mode"] == "activated"
+    lease_slot = authority["state"]["lease_slot"]
+    assert state["state_sequence"] == 0
+    assert state["signed_state_digest"] == genesis_state_digest
+    assert lease_slot["generation"] == 1
+    assert lease_slot["last_clear"] is None
+    assert lease_slot["active"]["phase"] == "preparing"
+    assert lease_slot["active"]["expires_at_unix"] == expires_at_unix
+
+    # Observe another completed recovery attempt, not just the initial startup projection.
+    first_scan = observed_status["generation"]
+    wait_for(
+        lambda: owner_requires_recovery() and observed_status["generation"] > first_scan,
+        wait_for_timeout=30,
+    )
     # `open_next` adopts the appended state, so the genesis state's open body comes first.
     genesis_open = append_client.call("open")
     appended_open = append_client.call("open_next")
-    opened_digest = _wait_until_state_opens(cluster.peer_urls, genesis_open, appended_open)
-    assert opened_digest == genesis_state_digest
+    leader_url = _leader_url(cluster.peer_urls)
+    assert leader_url is not None
+    for open_body in [genesis_open, appended_open]:
+        response = _mutation_post(leader_url, "open", open_body)
+        assert 400 <= response.status_code < 500, response.text
+    assert all(
+        _private_oram_consensus_protocol_projection(peer_dir) == fenced
+        for peer_dir in cluster.peer_dirs
+    )
     _assert_no_plaintext_leaks(cluster.peer_dirs, appended, committed=False)

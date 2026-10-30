@@ -475,6 +475,7 @@ pub fn config_private_result_oram_api(cfg: &mut web::ServiceConfig) {
 mod private_result_oram_rest_tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     use actix_web::http::StatusCode;
     use actix_web::{App, test as actix_test, web};
@@ -1595,6 +1596,7 @@ mod private_result_oram_rest_tests {
     /// uploaded, rewritten by a signed commit and captured in a collection snapshot must leave no
     /// payload bytes, fetch or point token, or client key bytes under the storage, snapshot or
     /// temp directories.
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_payloads_store_no_plaintext_sentinels() {
         let _guard = route_e2e_guard();
@@ -1794,9 +1796,13 @@ mod private_result_oram_rest_tests {
             )
             .await
             .unwrap();
-            crate::common::collections::do_create_snapshot(toc.clone(), &auth, COLLECTION_NAME)
-                .await
-                .unwrap();
+            crate::common::collections::do_create_snapshot(
+                Arc::new(dispatcher.clone()),
+                &auth,
+                COLLECTION_NAME,
+            )
+            .await
+            .unwrap();
         });
 
         let mut files = Vec::new();
@@ -1894,6 +1900,7 @@ mod private_result_oram_rest_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_common_ops_require_write_access_for_mutations() {
         let _guard = route_e2e_guard();
@@ -2044,6 +2051,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_result_oram_uploads_and_reads_through_rest_routes() {
         let _guard = route_e2e_guard();
@@ -3221,7 +3229,7 @@ mod private_result_oram_rest_tests {
             );
 
             let active_snapshot_error = crate::common::collections::do_create_snapshot(
-                dispatcher.toc(&auth, &pass).clone(),
+                Arc::new(dispatcher.clone()),
                 &auth,
                 COLLECTION_NAME,
             )
@@ -4721,6 +4729,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn setup_rest_routes_revalidate_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -4947,6 +4956,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_rest_read_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();
@@ -5078,6 +5088,7 @@ mod private_result_oram_rest_tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_rest_commit_rejects_runtime_oram_policy_drift() {
         let _guard = route_e2e_guard();

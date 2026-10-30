@@ -67,6 +67,16 @@ activation"). This document proposes the missing enrollment path.
 
 ## Implementation status
 
+- Capability upgrades install a consecutively signed activation-authority
+  successor through startup configuration before gathering the new cluster
+  proof. If a fully enabled older protocol floor already exists, the authority
+  durably retains its exact signed predecessor and the old floor digest.
+  Restart before `PrepareTaggedWrites` verifies both signatures, their parent
+  link and that exact floor binding; it preserves the old applied floor and
+  keeps new-protocol writes fenced. Another authority rotation is refused
+  until the floor catches up. The bounded predecessor record remains verifiable
+  after activation; missing or invalid evidence never permits a capability
+  mismatch. Install the new binary on every peer before completing activation.
 - Step 1 is implemented as a new consensus operation,
   `ConsensusOperations::EnrollPrivateOramMutationCollectionV2` (carrying an
   `InitializePrivateOramMutationState`), applied by `apply_enroll_v2` in
@@ -244,22 +254,28 @@ Mutation sessions are coordinated by the current leader, so clients must route
 precondition failure.
 
 The decision itself (`decide_private_oram_admitted_mutation_v2`, taken by the
-live handoff and by the supervisor alike) commits only inside the validity
-window the client signed: once the lease consensus holds has expired, the
-lease owner proposes the `Preparing -> AbortDecided` transition
-(`private_oram_mutation_v2_abort_decision_operation`, which had no caller)
-instead, since Raft apply cannot read a clock. Both transitions require the
-preparing lease and the generation's readiness certificate, so a racing
-commit and abort are ordered by Raft and the terminal resume finishes
-whichever applied; for an abort it rolls every owner back to the exact old
-state and cleans up. `test_private_oram_paired_append_aborts_once_its_signed_lease_expired`
+live handoff and by the supervisor alike) proposes a commit only while the
+lease consensus holds is valid. It uses a coherent state-and-lease projection
+to confirm the exact committed state, receipt and immutable lease identity,
+allowing only monotonic renewal evidence. Unexpired admitted mutations can
+still finish after a leader change or restart.
+
+Once the lease has expired, the mutation remains `Preparing` and requires
+authorized recovery. Expiry alone supplies neither canonical owner abort
+intent nor a durable abort policy; production proposal paths continue to
+reject `AbortDecided`. Both the old and new state remain closed to new mutation
+sessions, and no further generation is admitted. Existing durable abort
+decisions remain readable by terminal recovery. This intentionally preserves
+the abort-authority contract in [ckks.md](ckks.md), rather than treating a
+timeout or expired lease as permission to roll back owner stores.
+
+`test_private_oram_paired_append_stays_fenced_after_its_signed_lease_expired`
 shortens the mutation lease with the test-only
-`QDRANT_PRIVATE_ORAM_TEST_MUTATION_LEASE_SECS` (crash-point builds only),
-kills the coordinator before its decision and restarts it after the lease
-expired: the genesis state opens again and the appended state is refused. An
-admitted mutation whose readiness can never be certified (an owner that never
-installs its capsule) still stays blocked, because both decisions require the
-readiness certificate.
+`QDRANT_PRIVATE_ORAM_TEST_MUTATION_LEASE_SECS` (crash-point builds only), kills
+the coordinator before its decision and restarts it after expiry. It checks
+that repeated supervisor scans retain the same old state and preparing lease,
+and that neither state can open a new session. An admitted mutation whose
+readiness can never be certified also stays blocked.
 
 The live handoff has test-only points (feature `private-oram-crash-points`)
 after admission, after the parent materialization, after the owner adoption,
@@ -270,12 +286,10 @@ return an error once per process, as a timed-out proposal or a leader change
 does. `test_private_oram_paired_append_recovers_a_failed_live_handoff` fails
 the handoff at every point and the supervisor commits in the same process each
 time. `test_private_oram_paired_append_commits_after_the_coordinator_restarts`
-kills the coordinator at every point and restarts it; every point but one
-commits. After a restart that follows the parent materialization, the admitted
-reconcile's re-validation of the retained owner prepare
-(`validate_private_oram_append_owner_prepare_from_durable_recovery_v2`) fails
-with a mutation contract error on every supervisor pass, so the append stays
-blocked; that case is marked as an expected failure until it is fixed.
+kills the coordinator at every point and verifies that it commits after restart,
+including a restart immediately after the parent materialization. Re-validation
+of the retained owner prepare uses the signed new state's timestamp, so a state
+signed after the mutation was issued remains valid when replayed from recovery.
 `test_private_oram_paired_append_commits_through_repeated_leader_changes`
 freezes whichever peer leads four times while the handoff and the recovery run.
 

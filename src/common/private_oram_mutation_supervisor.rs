@@ -13,10 +13,13 @@ use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::dispatcher::Dispatcher;
 
 use super::auth::Auth;
-use super::private_oram_mutation::reconcile_private_oram_admitted_to_commit_v2;
+use super::private_oram_mutation::{
+    reconcile_private_oram_admitted_to_commit_v2, recover_private_oram_preadmission_once_v2,
+};
 use super::private_oram_mutation_session::{
     current_unix_secs, private_oram_detached_job_deciding_for_collection_v2,
     private_oram_detached_job_exists_for_collection_v2,
+    reconcile_private_oram_rejected_runtime_jobs_v2,
 };
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_oram_recovery::{
@@ -29,6 +32,56 @@ use crate::settings::Settings;
 const PRIVATE_ORAM_MUTATION_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
 const PRIVATE_ORAM_MUTATION_SUPERVISOR_MAX_CANDIDATES: usize = 1_024;
 const PRIVATE_ORAM_MUTATION_IMMUTABLE_OWNER_STALL_SECS: u64 = 300;
+const PRIVATE_ORAM_MUTATION_PRE_ARCHIVE_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_PRE_ARCHIVE_PAUSE_FILE";
+const PRIVATE_ORAM_MUTATION_POST_ARCHIVE_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ARCHIVE_PAUSE_FILE";
+const PRIVATE_ORAM_MUTATION_SUPERVISOR_SCAN_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_SUPERVISOR_SCAN_PAUSE_FILE";
+const PRIVATE_ORAM_MUTATION_TERMINAL_RESUME_ATTEMPT_LOG_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_TERMINAL_RESUME_ATTEMPT_LOG";
+const PRIVATE_ORAM_MUTATION_ADMITTED_RECONCILE_PROBE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_ADMITTED_RECONCILE_PROBE";
+
+#[cfg(debug_assertions)]
+async fn private_oram_mutation_pause_v2(env_name: &str, milestone: &str) {
+    let Some(pause_file) = std::env::var_os(env_name) else {
+        return;
+    };
+    if pause_file.is_empty() {
+        return;
+    }
+    log::warn!("{milestone}");
+    while std::path::Path::new(&pause_file).exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn private_oram_mutation_pause_v2(_env_name: &str, _milestone: &str) {}
+
+#[cfg(debug_assertions)]
+fn private_oram_mutation_log_terminal_resume_attempt_v2() {
+    if std::env::var_os(PRIVATE_ORAM_MUTATION_TERMINAL_RESUME_ATTEMPT_LOG_ENV)
+        .is_some_and(|value| !value.is_empty())
+    {
+        log::warn!("Private ORAM staging mutation terminal resume attempt reached");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn private_oram_mutation_log_terminal_resume_attempt_v2() {}
+
+#[cfg(debug_assertions)]
+fn private_oram_mutation_admitted_reconcile_probe_v2() -> bool {
+    std::env::var_os(PRIVATE_ORAM_MUTATION_ADMITTED_RECONCILE_PROBE_ENV)
+        .is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn private_oram_mutation_admitted_reconcile_probe_v2() -> bool {
+    false
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -216,8 +269,8 @@ pub(crate) async fn supervise_private_oram_mutations_v2(
             .await
             {
                 Ok(status) => status,
-                Err(error) => {
-                    log::warn!("private ORAM mutation supervisor pass failed: {error}");
+                Err(_) => {
+                    log::warn!("private ORAM mutation supervisor scan failed");
                     PrivateOramMutationSupervisorStatusV2 {
                         state: PrivateOramMutationSupervisorStateV2::Blocked,
                         block_reason: Some(
@@ -253,15 +306,23 @@ async fn reconcile_private_oram_mutations_once_v2(
     identity: &PrivateOramPeerRecoveryIdentity,
     generation: u64,
 ) -> StorageResult<PrivateOramMutationSupervisorStatusV2> {
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_SUPERVISOR_SCAN_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation supervisor scan pause reached",
+    )
+    .await;
     let consensus = dispatcher.consensus_state().ok_or_else(|| {
         StorageError::service_error("private ORAM mutation supervisor requires distributed mode")
     })?;
     let keys = dispatcher.active_private_oram_mutation_keys()?;
     let pending_acknowledgements =
         dispatcher.private_oram_mutation_pending_acknowledgement_keys()?;
+    let preadmission_candidates =
+        consensus.private_oram_mutation_v2_preadmission_recovery_candidates()?;
     let candidate_count = keys
         .len()
         .checked_add(pending_acknowledgements.len())
+        .and_then(|count| count.checked_add(preadmission_candidates.len()))
         .ok_or_else(|| {
             StorageError::service_error("private ORAM mutation supervisor candidate limit exceeded")
         })?;
@@ -283,9 +344,9 @@ async fn reconcile_private_oram_mutations_once_v2(
         // pass for every other collection.
         let collection = match toc.get_collection(&pass).await {
             Ok(collection) => collection,
-            Err(error) => {
+            Err(_) => {
                 log::debug!(
-                    "private ORAM mutation supervisor skipped a collection that disappeared during discovery: {error}"
+                    "private ORAM mutation supervisor skipped a collection that disappeared during discovery"
                 );
                 continue;
             }
@@ -313,6 +374,53 @@ async fn reconcile_private_oram_mutations_once_v2(
         ..PrivateOramMutationSupervisorStatusV2::default()
     };
     let mut foreign_owner_observations = HashSet::new();
+    for candidate in preadmission_candidates {
+        let Some(collection_name) = collection_names.get(&candidate.key().collection_id) else {
+            status.failed = status.failed.saturating_add(1);
+            continue;
+        };
+        if consensus
+            .require_private_oram_activation_coordinator_is_local_leader()
+            .is_err()
+        {
+            // Prepared attempts are recovered by the current leader, not an immutable
+            // admitted owner. They must still keep follower readiness pending.
+            status.owned_elsewhere = status.owned_elsewhere.saturating_add(1);
+            continue;
+        }
+        match recover_private_oram_preadmission_once_v2(
+            dispatcher,
+            settings,
+            identity,
+            collection_name,
+            &candidate,
+        )
+        .await
+        {
+            Ok(true) => status.reconciled = status.reconciled.saturating_add(1),
+            Ok(false) => {
+                status.process_local_pending = status.process_local_pending.saturating_add(1)
+            }
+            Err(_) => {
+                log::warn!("private ORAM mutation supervisor pre-admission recovery failed");
+                status.failed = status.failed.saturating_add(1);
+            }
+        }
+    }
+    // A new leader may have acknowledged an orphan while its original coordinator was
+    // paused. Retire exact rejected local jobs on every peer, even after durable candidates
+    // have disappeared from the leader's pending-work list.
+    match reconcile_private_oram_rejected_runtime_jobs_v2(dispatcher).await {
+        Ok(retired) => {
+            status.reconciled = status
+                .reconciled
+                .saturating_add(u32::try_from(retired).unwrap_or(u32::MAX))
+        }
+        Err(_) => {
+            log::warn!("private ORAM mutation supervisor rejected runtime cleanup failed");
+            status.failed = status.failed.saturating_add(1);
+        }
+    }
     for (key, owner_peer_id, generation) in pending_acknowledgements {
         let Some(collection_name) = collection_names.get(&key.collection_id) else {
             status.failed = status.failed.saturating_add(1);
@@ -328,7 +436,12 @@ async fn reconcile_private_oram_mutations_once_v2(
             continue;
         }
         let result = async {
-            archive_private_oram_mutation_before_acknowledgement_v2(
+            private_oram_mutation_pause_v2(
+                PRIVATE_ORAM_MUTATION_PRE_ARCHIVE_PAUSE_FILE_ENV,
+                "Private ORAM staging mutation post-clear pre-archive pause reached",
+            )
+            .await;
+            let ready = archive_private_oram_mutation_before_acknowledgement_v2(
                 dispatcher,
                 settings,
                 identity,
@@ -337,11 +450,14 @@ async fn reconcile_private_oram_mutations_once_v2(
                 generation,
             )
             .await?;
+            private_oram_mutation_pause_v2(
+                PRIVATE_ORAM_MUTATION_POST_ARCHIVE_PAUSE_FILE_ENV,
+                "Private ORAM staging mutation post-archive pre-acknowledgement pause reached",
+            )
+            .await;
             dispatcher
                 .submit_private_oram_mutation_clear_acknowledgement_v2(
-                    key,
-                    owner_peer_id,
-                    generation,
+                    ready,
                     Some(Duration::from_secs(60)),
                 )
                 .await
@@ -352,9 +468,9 @@ async fn reconcile_private_oram_mutations_once_v2(
                 status.reconciled = status.reconciled.saturating_add(1);
                 status.awaiting_cleanup = status.awaiting_cleanup.saturating_add(1);
             }
-            Err(error) => {
+            Err(_) => {
                 log::warn!(
-                    "private ORAM mutation supervisor could not acknowledge a cleared mutation generation {generation}: {error}"
+                    "private ORAM mutation supervisor could not acknowledge a cleared mutation"
                 );
                 status.failed = status.failed.saturating_add(1);
             }
@@ -365,16 +481,15 @@ async fn reconcile_private_oram_mutations_once_v2(
             status.failed = status.failed.saturating_add(1);
             continue;
         };
+        let admitted_reconcile_probe = private_oram_mutation_admitted_reconcile_probe_v2();
         match private_oram_detached_job_exists_for_collection_v2(&key.collection_id) {
-            Ok(true) => {
+            Ok(true) if !admitted_reconcile_probe => {
                 status.process_local_pending = status.process_local_pending.saturating_add(1);
                 continue;
             }
-            Ok(false) => {}
-            Err(error) => {
-                log::warn!(
-                    "private ORAM mutation supervisor could not inspect detached jobs: {error}"
-                );
+            Ok(_) => {}
+            Err(_) => {
+                log::warn!("private ORAM mutation supervisor could not inspect detached jobs");
                 status.failed = status.failed.saturating_add(1);
                 continue;
             }
@@ -417,16 +532,11 @@ async fn reconcile_private_oram_mutations_once_v2(
                 }
             }
         }
-        match reconcile_private_oram_admitted_to_commit_v2(
-            dispatcher,
-            settings,
-            identity,
-            collection_name,
-            &key,
-        )
-        .await
-        {
-            Ok(()) => match resume_private_oram_mutation_terminal_once_v2(
+        let admitted_ready = if private_oram_mutation_requires_admitted_reconcile_v2(&lease.phase) {
+            if admitted_reconcile_probe {
+                log::warn!("Private ORAM staging mutation admitted reconcile attempt reached");
+            }
+            reconcile_private_oram_admitted_to_commit_v2(
                 dispatcher,
                 settings,
                 identity,
@@ -434,26 +544,38 @@ async fn reconcile_private_oram_mutations_once_v2(
                 &key,
             )
             .await
-            {
-                Ok(PrivateOramMutationTerminalResumeOutcomeV2::Advanced) => {
-                    status.reconciled = status.reconciled.saturating_add(1);
-                    status.process_local_pending = status.process_local_pending.saturating_add(1);
+        } else {
+            Ok(())
+        };
+        match admitted_ready {
+            Ok(()) => {
+                private_oram_mutation_log_terminal_resume_attempt_v2();
+                match resume_private_oram_mutation_terminal_once_v2(
+                    dispatcher,
+                    settings,
+                    identity,
+                    collection_name,
+                    &key,
+                )
+                .await
+                {
+                    Ok(PrivateOramMutationTerminalResumeOutcomeV2::Advanced) => {
+                        status.reconciled = status.reconciled.saturating_add(1);
+                        status.process_local_pending =
+                            status.process_local_pending.saturating_add(1);
+                    }
+                    Ok(PrivateOramMutationTerminalResumeOutcomeV2::AwaitingCleanup) => {
+                        status.reconciled = status.reconciled.saturating_add(1);
+                        status.awaiting_cleanup = status.awaiting_cleanup.saturating_add(1);
+                    }
+                    Err(_) => {
+                        log::warn!("private ORAM mutation supervisor terminal resume failed");
+                        status.failed = status.failed.saturating_add(1);
+                    }
                 }
-                Ok(PrivateOramMutationTerminalResumeOutcomeV2::AwaitingCleanup) => {
-                    status.reconciled = status.reconciled.saturating_add(1);
-                    status.awaiting_cleanup = status.awaiting_cleanup.saturating_add(1);
-                }
-                Err(error) => {
-                    log::warn!(
-                        "private ORAM mutation supervisor could not resume a terminal mutation: {error}"
-                    );
-                    status.failed = status.failed.saturating_add(1);
-                }
-            },
-            Err(error) => {
-                log::warn!(
-                    "private ORAM mutation supervisor could not commit an admitted mutation: {error}"
-                );
+            }
+            Err(_) => {
+                log::warn!("private ORAM mutation supervisor admitted reconcile failed");
                 status.failed = status.failed.saturating_add(1);
             }
         }
@@ -471,6 +593,12 @@ async fn reconcile_private_oram_mutations_once_v2(
     };
     status.state = classify_private_oram_mutation_supervisor_state_v2(&status);
     Ok(status)
+}
+
+fn private_oram_mutation_requires_admitted_reconcile_v2(
+    phase: &PrivateOramMutationLeasePhase,
+) -> bool {
+    matches!(phase, PrivateOramMutationLeasePhase::Preparing)
 }
 
 fn classify_private_oram_mutation_supervisor_state_v2(
@@ -571,5 +699,23 @@ mod tests {
             (0, 0)
         );
         assert!(first_seen.is_empty());
+    }
+
+    #[test]
+    fn terminal_decisions_skip_admitted_reconciliation() {
+        assert!(private_oram_mutation_requires_admitted_reconcile_v2(
+            &PrivateOramMutationLeasePhase::Preparing
+        ));
+        assert!(!private_oram_mutation_requires_admitted_reconcile_v2(
+            &PrivateOramMutationLeasePhase::ConsensusCommitted {
+                committed_record_digest: "record".to_string(),
+                committed_state_sequence: 1,
+                committed_signed_state_digest: "state".to_string(),
+                receipt_digest: "receipt".to_string(),
+            }
+        ));
+        assert!(!private_oram_mutation_requires_admitted_reconcile_v2(
+            &PrivateOramMutationLeasePhase::AbortDecided
+        ));
     }
 }

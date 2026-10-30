@@ -8,6 +8,7 @@
 
 use std::fmt::{self, Debug, Formatter};
 
+use data_encoding::BASE64URL_NOPAD;
 use qdrant_sec::{
     PrivateOramActivationAuthorityBundleV1, PrivateOramActivationAuthorityManifestV1,
     PrivateOramActivationAuthorityTrustAnchorV1, PrivateOramActivationRegistryExpectationV1,
@@ -72,6 +73,18 @@ pub struct PrivateOramActivationAuthorityStateV1 {
     version: u16,
     manifest_digest: String,
     bundle: PrivateOramActivationAuthorityBundleV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_upgrade: Option<PrivateOramActivationCapabilityUpgradeV1>,
+}
+
+/// Bounded evidence for the interval between an operator's authority rotation and the new floor.
+/// Keeping the complete signed predecessor lets restart verify the exact consecutive transition;
+/// its floor binding cannot authorize a mismatch against a different applied floor.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateOramActivationCapabilityUpgradeV1 {
+    predecessor: PrivateOramActivationAuthorityBundleV1,
+    format_floor_digest: String,
 }
 
 impl Debug for PrivateOramActivationAuthorityStateV1 {
@@ -82,6 +95,7 @@ impl Debug for PrivateOramActivationAuthorityStateV1 {
             .field("registry_generation", &self.registry_generation())
             .field("manifest_digest", &"[redacted]")
             .field("bundle", &"[redacted]")
+            .field("capability_upgrade", &self.capability_upgrade.is_some())
             .finish()
     }
 }
@@ -114,11 +128,54 @@ impl PrivateOramActivationAuthorityStateV1 {
         }
     }
 
+    pub(super) fn retain_capability_upgrade_predecessor(
+        &mut self,
+        predecessor: &Self,
+        format_floor_digest: &str,
+    ) {
+        self.capability_upgrade = Some(PrivateOramActivationCapabilityUpgradeV1 {
+            predecessor: predecessor.bundle.clone(),
+            format_floor_digest: format_floor_digest.to_string(),
+        });
+    }
+
+    /// The caller must first verify this authority under the configured external trust anchor.
+    pub(super) fn capability_upgrade_matches_floor(
+        &self,
+        format_floor_digest: &str,
+        required_binary_capability_digest: &str,
+    ) -> bool {
+        self.capability_upgrade.as_ref().is_some_and(|upgrade| {
+            upgrade.format_floor_digest == format_floor_digest
+                && upgrade
+                    .predecessor
+                    .manifest
+                    .required_binary_capability_digest
+                    == required_binary_capability_digest
+        })
+    }
+
+    /// Only use after verifying this state and its retained predecessor under the trust anchor.
+    /// Codec-1 floors did not store a binary capability; the exact signed predecessor supplies it.
+    pub(super) fn legacy_floor_manifest(
+        &self,
+        format_floor_digest: &str,
+    ) -> Option<&PrivateOramActivationAuthorityManifestV1> {
+        match &self.capability_upgrade {
+            Some(upgrade) if upgrade.format_floor_digest == format_floor_digest => {
+                Some(&upgrade.predecessor.manifest)
+            }
+            Some(_) => None,
+            None => Some(self.manifest()),
+        }
+    }
+
     fn from_verified(verified: &VerifiedSignedPrivateOramActivationAuthorityManifestV1) -> Self {
         Self {
             version: PRIVATE_ORAM_ACTIVATION_AUTHORITY_STATE_VERSION,
             manifest_digest: verified.manifest_digest().to_string(),
             bundle: verified.bundle().clone(),
+            capability_upgrade: None,
         }
     }
 }
@@ -278,6 +335,29 @@ pub fn validate_private_oram_activation_authority_state_v1_shape(
     if state.manifest_digest != expected_digest {
         return Err(PrivateOramActivationAuthorityStateError::InvalidPersistedState);
     }
+    if let Some(upgrade) = &state.capability_upgrade {
+        let invalid = || PrivateOramActivationAuthorityStateError::InvalidPersistedState;
+        let predecessor = &upgrade.predecessor;
+        validate_private_oram_activation_authority_manifest_v1_shape(&predecessor.manifest)
+            .map_err(|_| invalid())?;
+        validate_private_oram_activation_authority_signature_v1_shape(&predecessor.signature)
+            .map_err(|_| invalid())?;
+        let predecessor_digest =
+            private_oram_activation_authority_manifest_digest_v1(&predecessor.manifest)
+                .map_err(|_| invalid())?;
+        let floor_digest = BASE64URL_NOPAD
+            .decode(upgrade.format_floor_digest.as_bytes())
+            .map_err(|_| invalid())?;
+        if predecessor.manifest.registry_generation.checked_add(1)
+            != Some(state.registry_generation())
+            || state.manifest().parent_manifest_digest.as_deref()
+                != Some(predecessor_digest.as_str())
+            || floor_digest.len() != 32
+            || BASE64URL_NOPAD.encode(&floor_digest) != upgrade.format_floor_digest
+        {
+            return Err(invalid());
+        }
+    }
     Ok(())
 }
 
@@ -310,7 +390,7 @@ fn verify_private_oram_activation_authority_state_v1(
     PrivateOramActivationAuthorityStateError,
 > {
     validate_private_oram_activation_authority_state_v1_shape(state)?;
-    validate_private_oram_activation_authority_bundle_v1(
+    let verified = validate_private_oram_activation_authority_bundle_v1(
         &state.bundle,
         trust_anchor,
         PrivateOramActivationRegistryExpectationV1::Anchored {
@@ -318,7 +398,28 @@ fn verify_private_oram_activation_authority_state_v1(
             manifest_digest: state.manifest_digest(),
         },
     )
-    .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidPersistedState)
+    .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidPersistedState)?;
+    if let Some(upgrade) = &state.capability_upgrade {
+        let predecessor_digest =
+            private_oram_activation_authority_manifest_digest_v1(&upgrade.predecessor.manifest)
+                .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidPersistedState)?;
+        let predecessor = validate_private_oram_activation_authority_bundle_v1(
+            &upgrade.predecessor,
+            trust_anchor,
+            PrivateOramActivationRegistryExpectationV1::Anchored {
+                registry_generation: upgrade.predecessor.manifest.registry_generation,
+                manifest_digest: &predecessor_digest,
+            },
+        )
+        .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidPersistedState)?;
+        validate_private_oram_activation_authority_transition_v1(
+            &predecessor,
+            &state.bundle,
+            trust_anchor,
+        )
+        .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidPersistedState)?;
+    }
+    Ok(verified)
 }
 
 pub(super) fn plan_private_oram_activation_authority_cas_v1(
@@ -381,7 +482,8 @@ pub fn validate_private_oram_activation_authority_snapshot_transition_v1(
         validate_private_oram_activation_authority_state_v1_shape(current)?;
     }
     if let Some(incoming) = incoming {
-        validate_private_oram_activation_authority_state_v1_shape(incoming)?;
+        verify_private_oram_activation_authority_state_v1(incoming, trust_anchor)
+            .map_err(|_| PrivateOramActivationAuthorityStateError::InvalidSnapshotTransition)?;
     }
     match (current, incoming) {
         (None, None) => Ok(()),
@@ -675,6 +777,75 @@ mod tests {
     }
 
     #[test]
+    fn capability_upgrade_evidence_requires_the_exact_signed_predecessor() {
+        let (key_pair, trust_anchor, bundle) = genesis();
+        let verified = validate_private_oram_activation_authority_bundle_v1(
+            &bundle,
+            &trust_anchor,
+            PrivateOramActivationRegistryExpectationV1::Genesis,
+        )
+        .unwrap();
+        let current = PrivateOramActivationAuthorityStateV1::from_verified(&verified);
+        assert!(
+            serde_json::to_value(&current)
+                .unwrap()
+                .get("capability_upgrade")
+                .is_none()
+        );
+        let successor = successor(&key_pair, &current);
+        let verified = validate_private_oram_activation_authority_transition_v1(
+            &verified,
+            &successor,
+            &trust_anchor,
+        )
+        .unwrap();
+        let mut next = PrivateOramActivationAuthorityStateV1::from_verified(&verified);
+        next.retain_capability_upgrade_predecessor(&current, &digest(80));
+        verify_private_oram_activation_authority_state_v1(&next, &trust_anchor).unwrap();
+        validate_private_oram_activation_authority_snapshot_transition_v1(
+            Some(&current),
+            Some(&next),
+            &trust_anchor,
+        )
+        .unwrap();
+        assert!(next.capability_upgrade_matches_floor(&digest(80), &digest(2)));
+        assert!(!next.capability_upgrade_matches_floor(&digest(81), &digest(2)));
+        assert!(!next.capability_upgrade_matches_floor(&digest(80), &digest(3)));
+
+        let mut bad_signature = next.clone();
+        bad_signature
+            .capability_upgrade
+            .as_mut()
+            .unwrap()
+            .predecessor
+            .signature
+            .sig = BASE64URL_NOPAD.encode(&[91; 64]);
+        let mut wrong_parent = next.clone();
+        let mut other_manifest = bundle.manifest.clone();
+        other_manifest.required_binary_capability_digest = digest(81);
+        wrong_parent
+            .capability_upgrade
+            .as_mut()
+            .unwrap()
+            .predecessor =
+            package_private_oram_activation_authority_manifest_v1(&key_pair, 1, other_manifest)
+                .unwrap();
+        for invalid in [bad_signature, wrong_parent] {
+            assert!(
+                verify_private_oram_activation_authority_state_v1(&invalid, &trust_anchor).is_err()
+            );
+            assert!(
+                validate_private_oram_activation_authority_snapshot_transition_v1(
+                    Some(&current),
+                    Some(&invalid),
+                    &trust_anchor,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn current_at_read_rejects_wrong_external_trust_anchor() {
         let (_, trust_anchor, bundle) = genesis();
         let store_instance_id = PrivateOramActivationAuthorityStoreInstanceId::default();
@@ -801,6 +972,7 @@ mod tests {
             )
             .unwrap(),
             bundle: removed_bundle,
+            capability_upgrade: None,
         };
         assert_eq!(
             validate_private_oram_activation_authority_snapshot_transition_v1(

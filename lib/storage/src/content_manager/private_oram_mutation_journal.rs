@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 
 use collection::operations::types::{CollectionError, CollectionResult};
 use collection::private_oram_owner_journal::{
+    PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1,
+    PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_MAX_BYTES_V1, PrivateOramOwnerArchivedGenerationV1,
+    PrivateOramOwnerCommittedArchiveGrantIndexV1, PrivateOramOwnerCommittedArchiveGrantV1,
     PrivateOramOwnerRecoveryIndexProjectionInputV1, PrivateOramOwnerRecoveryIndexProjectionV1,
-    PrivateOramOwnerRecoveryProjectionV1,
+    PrivateOramOwnerRecoveryProjectionV1, decode_private_oram_owner_committed_archive_grant_v1,
+    encode_private_oram_owner_committed_archive_grant_v1,
 };
 use collection::shards::channel_service::PrivateOramAuthenticatedOwnerRecoveryResponse;
 use collection::shards::shard::PeerId;
@@ -1716,6 +1720,178 @@ struct PrivateOramMutationTerminalArchiveV2 {
     archive_digest: String,
 }
 
+/// Exact parent archive proof retained while the corresponding child owner journal is retired.
+#[doc(hidden)]
+pub struct PrivateOramArchivedParentReadyV2 {
+    key: PrivateOramMutationKey,
+    vector_name: String,
+    owner_signing_key_id: String,
+    generation: u64,
+    owner_peer_id: PeerId,
+    descriptor_digest: String,
+    terminal_record_digest: String,
+    parent_archive_record_digest: String,
+    pending_tombstone_digest: String,
+    clear_receipt_digest: String,
+    prestage_receipt_digest: String,
+    owner_terminal_evidence_digest: String,
+}
+
+impl Debug for PrivateOramArchivedParentReadyV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramArchivedParentReadyV2")
+            .field("generation", &"[redacted]")
+            .field("owner_peer_id", &"[redacted]")
+            .field("archive", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PrivateOramArchivedParentReadyV2 {
+    pub(crate) fn key(&self) -> &PrivateOramMutationKey {
+        &self.key
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn owner_peer_id(&self) -> PeerId {
+        self.owner_peer_id
+    }
+
+    pub(crate) fn matches_permit(
+        &self,
+        permit: &PrivateOramMutationClearedPendingArchivePermitV2,
+    ) -> bool {
+        self.key.collection_id == permit.collection_id()
+            && self.vector_name == permit.vector_name()
+            && self.owner_signing_key_id == permit.owner_signing_key_id()
+            && self.generation == permit.generation()
+            && self.owner_peer_id == permit.owner_peer_id()
+            && self.descriptor_digest == permit.descriptor_digest()
+            && self.terminal_record_digest == permit.terminal_record_digest()
+            && self.pending_tombstone_digest == permit.archive_binding_digest()
+            && self.clear_receipt_digest == permit.clear_receipt_digest()
+            && self.prestage_receipt_digest == permit.owner_prestage_receipt().receipt_digest()
+    }
+
+    pub(crate) fn parent_archive_record_digest(&self) -> &str {
+        &self.parent_archive_record_digest
+    }
+
+    pub(crate) fn pending_tombstone_digest(&self) -> &str {
+        &self.pending_tombstone_digest
+    }
+
+    pub(crate) fn clear_receipt_digest(&self) -> &str {
+        &self.clear_receipt_digest
+    }
+
+    pub(crate) fn prestage_receipt_digest(&self) -> &str {
+        &self.prestage_receipt_digest
+    }
+
+    pub(crate) fn owner_terminal_evidence_digest(&self) -> &str {
+        &self.owner_terminal_evidence_digest
+    }
+
+    pub(crate) fn into_ack_parts(self) -> (PrivateOramMutationKey, PeerId, u64) {
+        (self.key, self.owner_peer_id, self.generation)
+    }
+}
+
+/// Process-local capability proving that both parent and child terminal namespaces are archived.
+/// It is intentionally non-cloneable and non-serializable.
+#[doc(hidden)]
+pub struct PrivateOramMutationLocalArchiveReadyV2 {
+    parent: PrivateOramArchivedParentReadyV2,
+}
+
+impl Debug for PrivateOramMutationLocalArchiveReadyV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationLocalArchiveReadyV2")
+            .field("generation", &"[redacted]")
+            .field("owner_peer_id", &"[redacted]")
+            .field("archive_chain", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PrivateOramMutationLocalArchiveReadyV2 {
+    pub(crate) fn try_from_exact_archives(
+        parent: PrivateOramArchivedParentReadyV2,
+        owner: PrivateOramOwnerArchivedGenerationV1,
+        current: &PrivateOramMutationClearedPendingArchivePermitV2,
+    ) -> Result<Self, PrivateOramMutationJournalError> {
+        if !parent.matches_permit(current)
+            || owner.collection_id() != parent.key.collection_id
+            || owner.generation() != parent.generation
+            || owner.owner_peer_id() != parent.owner_peer_id
+            || owner.parent_archive_record_digest() != parent.parent_archive_record_digest
+            || owner.pending_tombstone_digest() != parent.pending_tombstone_digest
+            || owner.clear_receipt_digest() != parent.clear_receipt_digest
+            || owner.retired_prestage_receipt_digest() != parent.prestage_receipt_digest
+            || owner.owner_terminal_evidence_digest() != parent.owner_terminal_evidence_digest
+        {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        Ok(Self { parent })
+    }
+
+    pub(crate) fn key(&self) -> &PrivateOramMutationKey {
+        self.parent.key()
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.parent.generation()
+    }
+
+    pub(crate) const fn owner_peer_id(&self) -> PeerId {
+        self.parent.owner_peer_id()
+    }
+
+    pub(crate) fn matches_permit(
+        &self,
+        permit: &PrivateOramMutationClearedPendingArchivePermitV2,
+    ) -> bool {
+        self.parent.matches_permit(permit)
+    }
+
+    pub(crate) fn into_ack_parts(self) -> (PrivateOramMutationKey, PeerId, u64) {
+        self.parent.into_ack_parts()
+    }
+}
+
+/// Parent terminal archive after its canonical child grant has been durably published.
+#[doc(hidden)]
+pub struct PrivateOramArchivedParentTerminalBindingV2 {
+    ready: PrivateOramArchivedParentReadyV2,
+}
+
+impl Debug for PrivateOramArchivedParentTerminalBindingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramArchivedParentTerminalBindingV2")
+            .field("generation", &"[redacted]")
+            .field("owner_peer_id", &"[redacted]")
+            .field("terminal", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PrivateOramArchivedParentTerminalBindingV2 {
+    pub fn generation(&self) -> u64 {
+        self.ready.generation
+    }
+
+    pub fn into_ready(self) -> PrivateOramArchivedParentReadyV2 {
+        self.ready
+    }
+}
+
 impl Debug for PrivateOramMutationCleanupV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -2424,6 +2600,7 @@ pub(crate) fn private_oram_mutation_admission_recovery_manifest_for_test(
         lease.generation,
         lease.writer_fence,
         lease.owner_peer_id,
+        test_digest(b"test-owner-store-incarnation", lease),
         parent_descriptor_digest.clone(),
         parent_lease_acquired_record_digest.clone(),
         owner_roster_digest.clone(),
@@ -2574,6 +2751,7 @@ pub(crate) fn private_oram_mutation_append_fixture_with_owner_signer_seeds_for_t
             lease.generation,
             lease.writer_fence,
             owner_peer_id,
+            test_digest(b"test-owner-store-incarnation", lease, Some(owner_peer_id)),
             parent_descriptor_digest.clone(),
             parent_lease_acquired_record_digest.clone(),
             owner_roster_digest.clone(),
@@ -3940,6 +4118,40 @@ impl PrivateOramMutationJournal {
                 .clone(),
         };
         Ok(PrivateOramMutationRecoveryReadinessProposalV2 { key, expectation })
+    }
+
+    /// Reopens the canonical parent journal and derives the ordered consensus prefix required
+    /// before owner recovery capsules can be installed.
+    pub fn point_stage_parent_progress_proposals_v2(
+        &self,
+    ) -> Result<Vec<PrivateOramMutationNeedParentProgressV2>, PrivateOramMutationJournalError> {
+        let snapshot = self
+            .load_v2()?
+            .ok_or(PrivateOramMutationJournalError::Corrupt)?;
+        let point_stage_sequence = PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence();
+        if snapshot.state.phase.sequence() < point_stage_sequence {
+            return Err(PrivateOramMutationJournalError::InvalidTransition);
+        }
+        let key = PrivateOramMutationKey {
+            collection_id: snapshot
+                .validated_descriptor()
+                .mutation_bundle
+                .mutation
+                .collection_id
+                .clone(),
+        };
+        (1..=point_stage_sequence)
+            .map(|sequence| {
+                Ok(PrivateOramMutationNeedParentProgressV2 {
+                    proposal: PrivateOramMutationParentProgressProposalV2 {
+                        key: key.clone(),
+                        expectation: derive_private_oram_mutation_parent_watermark_at_sequence_v2(
+                            &snapshot, sequence,
+                        )?,
+                    },
+                })
+            })
+            .collect()
     }
 
     pub fn begin(
@@ -6385,14 +6597,16 @@ mod tests {
         PRIVATE_ORAM_PEER_RECOVERY_PROTOCOL_VERSION, PRIVATE_ORAM_SIGNED_STATE_V2_VERSION,
         PRIVATE_ORAM_STAGED_INSERT_FRAME_V1_VERSION, PrivateHnswParams, PrivateHnswVectorEncoding,
         PrivateOramAppendBucketRefV1, PrivateOramAppendIndexWritebackV1,
-        PrivateOramAppendMutationV1, PrivateOramImmutableIndexParamsV2,
-        PrivateOramImmutableIndexV2, PrivateOramImmutableManifestV2, PrivateOramIndexCapacityV2,
-        PrivateOramIndexStateV2, PrivateOramSignedStateV2, PrivateOramStagedInsertFrameV1,
-        PrivateOramStagedPointIdV1, PrivateOramStagedPointV1, ResultPrivacyMode,
-        VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER, encode_private_oram_staged_insert_frame_v1,
-        package_private_oram_append_mutation_v1, package_private_oram_immutable_manifest_v2,
-        package_private_oram_signed_state_v2, private_oram_no_server_point_record_v1_digest,
-        private_oram_staged_insert_frame_v1_digest, private_oram_staged_point_semantic_v1_digest,
+        PrivateOramAppendMutationV1, PrivateOramAppendOwnerPrestageValidationContextV2,
+        PrivateOramImmutableIndexParamsV2, PrivateOramImmutableIndexV2,
+        PrivateOramImmutableManifestV2, PrivateOramIndexCapacityV2, PrivateOramIndexStateV2,
+        PrivateOramSignedStateV2, PrivateOramStagedInsertFrameV1, PrivateOramStagedPointIdV1,
+        PrivateOramStagedPointV1, ResultPrivacyMode, VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER,
+        encode_private_oram_staged_insert_frame_v1, package_private_oram_append_mutation_v1,
+        package_private_oram_immutable_manifest_v2, package_private_oram_signed_state_v2,
+        private_oram_no_server_point_record_v1_digest, private_oram_staged_insert_frame_v1_digest,
+        private_oram_staged_point_semantic_v1_digest,
+        validate_private_oram_append_owner_prepare_from_durable_recovery_v2,
     };
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::json;
@@ -6400,6 +6614,7 @@ mod tests {
 
     use super::writer_v2::{
         PrivateOramMutationJournalStructuralSnapshotV2, set_fail_immutable_json_after_rename_v2,
+        set_fail_terminal_archive_after_directory_rename_v2,
     };
     use super::*;
     use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
@@ -6446,6 +6661,7 @@ mod tests {
         private_oram_parent_progress_applied_entry_for_test,
         replace_private_oram_applied_entry_namespace_for_test,
         replace_private_oram_applied_entry_operation_digest_for_test,
+        replace_private_oram_archive_prestage_receipt_for_test,
         validate_private_oram_mutation_cleanup_lifecycle_v2,
         validate_private_oram_mutation_cleanup_pair_v2,
     };
@@ -6455,10 +6671,12 @@ mod tests {
         decode_private_oram_mutation_recovery_capsules_ready_v2,
         derive_private_oram_mutation_recovery_capsules_ready_v2,
         encode_private_oram_mutation_recovery_capsules_ready_v2,
+        private_oram_owner_capsule_set_digest_v2,
     };
     use crate::content_manager::consensus::private_oram_mutation_watermark::{
         PrivateOramMutationParentWatermarkExpectationV2, PrivateOramMutationParentWatermarkV2,
         derive_private_oram_mutation_parent_watermark_expectation_v2,
+        private_oram_mutation_parent_watermark_expectation_for_test,
         replace_private_oram_mutation_parent_watermark_record_for_test,
         truncate_private_oram_mutation_parent_watermark_expectation_for_test,
         validate_private_oram_mutation_parent_watermark_v2_cas_transition,
@@ -6556,15 +6774,15 @@ mod tests {
     }
 
     fn signed_owner_install_evidence_v2(
-        fixture: &Fixture,
+        lease: &PrivateOramMutationLease,
         receipt: PrivateOramOwnerRecoveryCapsuleInstallReceiptV2,
     ) -> PrivateOramOwnerRecoveryCapsuleInstallEvidenceV2 {
         let receipt_canonical_json =
             encode_private_oram_owner_recovery_capsule_install_receipt_v2(&receipt).unwrap();
         let statement = qdrant_sec::PrivateOramOwnerCapsuleInstallAttestationStatementV2 {
             protocol_version: qdrant_sec::PRIVATE_ORAM_OWNER_CAPSULE_INSTALL_PROTOCOL_VERSION_V2,
-            collection_id: fixture.preparing_lease.collection_id.clone(),
-            mutation_id: fixture.preparing_lease.mutation_id.clone(),
+            collection_id: lease.collection_id.clone(),
+            mutation_id: lease.mutation_id.clone(),
             parent_descriptor_digest: receipt.parent_descriptor_digest().to_string(),
             owner_peer_id: receipt.owner_peer_id(),
             activation_registry_generation: receipt.activation_authority().registry_generation(),
@@ -7061,11 +7279,19 @@ mod tests {
     }
 
     fn paired_store_fixture(temp: &TempDir) -> (PrivateOramOwnerStorePairTestFixtureV1, Fixture) {
+        paired_store_fixture_with_writer_fence(temp, 1)
+    }
+
+    fn paired_store_fixture_with_writer_fence(
+        temp: &TempDir,
+        writer_fence: u64,
+    ) -> (PrivateOramOwnerStorePairTestFixtureV1, Fixture) {
         let collection_path = temp.path().join("collection");
         fs::create_dir(&collection_path).unwrap();
-        let pair = PrivateOramOwnerStorePairTestFixtureV1::new(
+        let pair = PrivateOramOwnerStorePairTestFixtureV1::new_with_writer_fence(
             &collection_path,
             PAIRED_STORE_NON_SECRET_TEST_OWNER_SEED,
+            writer_fence,
         );
         let mutation_bundle = pair.mutation_bundle().clone();
         let mutation = &mutation_bundle.mutation;
@@ -7244,6 +7470,7 @@ mod tests {
             lease.generation,
             lease.writer_fence,
             lease.owner_peer_id,
+            digest(209),
             parent_descriptor_digest.clone(),
             parent_lease_acquired_record_digest.clone(),
             owner_roster_digest.clone(),
@@ -7314,6 +7541,7 @@ mod tests {
         (encoded, package, fixture)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn admission_recovery_manifest_v2_binds_durable_recovery_envelope() {
         let (encoded, expected_package, fixture) = admission_recovery_manifest_v2_fixture();
@@ -7353,6 +7581,92 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_recovery_reconstructs_plan_against_precommit_consensus_state() {
+        let (encoded, package, fixture) = admission_recovery_manifest_v2_fixture();
+        let manifest = decode_private_oram_mutation_admission_recovery_manifest_v2(&encoded)
+            .expect("V2 recovery manifest must decode");
+        let mutation = &package.owner_prepare.mutation_bundle.mutation;
+        let old_state = &mutation.old_state.state;
+        let old_state_digest = private_oram_signed_state_v2_digest(old_state).unwrap();
+        let validated = validate_private_oram_append_owner_prepare_from_durable_recovery_v2(
+            &package.immutable_manifest,
+            &package.owner_prepare,
+            &package.durable_read_observations,
+            PrivateOramAppendOwnerPrestageValidationContextV2 {
+                expected_collection_id: &mutation.collection_id,
+                expected_manifest_digest: &mutation.manifest_digest,
+                expected_owner_signing_key_id: &mutation.owner_signing_key_id,
+                expected_layout_generation: old_state.layout_generation,
+                expected_layout_digest: &old_state.layout_digest,
+                expected_writer_lease_digest: &mutation.writer_lease_digest,
+                expected_writer_fence: mutation.writer_fence,
+                expected_state_sequence: old_state.state_sequence,
+                expected_old_state_digest: &old_state_digest,
+                expected_visible_point_record: None,
+                now_unix: mutation.new_state.state.signed_at_unix,
+                max_mutation_ttl_secs: 300,
+                public_key: &fixture.public_key,
+            },
+        )
+        .unwrap();
+        let previous_slot = PrivateOramMutationLeaseSlotV2 {
+            version: PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION,
+            generation: fixture.preparing_lease.generation - 1,
+            active: None,
+            last_clear: None,
+            max_writer_fence: fixture.preparing_lease.writer_fence - 1,
+        };
+        let admission = derive_private_oram_mutation_admission_plan_v2(
+            fixture.preparing_lease.owner_peer_id,
+            fixture.preparing_lease.generation,
+            fixture.preparing_lease.writer_fence,
+            &previous_slot,
+            &fixture.old_consensus,
+            &validated,
+        )
+        .unwrap();
+        let preparing_lease = admission.lease().clone();
+        let recovered_preparing = derive_private_oram_mutation_admitted_recovery_plan_v2(
+            &preparing_lease,
+            &fixture.old_consensus,
+            &manifest,
+            &validated,
+        )
+        .expect("pre-commit recovery must reconstruct from the still-current old state");
+        assert_eq!(recovered_preparing, admission);
+        assert!(
+            derive_private_oram_mutation_admitted_recovery_plan_v2(
+                &preparing_lease,
+                &fixture.new_consensus,
+                &manifest,
+                &validated,
+            )
+            .is_err()
+        );
+
+        let mut committed_lease = preparing_lease;
+        committed_lease.phase = fixture.committed_lease.phase.clone();
+        let recovered_committed = derive_private_oram_mutation_admitted_recovery_plan_v2(
+            &committed_lease,
+            &fixture.new_consensus,
+            &manifest,
+            &validated,
+        )
+        .expect("post-commit recovery must reconstruct against the committed new state");
+        assert_eq!(recovered_committed, admission);
+        assert!(
+            derive_private_oram_mutation_admitted_recovery_plan_v2(
+                &committed_lease,
+                &fixture.old_consensus,
+                &manifest,
+                &validated,
+            )
+            .is_err()
+        );
+    }
+
     fn journal(temp: &TempDir, fixture: &Fixture) -> PrivateOramMutationJournal {
         let collection = temp.path().join("collection");
         if !collection.exists() {
@@ -7380,6 +7694,28 @@ mod tests {
                 fixture.old_consensus.clone(),
             )
             .unwrap()
+    }
+
+    // Protocol and codec tests need the canonical initial image, without publishing a journal.
+    fn initial_snapshot(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        owners: &[PeerId],
+    ) -> PrivateOramMutationJournalSnapshotV1 {
+        let descriptor = journal
+            .build_descriptor(
+                11,
+                owners,
+                fixture.mutation_bundle.clone(),
+                fixture.preparing_lease.clone(),
+                fixture.old_consensus.clone(),
+            )
+            .unwrap();
+        let mut snapshot = v1_snapshot_for_descriptor(&descriptor);
+        snapshot.state.record_digest =
+            state_record_digest(&descriptor.descriptor_digest, &snapshot.state).unwrap();
+        validate_state(&descriptor, &snapshot.state).unwrap();
+        snapshot
     }
 
     fn owner_prepares(
@@ -7878,6 +8214,32 @@ mod tests {
         derive_private_oram_mutation_parent_watermark_expectation_v2(&snapshot).unwrap()
     }
 
+    fn v2_parent_watermark_expectation_in_memory(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        decision_kind: PrivateOramMutationDecisionKindV2,
+        target_phase: PrivateOramMutationJournalPhaseV2,
+    ) -> PrivateOramMutationParentWatermarkExpectationV2 {
+        let initial = initial_snapshot(journal, fixture, &[11]);
+        let state = v2_no_server_terminal_state_for_descriptor(
+            &initial.descriptor,
+            fixture,
+            decision_kind,
+            target_phase,
+        );
+        let history =
+            canonical_private_oram_mutation_state_history_v2(&initial.descriptor, &state).unwrap();
+        private_oram_mutation_parent_watermark_expectation_for_test(
+            &initial.descriptor.preparing_lease,
+            initial.descriptor.descriptor_digest.clone(),
+            history
+                .into_iter()
+                .map(|record| record.record_digest)
+                .collect(),
+        )
+        .unwrap()
+    }
+
     fn cleanup_lifecycle_at_terminal_parent(
         journal: &PrivateOramMutationJournal,
         fixture: &Fixture,
@@ -7912,7 +8274,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             journal,
             fixture,
             decision_kind,
@@ -7945,6 +8307,13 @@ mod tests {
     }
 
     fn admitted_cleanup_authority(fixture: &Fixture) -> PrivateOramMutationAuthorityStateV2 {
+        admitted_cleanup_authority_with_owner_enrollment(fixture, false)
+    }
+
+    fn admitted_cleanup_authority_with_owner_enrollment(
+        fixture: &Fixture,
+        enroll_owner: bool,
+    ) -> PrivateOramMutationAuthorityStateV2 {
         let authority_key = private_oram_mutation_authority_key_v2(
             &fixture.preparing_lease.collection_id,
             digest(245),
@@ -7972,6 +8341,52 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        if enroll_owner {
+            use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
+                apply_private_oram_mutation_authority_owner_enrollment_activated_v2,
+                apply_private_oram_mutation_authority_owner_enrollment_prepared_v2,
+                private_oram_mutation_owner_enrollment_fixture_for_test,
+            };
+            let owner_key = Ed25519KeyPair::from_seed_unchecked(&[12; 32]).unwrap();
+            assert_eq!(fixture.preparing_lease.owner_peer_id, 11);
+            let (prepared, commitment) = private_oram_mutation_owner_enrollment_fixture_for_test(
+                &authority,
+                &fixture.preparing_lease.collection_id,
+                7,
+                11,
+                &owner_key,
+                20,
+            )
+            .unwrap();
+            let prepare_context = private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::OwnerEnrollmentPrepared,
+                prepared.prepared_record_digest.clone(),
+                1,
+                2,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_owner_enrollment_prepared_v2(
+                &authority,
+                prepared,
+                prepare_context,
+            )
+            .unwrap();
+            let activate_context = private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::OwnerEnrollmentActivated,
+                commitment.commitment_digest.clone(),
+                1,
+                3,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_owner_enrollment_activated_v2(
+                &authority,
+                commitment,
+                activate_context,
+            )
+            .unwrap();
+        }
         let manifest_seed = private_oram_mutation_admission_recovery_manifest_for_test(
             &fixture.preparing_lease,
             authority.aggregate().unwrap().aggregate_digest(),
@@ -8074,7 +8489,29 @@ mod tests {
         PrivateOramMutationParentWatermarkExpectationV2,
         PrivateOramMutationRecoveryCapsulesReadyExpectationV2,
     ) {
-        let mut authority = admitted_cleanup_authority(fixture);
+        cleanup_authority_at_terminal_parent_with_owner_enrollment(
+            journal,
+            fixture,
+            decision_kind,
+            activation_authority,
+            owner_evidence,
+            false,
+        )
+    }
+
+    fn cleanup_authority_at_terminal_parent_with_owner_enrollment(
+        journal: &PrivateOramMutationJournal,
+        fixture: &Fixture,
+        decision_kind: PrivateOramMutationDecisionKindV2,
+        activation_authority: crate::content_manager::consensus::private_oram_activation_authority::PrivateOramActivationAuthorityLocatorV1,
+        owner_evidence: PrivateOramOwnerRecoveryCapsuleInstallEvidenceV2,
+        enroll_owner: bool,
+    ) -> (
+        PrivateOramMutationAuthorityStateV2,
+        PrivateOramMutationParentWatermarkExpectationV2,
+        PrivateOramMutationRecoveryCapsulesReadyExpectationV2,
+    ) {
+        let mut authority = admitted_cleanup_authority_with_owner_enrollment(fixture, enroll_owner);
         let terminal = v2_parent_watermark_expectation(
             journal,
             fixture,
@@ -8459,9 +8896,9 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "stale fixture: the paired store fixture cannot mint a next-generation bundle"]
-    fn v2_owner_recovery_capsule_store_supersedes_previous_generation() {
+    fn v2_owner_recovery_capsule_store_retains_successive_generations() {
         let parent_temp = tempfile::tempdir().unwrap();
         let next_parent_temp = tempfile::tempdir().unwrap();
         let owner_temp = tempfile::tempdir().unwrap();
@@ -8481,23 +8918,16 @@ mod tests {
         owner_store
             .install(&package, &activation, pair.resources())
             .unwrap();
+        owner_store
+            .install(&package, &activation, pair.resources())
+            .unwrap();
 
         // The next mutation of the same collection mints a capsule for the next lease
         // generation; the store must accept it instead of treating the collection as one-shot.
-        let (next_pair, next_base) = paired_store_fixture(&next_owner_temp);
-        let mut next_lease = next_base.preparing_lease.clone();
-        next_lease.generation += 1;
-        next_lease.writer_fence += 1;
-        let next_fixture = Fixture {
-            public_key: next_base.public_key.clone(),
-            immutable_manifest: next_base.immutable_manifest.clone(),
-            mutation_bundle: next_base.mutation_bundle.clone(),
-            preparing_lease: next_lease,
-            committed_lease: next_base.committed_lease.clone(),
-            old_consensus: next_base.old_consensus.clone(),
-            new_consensus: next_base.new_consensus.clone(),
-            staged_frame_bytes: next_base.staged_frame_bytes.clone(),
-        };
+        let (next_pair, next_fixture) = paired_store_fixture_with_writer_fence(
+            &next_owner_temp,
+            fixture.preparing_lease.writer_fence + 1,
+        );
         let next_journal = journal(&next_parent_temp, &next_fixture);
         let next_package = point_stage_owner_capsule_package_v2(
             &next_journal,
@@ -8511,23 +8941,54 @@ mod tests {
             next_package.lease_generation(),
             package.lease_generation() + 1
         );
-        owner_store
+        // The independent paired fixtures each own their prepared journal and store image.
+        // Reopen the retained capsule directory beside the next valid local image, rather
+        // than passing resources from a different collection directory to the first store.
+        let capsule_root = next_owner_temp
+            .path()
+            .join("collection/private_oram_owner_recovery_capsules_v2");
+        fs::rename(
+            owner_temp
+                .path()
+                .join("collection/private_oram_owner_recovery_capsules_v2"),
+            &capsule_root,
+        )
+        .unwrap();
+        let next_owner_store = owner_capsule_store_v2(
+            &next_owner_temp.path().join("collection"),
+            &next_fixture,
+            11,
+        );
+        next_owner_store
             .install(&next_package, &activation, next_pair.resources())
             .unwrap();
-        // The current capsule stays idempotent, a replay of the previous generation is refused,
-        // and the store serves the newest material.
-        owner_store
+        // Both generations remain exactly replayable and load only through their explicit
+        // generation, so a later install cannot replace earlier recovery material.
+        next_owner_store
             .install(&next_package, &activation, next_pair.resources())
             .unwrap();
-        assert!(matches!(
-            owner_store
-                .install(&package, &activation, pair.resources())
-                .unwrap_err(),
-            PrivateOramMutationJournalError::ConcurrentMutation
-        ));
-        owner_store.load_recovery_material_v2(&activation).unwrap();
+        for (installed, expected_fixture) in [(&package, &fixture), (&next_package, &next_fixture)]
+        {
+            assert!(
+                capsule_root
+                    .join(format!("capsule-v2-{:020}.json", installed.generation()))
+                    .is_file()
+            );
+            let material = next_owner_store
+                .load_recovery_material_v2(installed.generation(), &activation)
+                .unwrap();
+            assert_eq!(
+                material.immutable_manifest(),
+                &expected_fixture.immutable_manifest
+            );
+            assert_eq!(
+                material.mutation_bundle(),
+                &expected_fixture.mutation_bundle
+            );
+        }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_requires_point_stage_durable_parent() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8543,6 +9004,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_install_is_insert_only_and_exactly_replayable() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8569,8 +9031,17 @@ mod tests {
         );
         assert_eq!(first.capsule_digest(), package.capsule_digest());
         assert_eq!(first.capsule_set_digest(), package.capsule_set_digest());
+        let capsule_root = remote_collection.join("private_oram_owner_recovery_capsules_v2");
+        assert!(
+            capsule_root
+                .join(format!("capsule-v2-{:020}.json", package.generation()))
+                .is_file()
+        );
+        assert!(!capsule_root.join("capsule.json").exists());
 
-        let material = store.load_recovery_material_v2(&activation).unwrap();
+        let material = store
+            .load_recovery_material_v2(package.generation(), &activation)
+            .unwrap();
         assert_eq!(material.immutable_manifest(), &fixture.immutable_manifest);
         assert_eq!(material.mutation_bundle(), &fixture.mutation_bundle);
 
@@ -8580,6 +9051,51 @@ mod tests {
         assert!(!debug.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v2_owner_recovery_capsule_legacy_file_is_generation_exact() {
+        let parent_temp = tempfile::tempdir().unwrap();
+        let remote_temp = tempfile::tempdir().unwrap();
+        let (pair, fixture) = paired_store_fixture(&remote_temp);
+        let journal = journal(&parent_temp, &fixture);
+        let activation = activation_locator_for_capsule_test(203);
+        let package =
+            point_stage_owner_capsule_package_v2(&journal, &fixture, &pair, 11, activation.clone());
+        let remote_collection = remote_temp.path().join("collection");
+        let store = owner_capsule_store_v2(&remote_collection, &fixture, 11);
+        store
+            .install(&package, &activation, pair.resources())
+            .unwrap();
+
+        let capsule_root = remote_collection.join("private_oram_owner_recovery_capsules_v2");
+        fs::rename(
+            capsule_root.join(format!("capsule-v2-{:020}.json", package.generation())),
+            capsule_root.join("capsule.json"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .load_recovery_material_v2(package.generation(), &activation)
+                .unwrap()
+                .mutation_bundle(),
+            &fixture.mutation_bundle
+        );
+        assert_eq!(
+            store
+                .install(&package, &activation, pair.resources())
+                .unwrap()
+                .capsule_digest(),
+            package.capsule_digest()
+        );
+        assert!(
+            store
+                .load_recovery_material_v2(package.generation() + 1, &activation)
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_wrong_owner_authority_and_tampering() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8617,6 +9133,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_a_conflicting_valid_package() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8649,13 +9166,14 @@ mod tests {
         );
         assert_eq!(
             store
-                .load_recovery_material_v2(&first_activation)
+                .load_recovery_material_v2(first.generation(), &first_activation)
                 .unwrap()
                 .mutation_bundle(),
             &fixture.mutation_bundle
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_rejects_non_old_physical_pair_before_publication() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8672,9 +9190,14 @@ mod tests {
             store.install(&package, &activation, pair.resources()),
             Err(PrivateOramMutationJournalError::InvalidTransition)
         ));
-        assert!(store.load_recovery_material_v2(&activation).is_err());
+        assert!(
+            store
+                .load_recovery_material_v2(package.generation(), &activation)
+                .is_err()
+        );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_owner_recovery_capsule_fuses_consensus_authority_and_paired_recovery() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -8760,8 +9283,8 @@ mod tests {
         let receipt_12 = owner_12_store
             .install(&package_12, &activation, pair_12.resources())
             .unwrap();
-        let evidence_11 = signed_owner_install_evidence_v2(&fixture, receipt_11);
-        let evidence_12 = signed_owner_install_evidence_v2(&fixture, receipt_12);
+        let evidence_11 = signed_owner_install_evidence_v2(&fixture.preparing_lease, receipt_11);
+        let evidence_12 = signed_owner_install_evidence_v2(&fixture.preparing_lease, receipt_12);
         let snapshot = begin_v2(&parent, &fixture, &[11, 12]);
         let point_stage =
             derive_private_oram_mutation_parent_watermark_expectation_v2(&snapshot).unwrap();
@@ -8910,6 +9433,7 @@ mod tests {
         assert_eq!(replayed, terminal);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_persists_exact_new_decision_as_actual_history() {
         let temp = tempfile::tempdir().unwrap();
@@ -8992,6 +9516,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_terminal_claims_require_exact_peer_set_and_replay_exactly() {
         let temp = tempfile::tempdir().unwrap();
@@ -9043,6 +9568,7 @@ mod tests {
         assert!(!rendered.contains(&evidence.terminal_evidence_digest));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_terminal_claims_reject_identity_kind_digest_and_duplicates() {
         let temp = tempfile::tempdir().unwrap();
@@ -9122,6 +9648,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_remote_owner_recovery_requires_exact_persisted_material_and_request_binding() {
         let temp = tempfile::tempdir().unwrap();
@@ -9264,6 +9791,7 @@ mod tests {
         assert!(!rendered.contains(&request.challenge_nonce));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_fuses_exact_new_and_revalidates_child_on_replay() {
         let temp = tempfile::tempdir().unwrap();
@@ -9312,6 +9840,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_hnsw_published_before_result() {
         let temp = tempfile::tempdir().unwrap();
@@ -9375,6 +9904,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_both_stores_published_before_child() {
         let temp = tempfile::tempdir().unwrap();
@@ -9419,6 +9949,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_fuses_exact_old_pair_recovery() {
         let temp = tempfile::tempdir().unwrap();
@@ -9465,6 +9996,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_exact_old_replays_child_terminal_before_parent() {
         let temp = tempfile::tempdir().unwrap();
@@ -9518,6 +10050,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_exact_old_replays_parent_before_lock_release() {
         let temp = tempfile::tempdir().unwrap();
@@ -9565,6 +10098,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_classifies_parent_failure_after_child_terminal_as_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
@@ -9622,6 +10156,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_replays_parent_published_before_lock_release() {
         let temp = tempfile::tempdir().unwrap();
@@ -9669,6 +10204,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rolls_forward_exact_pending_sequence_six() {
         let expected_temp = tempfile::tempdir().unwrap();
@@ -9738,6 +10274,7 @@ mod tests {
         assert!(rolled.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rejects_pending_remotes_before_child_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -9789,6 +10326,7 @@ mod tests {
         assert!(child.terminal.is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_local_terminal_rejects_cross_collection_store_resources_before_mutation() {
         let local_temp = tempfile::tempdir().unwrap();
@@ -9868,6 +10406,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_requires_abort_decision_for_exact_old() {
         let temp = tempfile::tempdir().unwrap();
@@ -9918,6 +10457,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_point_resolution_requires_exact_local_terminal_token() {
         let temp = tempfile::tempdir().unwrap();
@@ -9956,6 +10496,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rolls_forward_only_the_exact_pending_point_resolution() {
         let temp = tempfile::tempdir().unwrap();
@@ -10001,6 +10542,7 @@ mod tests {
         assert!(resolved.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_validates_visible_point_receipt_under_live_stage_lock() {
         let temp = tempfile::tempdir().unwrap();
@@ -10140,6 +10682,7 @@ mod tests {
         assert!(!rendered.contains(&fixture.mutation_bundle.mutation.mutation_id));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_phase_tokens_reject_cross_descriptor_reuse_and_replay_exactly() {
         let first_temp = tempfile::tempdir().unwrap();
@@ -10207,6 +10750,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_accepts_only_durable_visible_point_stage_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -10247,6 +10791,7 @@ mod tests {
         assert_eq!(decision.kind(), PrivateOramMutationDecisionKindV2::ExactNew);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_legacy_and_mixed_active_layouts() {
         let temp = tempfile::tempdir().unwrap();
@@ -10284,6 +10829,154 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v2_parent_progress_starts_next_generation_after_retained_terminal() {
+        let first_temp = tempfile::tempdir().unwrap();
+        let (_, first_fixture) = paired_store_fixture(&first_temp);
+        let first_journal = journal(&first_temp, &first_fixture);
+        let first_terminal = v2_parent_watermark_expectation(
+            &first_journal,
+            &first_fixture,
+            PrivateOramMutationDecisionKindV2::ExactOldAbort,
+            PrivateOramMutationJournalPhaseV2::PointResolved,
+        );
+
+        // An aborted generation preserves the old consensus state. Build the next signed
+        // mutation over that same state, with its own paired owner journals and writer fence.
+        let next_temp = tempfile::tempdir().unwrap();
+        let (next_pair, next_fixture) = paired_store_fixture_with_writer_fence(
+            &next_temp,
+            first_fixture.preparing_lease.writer_fence + 1,
+        );
+        assert_eq!(next_fixture.old_consensus, first_fixture.old_consensus);
+        assert_eq!(
+            next_fixture.preparing_lease.generation,
+            first_fixture.preparing_lease.generation + 1
+        );
+        let next_journal = journal(&next_temp, &next_fixture);
+        point_stage_owner_capsule_package_v2(
+            &next_journal,
+            &next_fixture,
+            &next_pair,
+            11,
+            activation_locator_for_capsule_test(214),
+        );
+        let next_snapshot = next_journal.load_v2().unwrap().unwrap();
+        assert!(first_terminal.watermark().sequence() > next_snapshot.state.sequence);
+        let next_first =
+            derive_private_oram_mutation_parent_watermark_at_sequence_v2(&next_snapshot, 1)
+                .unwrap();
+        let preparing_at = |watermark| {
+            LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                reconcile_snapshot(
+                    &next_fixture.old_consensus,
+                    next_fixture.preparing_lease.clone(),
+                )
+                .with_parent_watermark_for_test(watermark),
+                100,
+            )
+        };
+
+        // Until its first progress applies, admission still exposes the previous generation's
+        // terminal watermark. Its higher sequence must not stall the new journal at sequence 3.
+        let mut watermark = first_terminal.watermark().clone();
+        assert_eq!(
+            preparing_at(watermark.clone()).active_parent_watermark_sequence(),
+            None
+        );
+        for expected_sequence in 1..=3 {
+            let proposal = next_journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
+                    watermark,
+                ))
+                .unwrap()
+                .expect("the current generation still lacks parent progress")
+                .into_proposal();
+            watermark = proposal.expectation().watermark().clone();
+            assert_eq!(watermark.sequence(), expected_sequence);
+            assert_eq!(
+                watermark.lease_generation(),
+                next_fixture.preparing_lease.generation
+            );
+            if expected_sequence == 1 {
+                assert_eq!(&watermark, next_first.watermark());
+            }
+        }
+        assert_eq!(watermark.sequence(), next_snapshot.state.sequence);
+        assert!(
+            next_journal
+                .next_private_oram_mutation_parent_progress_before_decision_v2(preparing_at(
+                    watermark,
+                ))
+                .unwrap()
+                .is_none()
+        );
+
+        // Keep the sequence equal to the active journal so only the generation distinguishes
+        // this watermark from the current-generation control accepted above.
+        let future_temp = tempfile::tempdir().unwrap();
+        let (future_pair, future_fixture) = paired_store_fixture_with_writer_fence(
+            &future_temp,
+            next_fixture.preparing_lease.writer_fence + 1,
+        );
+        let future_journal = journal(&future_temp, &future_fixture);
+        point_stage_owner_capsule_package_v2(
+            &future_journal,
+            &future_fixture,
+            &future_pair,
+            11,
+            activation_locator_for_capsule_test(215),
+        );
+        let future_snapshot = future_journal.load_v2().unwrap().unwrap();
+        let future_point_stage = derive_private_oram_mutation_parent_watermark_at_sequence_v2(
+            &future_snapshot,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
+        )
+        .unwrap();
+        assert_eq!(
+            future_point_stage.watermark().lease_generation(),
+            next_fixture.preparing_lease.generation + 1
+        );
+        assert_eq!(
+            future_point_stage.watermark().sequence(),
+            next_snapshot.state.sequence
+        );
+        assert_eq!(
+            next_journal.load_v2().unwrap().unwrap().state.phase,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable
+        );
+        assert!(matches!(
+            next_journal.next_private_oram_mutation_parent_progress_before_decision_v2(
+                preparing_at(future_point_stage.watermark().clone(),)
+            ),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+
+        // Post-decision recovery requires progress from the decided generation. Equal sequence
+        // numbers from an older journal must not authorize the next recovery step.
+        let old_point_stage = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+            &first_terminal,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_journal.open_private_oram_mutation_resume_v2(
+                LinearizablePrivateOramMutationReconcileSnapshotV2::from_snapshot_for_test(
+                    reconcile_snapshot(
+                        &next_fixture.new_consensus,
+                        next_fixture.committed_lease.clone(),
+                    )
+                    .with_parent_watermark_for_test(old_point_stage.watermark().clone()),
+                    100,
+                ),
+                "docs",
+            ),
+            Err(PrivateOramMutationJournalError::InvalidTransition)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_opaque_resume_facade_advances_no_server_terminal_sequence() {
         let temp = tempfile::tempdir().unwrap();
@@ -10705,7 +11398,7 @@ mod tests {
                 .unwrap(),
             Some((11, terminal_slot.generation))
         );
-        let archive_permit = private_oram_cleared_pending_archive_permit_for_test(
+        let synthetic_archive_permit = private_oram_cleared_pending_archive_permit_for_test(
             cleared.lifecycle(),
             fixture.mutation_bundle.mutation.collection_id.clone(),
             fixture.immutable_manifest.manifest.indexes[0]
@@ -10720,53 +11413,113 @@ mod tests {
             terminal_slot.generation,
         )
         .unwrap();
-        set_fail_immutable_json_after_rename_v2(true);
+        let local_terminal = journal
+            .load_v2()
+            .unwrap()
+            .unwrap()
+            .state
+            .local_terminals
+            .unwrap()
+            .owners
+            .into_iter()
+            .next()
+            .unwrap();
+        let synthetic_receipt = synthetic_archive_permit.owner_prestage_receipt();
+        let exact_receipt = PrivateOramOwnerPrestageReceiptV2::from_parts_for_test(
+            synthetic_receipt.intent_key().to_string(),
+            synthetic_receipt.collection_id().to_string(),
+            synthetic_receipt.mutation_id().to_string(),
+            synthetic_receipt.mutation_digest().to_string(),
+            synthetic_receipt.expected_aggregate_digest().to_string(),
+            synthetic_receipt.lease_generation(),
+            synthetic_receipt.writer_fence(),
+            synthetic_receipt.owner_peer_id(),
+            synthetic_receipt
+                .owner_store_incarnation_digest()
+                .to_string(),
+            local_terminal.parent_descriptor_digest.clone(),
+            synthetic_receipt
+                .parent_lease_acquired_record_digest()
+                .to_string(),
+            synthetic_receipt.owner_roster_digest().to_string(),
+            synthetic_receipt.activation_registry_generation(),
+            synthetic_receipt.activation_manifest_digest().to_string(),
+            synthetic_receipt.package_sha256().to_string(),
+            synthetic_receipt.package_len(),
+            synthetic_receipt.owner_request_digest().to_string(),
+            local_terminal.journal_descriptor_digest.clone(),
+            local_terminal.prepared_state_digest.clone(),
+        );
+        let initial_archive_permit = replace_private_oram_archive_prestage_receipt_for_test(
+            synthetic_archive_permit,
+            exact_receipt.clone(),
+        )
+        .unwrap();
+        let archive_permit = || {
+            replace_private_oram_archive_prestage_receipt_for_test(
+                private_oram_cleared_pending_archive_permit_for_test(
+                    cleared.lifecycle(),
+                    fixture.mutation_bundle.mutation.collection_id.clone(),
+                    fixture.immutable_manifest.manifest.indexes[0]
+                        .index_name
+                        .clone(),
+                    fixture
+                        .immutable_manifest
+                        .manifest
+                        .owner_signing_key_id
+                        .clone(),
+                    11,
+                    terminal_slot.generation,
+                )?,
+                exact_receipt.clone(),
+            )
+        };
+        set_fail_terminal_archive_after_directory_rename_v2(true);
         assert!(matches!(
-            journal.archive_private_oram_mutation_after_clear_v2(archive_permit),
+            journal.archive_private_oram_mutation_after_clear_v2(initial_archive_permit),
             Err(PrivateOramMutationJournalError::Indeterminate)
         ));
-        set_fail_immutable_json_after_rename_v2(false);
-        assert!(journal.load_v2().unwrap().is_none());
-        let replay_permit = private_oram_cleared_pending_archive_permit_for_test(
-            cleared.lifecycle(),
-            fixture.mutation_bundle.mutation.collection_id.clone(),
-            fixture.immutable_manifest.manifest.indexes[0]
-                .index_name
-                .clone(),
-            fixture
-                .immutable_manifest
-                .manifest
-                .owner_signing_key_id
-                .clone(),
-            11,
-            terminal_slot.generation,
-        )
-        .unwrap();
-        journal
-            .archive_private_oram_mutation_after_clear_v2(replay_permit)
-            .unwrap();
-
+        set_fail_terminal_archive_after_directory_rename_v2(false);
         let archive_name = format!(
             "{TERMINAL_ARCHIVE_NAME_PREFIX_V2}{:020}",
             terminal_slot.generation
         );
         let archive_path = journal.root.join(&archive_name);
+        assert!(archive_path.is_dir());
+        assert!(!archive_path.join(TERMINAL_ARCHIVE_FILE_V2).exists());
+        assert!(journal.load_v2().unwrap().is_none());
+
+        let record_fault_permit = archive_permit().unwrap();
+        set_fail_immutable_json_after_rename_v2(true);
+        assert!(matches!(
+            journal.archive_private_oram_mutation_after_clear_v2(record_fault_permit),
+            Err(PrivateOramMutationJournalError::Indeterminate)
+        ));
+        set_fail_immutable_json_after_rename_v2(false);
+        assert!(journal.load_v2().unwrap().is_none());
+        let replay_permit = archive_permit().unwrap();
+        let binding = journal
+            .archive_private_oram_mutation_after_clear_v2(replay_permit)
+            .unwrap();
+        let ready = binding.into_ready();
+        assert_eq!(
+            ready.key().collection_id,
+            fixture.preparing_lease.collection_id
+        );
+        assert_eq!(ready.generation(), terminal_slot.generation);
+        assert_eq!(ready.owner_peer_id(), 11);
+        assert_eq!(
+            ready.prestage_receipt_digest(),
+            exact_receipt.receipt_digest()
+        );
+        assert!(archive_path.join(TERMINAL_ARCHIVE_FILE_V2).is_file());
+        assert!(
+            archive_path
+                .join(PRIVATE_ORAM_PARENT_CHILD_ARCHIVE_GRANT_FILE_V1)
+                .is_file()
+        );
         create_private_directory(&journal.active_path()).unwrap();
-        let duplicate_permit = private_oram_cleared_pending_archive_permit_for_test(
-            cleared.lifecycle(),
-            fixture.mutation_bundle.mutation.collection_id.clone(),
-            fixture.immutable_manifest.manifest.indexes[0]
-                .index_name
-                .clone(),
-            fixture
-                .immutable_manifest
-                .manifest
-                .owner_signing_key_id
-                .clone(),
-            11,
-            terminal_slot.generation,
-        )
-        .unwrap();
+        let duplicate_permit = archive_permit().unwrap();
         assert!(matches!(
             journal.archive_private_oram_mutation_after_clear_v2(duplicate_permit),
             Err(PrivateOramMutationJournalError::ConcurrentMutation)
@@ -10780,21 +11533,7 @@ mod tests {
             let parked_archive = journal.root.join("terminal-archive-symlink-target-v2");
             fs::rename(&archive_path, &parked_archive).unwrap();
             symlink(&parked_archive, &archive_path).unwrap();
-            let symlink_permit = private_oram_cleared_pending_archive_permit_for_test(
-                cleared.lifecycle(),
-                fixture.mutation_bundle.mutation.collection_id.clone(),
-                fixture.immutable_manifest.manifest.indexes[0]
-                    .index_name
-                    .clone(),
-                fixture
-                    .immutable_manifest
-                    .manifest
-                    .owner_signing_key_id
-                    .clone(),
-                11,
-                terminal_slot.generation,
-            )
-            .unwrap();
+            let symlink_permit = archive_permit().unwrap();
             assert!(
                 journal
                     .archive_private_oram_mutation_after_clear_v2(symlink_permit)
@@ -10804,24 +11543,28 @@ mod tests {
             fs::rename(parked_archive, &archive_path).unwrap();
         }
 
-        let restored_archive_permit = private_oram_cleared_pending_archive_permit_for_test(
-            cleared.lifecycle(),
-            fixture.mutation_bundle.mutation.collection_id.clone(),
-            fixture.immutable_manifest.manifest.indexes[0]
-                .index_name
-                .clone(),
-            fixture
-                .immutable_manifest
-                .manifest
-                .owner_signing_key_id
-                .clone(),
-            11,
-            terminal_slot.generation,
-        )
-        .unwrap();
-        journal
+        let restored_archive_permit = archive_permit().unwrap();
+        let replayed_binding = journal
             .archive_private_oram_mutation_after_clear_v2(restored_archive_permit)
             .unwrap();
+        let replayed_ready = replayed_binding.into_ready();
+        assert_eq!(
+            replayed_ready.parent_archive_record_digest(),
+            ready.parent_archive_record_digest()
+        );
+        assert_eq!(
+            replayed_ready.pending_tombstone_digest(),
+            ready.pending_tombstone_digest()
+        );
+        assert_eq!(
+            replayed_ready.clear_receipt_digest(),
+            ready.clear_receipt_digest()
+        );
+        assert_eq!(
+            replayed_ready.owner_terminal_evidence_digest(),
+            ready.owner_terminal_evidence_digest()
+        );
+        drop(replayed_ready);
         let acknowledged = acknowledge_private_oram_mutation_clear_v2(
             cleared.lifecycle(),
             cleared.lease_slot(),
@@ -10837,6 +11580,7 @@ mod tests {
         assert_eq!(acknowledged.pending_acknowledgement_owner().unwrap(), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_opaque_resume_rejects_ids_visible_before_terminal_side_effects() {
         let temp = tempfile::tempdir().unwrap();
@@ -10882,6 +11626,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_resumes_only_an_exact_pending_typed_transition() {
         let temp = tempfile::tempdir().unwrap();
@@ -10915,6 +11660,7 @@ mod tests {
         assert!(resumed.pending_next_for_test().is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_resumes_a_pending_decision_durable_record() {
         // A crash between publishing the DecisionDurable record and moving the pointer leaves
@@ -11013,6 +11759,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_different_evidence_for_pending_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -11049,6 +11796,7 @@ mod tests {
         assert_eq!(observed.pending_next_for_test(), Some(&pending));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_structurally_invalid_pending_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -11081,6 +11829,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_bounds_history_directory_iteration() {
         let temp = tempfile::tempdir().unwrap();
@@ -11103,6 +11852,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_history_gap_pointer_ahead_and_missing_format() {
         let gap_temp = tempfile::tempdir().unwrap();
@@ -11152,6 +11902,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_classifies_missing_mandatory_artifacts_as_corrupt() {
         let descriptor_temp = tempfile::tempdir().unwrap();
@@ -11195,6 +11946,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_rejects_tampered_or_cross_bound_immutable_manifest() {
         let tampered_temp = tempfile::tempdir().unwrap();
@@ -11231,6 +11983,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_writer_restart_returns_exact_immutable_manifest_authority() {
         let temp = tempfile::tempdir().unwrap();
@@ -11246,12 +11999,14 @@ mod tests {
         assert!(!debug.contains(&fixture.immutable_manifest.signature.sig));
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_journal_persists_exact_seven_phase_progression() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(17, 1);
         let journal = journal(&temp, &fixture);
         let initial = begin(&journal, &fixture, &[11, 12]);
+        assert_eq!(initial, initial_snapshot(&journal, &fixture, &[11, 12]));
         assert_eq!(
             initial.state.phase,
             PrivateOramMutationJournalPhaseV1::LeaseAcquired
@@ -11312,7 +12067,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(41, 31);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
 
         for decision_kind in [
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -11346,6 +12101,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_parent_watermark_candidate_binds_the_complete_canonical_prefix() {
         let temp = tempfile::tempdir().unwrap();
@@ -11363,6 +12119,16 @@ mod tests {
             .unwrap();
         let expectation =
             derive_private_oram_mutation_parent_watermark_expectation_v2(&snapshot).unwrap();
+        assert_eq!(
+            expectation.watermark(),
+            v2_parent_watermark_expectation_in_memory(
+                &journal,
+                &fixture,
+                PrivateOramMutationDecisionKindV2::ExactNew,
+                PrivateOramMutationJournalPhaseV2::PointResolved,
+            )
+            .watermark()
+        );
         let watermark = expectation.watermark();
 
         validate_private_oram_mutation_parent_watermark_v2_shape(watermark).unwrap();
@@ -11423,7 +12189,7 @@ mod tests {
         let first_fixture = fixture(79, 93);
         let first_journal = journal(&temp, &first_fixture);
         let watermark_at = |phase| {
-            v2_parent_watermark_expectation(
+            v2_parent_watermark_expectation_in_memory(
                 &first_journal,
                 &first_fixture,
                 PrivateOramMutationDecisionKindV2::ExactNew,
@@ -11502,7 +12268,7 @@ mod tests {
         let other_temp = tempfile::tempdir().unwrap();
         let other_fixture = fixture(80, 95);
         let other_journal = journal(&other_temp, &other_fixture);
-        let other = v2_parent_watermark_expectation(
+        let other = v2_parent_watermark_expectation_in_memory(
             &other_journal,
             &other_fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -11534,7 +12300,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(81, 97);
         let journal = journal(&temp, &fixture);
-        let expectation = v2_parent_watermark_expectation(
+        let expectation = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactOldAbort,
@@ -11748,6 +12514,62 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v2_point_stage_parent_progress_proposals_bootstrap_admitted_authority_in_order() {
+        let parent_temp = tempfile::tempdir().unwrap();
+        let owner_temp = tempfile::tempdir().unwrap();
+        let (pair, fixture) = paired_store_fixture(&owner_temp);
+        let journal = journal(&parent_temp, &fixture);
+        point_stage_owner_capsule_package_v2(
+            &journal,
+            &fixture,
+            &pair,
+            11,
+            activation_locator_for_capsule_test(209),
+        );
+
+        let proposals = journal.point_stage_parent_progress_proposals_v2().unwrap();
+        assert_eq!(proposals.len(), 3);
+        let mut authority = admitted_cleanup_authority(&fixture);
+        for (offset, progress) in proposals.into_iter().enumerate() {
+            let proposal = progress.into_proposal();
+            let sequence = u64::try_from(offset).unwrap() + 1;
+            assert_eq!(
+                proposal.key(),
+                &PrivateOramMutationKey {
+                    collection_id: fixture.preparing_lease.collection_id.clone(),
+                }
+            );
+            assert_eq!(proposal.expectation().watermark().sequence(), sequence);
+            authority = apply_private_oram_mutation_authority_parent_progress_v2(
+                &authority,
+                proposal.expectation(),
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &authority,
+                    PrivateOramMutationMaterialOperationV2::ParentProgress,
+                    private_oram_mutation_authority_request_digest_for_parent_for_test(
+                        proposal.expectation(),
+                    ),
+                    1,
+                    20 + sequence,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                authority
+                    .aggregate()
+                    .unwrap()
+                    .parent_watermark()
+                    .unwrap()
+                    .sequence(),
+                sequence,
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn v2_authority_terminal_decision_requires_exact_seq3_recovery_capsule_readiness() {
         let parent_temp = tempfile::tempdir().unwrap();
@@ -11773,7 +12595,7 @@ mod tests {
             PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
         )
         .unwrap();
-        let evidence = signed_owner_install_evidence_v2(&fixture, receipt.clone());
+        let evidence = signed_owner_install_evidence_v2(&fixture.preparing_lease, receipt.clone());
         let ready = derive_private_oram_mutation_recovery_capsules_ready_v2(
             &point_stage,
             activation.clone(),
@@ -11812,7 +12634,10 @@ mod tests {
             derive_private_oram_mutation_recovery_capsules_ready_v2(
                 &point_stage,
                 activation_locator_for_capsule_test(211),
-                vec![signed_owner_install_evidence_v2(&fixture, receipt)],
+                vec![signed_owner_install_evidence_v2(
+                    &fixture.preparing_lease,
+                    receipt,
+                )],
             )
             .is_err()
         );
@@ -11956,8 +12781,9 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn v2_authority_retains_acknowledged_gc_obligation_across_next_admission() {
+    fn v2_authority_retains_acknowledged_gc_obligation_and_clears_next_generation() {
         let parent_temp = tempfile::tempdir().unwrap();
         let owner_temp = tempfile::tempdir().unwrap();
         let (pair, fixture) = paired_store_fixture(&owner_temp);
@@ -11970,17 +12796,18 @@ mod tests {
         let receipt = owner_store
             .install(&package, &activation, pair.resources())
             .unwrap();
-        let evidence = signed_owner_install_evidence_v2(&fixture, receipt);
+        let evidence = signed_owner_install_evidence_v2(&fixture.preparing_lease, receipt);
         let (mut authority, terminal, recovery_capsules_ready) =
-            cleanup_authority_at_terminal_parent(
+            cleanup_authority_at_terminal_parent_with_owner_enrollment(
                 &journal,
                 &fixture,
                 PrivateOramMutationDecisionKindV2::ExactNew,
                 activation,
                 evidence,
+                true,
             );
         let aggregate = authority.aggregate().unwrap();
-        assert_eq!(aggregate.transition_ordinal(), 12);
+        assert_eq!(aggregate.transition_ordinal(), 14);
         assert_eq!(
             aggregate.recovery_capsules_certificate().unwrap().ready(),
             recovery_capsules_ready.ready()
@@ -12002,7 +12829,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 12);
+        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 14);
         assert!(
             apply_private_oram_mutation_authority_parent_progress_v2(
                 &authority,
@@ -12047,7 +12874,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 12);
+        assert_eq!(authority.aggregate().unwrap().transition_ordinal(), 14);
 
         authority = apply_private_oram_mutation_authority_lease_transition_v2(
             &authority,
@@ -12258,6 +13085,14 @@ mod tests {
                 .resolution(),
             PrivateOramMutationClearResolutionV2::Pending
         ));
+        let pending_archive_tombstone_digest = authority
+            .aggregate()
+            .unwrap()
+            .lifecycle()
+            .last_cleared()
+            .unwrap()
+            .tombstone_digest()
+            .to_string();
         let acknowledgement_request =
             private_oram_mutation_authority_request_digest_for_ack_for_test(&authority).unwrap();
         authority = acknowledge_private_oram_mutation_authority_clear_v2(
@@ -12304,6 +13139,32 @@ mod tests {
                 .unwrap()
                 .outstanding_gc_obligations()
                 .is_empty()
+        );
+        let first_archives = authority
+            .aggregate()
+            .unwrap()
+            .acknowledged_owner_archive_expectations(fixture.preparing_lease.owner_peer_id)
+            .unwrap();
+        assert_ne!(
+            authority
+                .aggregate()
+                .unwrap()
+                .lifecycle()
+                .last_cleared()
+                .unwrap()
+                .tombstone_digest(),
+            pending_archive_tombstone_digest
+        );
+        assert_eq!(
+            first_archives
+                .iter()
+                .map(|archive| archive.generation())
+                .collect::<Vec<_>>(),
+            vec![fixture.preparing_lease.generation]
+        );
+        assert_eq!(
+            first_archives[0].pending_tombstone_digest(),
+            pending_archive_tombstone_digest
         );
 
         let mut next_lease = fixture.preparing_lease.clone();
@@ -12392,6 +13253,7 @@ mod tests {
         let aggregate = authority.aggregate().unwrap();
         assert_eq!(aggregate.lease_slot().active.as_ref(), Some(&next_lease));
         assert_eq!(authority.lease_slot(), aggregate.lease_slot());
+        assert_eq!(aggregate.parent_watermark(), Some(terminal.watermark()));
         assert_ne!(aggregate.outer_binding_digest(), digest(240));
         assert_eq!(aggregate.outer_binding_digest().len(), 43);
         assert_eq!(aggregate.aggregate_digest().len(), 43);
@@ -12437,6 +13299,210 @@ mod tests {
         let tampered: PrivateOramMutationAuthorityStateV2 =
             serde_json::from_value(tampered).unwrap();
         assert!(validate_private_oram_mutation_authority_state_v2(&tampered).is_err());
+
+        let next_terminal = private_oram_mutation_parent_watermark_expectation_for_test(
+            &next_lease,
+            digest(140),
+            (141..=147).map(digest).collect(),
+        )
+        .unwrap();
+        for sequence in 1..=3 {
+            let expected = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+                &next_terminal,
+                sequence,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_parent_progress_v2(
+                &authority,
+                &expected,
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &authority,
+                    PrivateOramMutationMaterialOperationV2::ParentProgress,
+                    private_oram_mutation_authority_request_digest_for_parent_for_test(&expected),
+                    1,
+                    28 + sequence,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let point_stage = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+            &next_terminal,
+            PrivateOramMutationJournalPhaseV2::PointStageDurable.sequence(),
+        )
+        .unwrap();
+        let activation = activation_locator_for_capsule_test(148);
+        let capsule_digest = digest(149);
+        let capsule_set_digest = private_oram_owner_capsule_set_digest_v2(&[(
+            next_lease.owner_peer_id,
+            capsule_digest.clone(),
+        )])
+        .unwrap();
+        let receipt = private_oram_owner_recovery_capsule_install_receipt_for_test(
+            next_lease.owner_peer_id,
+            next_terminal.watermark().descriptor_digest().to_string(),
+            capsule_digest,
+            capsule_set_digest,
+            activation.clone(),
+        )
+        .unwrap();
+        let next_ready = derive_private_oram_mutation_recovery_capsules_ready_v2(
+            &point_stage,
+            activation,
+            vec![signed_owner_install_evidence_v2(&next_lease, receipt)],
+        )
+        .unwrap();
+        authority = apply_private_oram_mutation_authority_recovery_capsules_ready_v2(
+            &authority,
+            &next_ready,
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::RecoveryCapsulesReady,
+                next_ready.ready().ready_digest().to_string(),
+                1,
+                32,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let next_committed_record_digest = digest(150);
+        let mut next_committed_lease = next_lease.clone();
+        next_committed_lease.phase = PrivateOramMutationLeasePhase::ConsensusCommitted {
+            committed_record_digest: next_committed_record_digest.clone(),
+            committed_state_sequence: next_lease.base_state_sequence + 1,
+            committed_signed_state_digest: digest(151),
+            receipt_digest: digest(152),
+        };
+        authority = apply_private_oram_mutation_authority_lease_transition_v2(
+            &authority,
+            next_committed_lease.clone(),
+            private_oram_mutation_aggregate_apply_context_with_outer_binding_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::ConsensusCommit,
+                private_oram_mutation_authority_request_digest_for_lease_for_test(
+                    &next_committed_lease,
+                )
+                .unwrap(),
+                digest(153),
+                1,
+                33,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for sequence in 4..=7 {
+            let expected = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+                &next_terminal,
+                sequence,
+            )
+            .unwrap();
+            authority = apply_private_oram_mutation_authority_parent_progress_v2(
+                &authority,
+                &expected,
+                private_oram_mutation_aggregate_apply_context_for_test(
+                    &authority,
+                    PrivateOramMutationMaterialOperationV2::ParentProgress,
+                    private_oram_mutation_authority_request_digest_for_parent_for_test(&expected),
+                    1,
+                    30 + sequence,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let next_cleanup = private_oram_cleanup_expectation_for_test(
+            authority.aggregate().unwrap().lifecycle(),
+            &next_committed_lease,
+            PrivateOramMutationClearOutcome::FinalizedOrReconciledAfterConsensusCommit,
+            next_committed_record_digest,
+            digest(154),
+            digest(155),
+        )
+        .unwrap();
+        authority = apply_private_oram_mutation_authority_cleanup_witness_v2(
+            &authority,
+            &next_cleanup,
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::CleanupWitness,
+                private_oram_mutation_authority_request_digest_for_cleanup_for_test(&next_cleanup),
+                1,
+                38,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let next_clear_attempt = digest(156);
+        authority = apply_private_oram_mutation_authority_clear_pending_v2(
+            &authority,
+            next_clear_attempt.clone(),
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::ClearPending,
+                next_clear_attempt,
+                1,
+                39,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let next_clear_request =
+            private_oram_mutation_authority_request_digest_for_clear_for_test(&authority).unwrap();
+        authority = apply_private_oram_mutation_authority_clear_v2(
+            &authority,
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::Clear,
+                next_clear_request,
+                1,
+                40,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            authority
+                .aggregate()
+                .unwrap()
+                .lifecycle()
+                .last_cleared()
+                .unwrap()
+                .clear_receipt()
+                .generation,
+            2
+        );
+        authority = acknowledge_private_oram_mutation_authority_clear_v2(
+            &authority,
+            private_oram_mutation_aggregate_apply_context_for_test(
+                &authority,
+                PrivateOramMutationMaterialOperationV2::ClearAcknowledgement,
+                private_oram_mutation_authority_request_digest_for_ack_for_test(&authority)
+                    .unwrap(),
+                1,
+                41,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(private_oram_mutation_terminal_material_transferable_for_test(&authority).unwrap());
+        assert_eq!(
+            authority.aggregate().unwrap().outstanding_gc_obligations()[0].generation(),
+            1
+        );
+        let second_archives = authority
+            .aggregate()
+            .unwrap()
+            .acknowledged_owner_archive_expectations(fixture.preparing_lease.owner_peer_id)
+            .unwrap();
+        assert_eq!(
+            second_archives
+                .iter()
+                .map(|archive| archive.generation())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        crate::content_manager::consensus::private_oram_mutation_cleanup::authority::assert_gc_compaction_retains_owner_history_for_test(&authority, &next_lease);
     }
 
     #[test]
@@ -12846,7 +13912,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -12974,7 +14040,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let terminal = v2_parent_watermark_expectation(
+        let terminal = v2_parent_watermark_expectation_in_memory(
             &journal,
             &fixture,
             PrivateOramMutationDecisionKindV2::ExactNew,
@@ -13169,7 +14235,7 @@ mod tests {
         }
         assert_eq!(
             cleared.lifecycle().lifecycle_digest(),
-            "7gxqxVChnLhfOV2tsoIAURpG_LfY0QMuqm-o52epsqw",
+            "bG_ORluMnxA5zltQHUSBa5gXBBWQlDOz8l4fqmIrDiw",
         );
     }
 
@@ -13178,7 +14244,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(42, 33);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let state = v2_no_server_terminal_state(
             &initial,
             &fixture,
@@ -13318,7 +14384,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture_at_sequence(45, 38, 0, true);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
 
         for outcome in [
             PrivateOramPointResolutionOutcomeV2::PublishedExactNew,
@@ -13401,7 +14467,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(46, 39);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11, 12, 13]);
+        let initial = initial_snapshot(&journal, &fixture, &[11, 12, 13]);
         let mut prepared = empty_v2_state(PrivateOramMutationJournalPhaseV2::OwnersPrepared);
         prepared.owner_prepares = owner_prepares(&initial);
         prepared.owner_journals = owner_journals_for_prepares(&prepared.owner_prepares);
@@ -13488,6 +14554,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dual_state_decoder_keeps_v1_complete_distinct_from_v2_point_resolved() {
         let temp = tempfile::tempdir().unwrap();
@@ -13567,7 +14634,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(47, 40);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let encoded = String::from_utf8(serde_json::to_vec(&initial.state).unwrap()).unwrap();
         assert_eq!(
             encoded,
@@ -13585,7 +14652,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(44, 37);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let state = v2_no_server_terminal_state(
             &initial,
             &fixture,
@@ -13603,7 +14670,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(68, 73);
         let journal = journal(&temp, &fixture);
-        let initial = begin(&journal, &fixture, &[11]);
+        let initial = initial_snapshot(&journal, &fixture, &[11]);
         let prepares = owner_prepares(&initial);
         let mut abort_decided = fixture.preparing_lease.clone();
         abort_decided.phase = PrivateOramMutationLeasePhase::AbortDecided;
@@ -13662,6 +14729,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_server_stage_binds_exact_owners_prepared_chain_tip() {
         let temp = tempfile::tempdir().unwrap();
@@ -13714,6 +14782,7 @@ mod tests {
         assert!(journal.load().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconciliation_context_classifies_only_valid_old_and_new_authority() {
         let temp = tempfile::tempdir().unwrap();
@@ -13812,6 +14881,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_recovery_authority_binds_owner_and_is_stable_across_parent_progress() {
         let temp = tempfile::tempdir().unwrap();
@@ -13941,6 +15011,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_recovery_authority_digest_has_known_answer() {
         let temp = tempfile::tempdir().unwrap();
@@ -13964,6 +15035,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_owner_recovery_authority_holds_and_revalidates_parent_lock() {
         let temp = tempfile::tempdir().unwrap();
@@ -14021,7 +15093,16 @@ mod tests {
                 set_private_directory_permissions(&journal.root).unwrap();
             })
             .unwrap_err();
+        // Linux reads through the pinned descriptor before checking root identity.
+        // Other Unix platforms read the replacement path and reject its missing active tree.
+        #[cfg(target_os = "linux")]
         assert!(matches!(error, PrivateOramMutationJournalError::Corrupt));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            error,
+            PrivateOramMutationJournalError::Io(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
         fs::remove_dir(&journal.root).unwrap();
         fs::rename(displaced_root, &journal.root).unwrap();
         assert!(journal.load().unwrap().is_some());
@@ -14057,6 +15138,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconciliation_context_rejects_mixed_ambiguous_and_aba_state() {
         let temp = tempfile::tempdir().unwrap();
@@ -14155,6 +15237,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn begin_is_exactly_idempotent_and_rejects_another_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -14182,7 +15265,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let fixture = fixture(41, 130);
         let journal = journal(&temp, &fixture);
-        let snapshot = begin(&journal, &fixture, &[11, 12]);
+        let snapshot = initial_snapshot(&journal, &fixture, &[11, 12]);
 
         assert_eq!(
             (
@@ -14215,6 +15298,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn single_owner_records_empty_remote_finalize_phase() {
         let temp = tempfile::tempdir().unwrap();
@@ -14236,6 +15320,7 @@ mod tests {
         assert_eq!(committed.state.remote_finalizations, Vec::new());
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_journal_binds_non_genesis_consensus_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -14262,6 +15347,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn visible_point_phase_requires_private_staging_token() {
         let temp = tempfile::tempdir().unwrap();
@@ -14349,6 +15435,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn changed_consensus_receipt_or_owner_evidence_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
@@ -14377,6 +15464,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn recomputed_parent_digest_cannot_replace_consensus_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -14406,6 +15494,7 @@ mod tests {
         assert!(journal.load().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn on_disk_state_digest_and_signature_tampering_are_rejected() {
         let temp = tempfile::tempdir().unwrap();

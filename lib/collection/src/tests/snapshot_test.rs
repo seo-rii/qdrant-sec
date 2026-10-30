@@ -119,6 +119,26 @@ async fn _test_snapshot_collection(node_type: NodeType) {
     .unwrap();
 
     let snapshots_temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    let prepared_snapshot = collection
+        .prepare_snapshot(snapshots_temp_dir.path(), 0)
+        .await
+        .unwrap();
+    let prepared_archive_path = prepared_snapshot.archive_path().to_path_buf();
+    let prepared_public_path = snapshots_path.path().join(prepared_snapshot.name());
+    let (prepared_size, prepared_checksum) = prepared_snapshot.size_and_checksum().await.unwrap();
+    assert!(prepared_size > 0);
+    assert_eq!(prepared_checksum.len(), 64);
+    assert!(prepared_archive_path.is_file());
+    assert!(!prepared_public_path.exists());
+    assert!(
+        std::fs::read_dir(snapshots_path.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    drop(prepared_snapshot);
+    assert!(!prepared_archive_path.exists());
+
     let snapshot_description = collection
         .create_snapshot(snapshots_temp_dir.path(), 0)
         .await
@@ -384,6 +404,7 @@ async fn test_snapshot_private_hnsw_unconfigured_store_fails_before_archive() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_result_oram_missing_bucket_fails_before_archive() {
     init_logger();
@@ -521,6 +542,7 @@ async fn test_snapshot_private_result_oram_missing_bucket_fails_before_archive()
     assert!(!err.contains(&manifest.root_hash));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_hnsw_missing_bucket_fails_before_archive() {
     init_logger();
@@ -931,6 +953,7 @@ fn write_snapshot_private_result_store(
         .unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_private_oram_store_files_are_archived() {
     init_logger();
@@ -1032,10 +1055,18 @@ async fn test_snapshot_private_oram_store_files_are_archived() {
     let snapshot_path = snapshots_path.path().join(&snapshot_description.name);
     let snapshot_file = std::fs::File::open(&snapshot_path).unwrap();
     let mut archive = tar::Archive::new(snapshot_file);
+    let hnsw_temp_dir = format!("{PRIVATE_HNSW_ORAM_DIR}/{vector_name}/temp");
     let mut archive_paths = HashSet::new();
     for entry in archive.entries().unwrap() {
         let entry = entry.unwrap();
-        archive_paths.insert(entry.path().unwrap().to_string_lossy().replace('\\', "/"));
+        let path = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+        if path == hnsw_temp_dir {
+            assert!(
+                entry.header().entry_type().is_dir(),
+                "snapshot HNSW owner archive parent must be a directory: {path}",
+            );
+        }
+        archive_paths.insert(path);
     }
 
     let expected_paths = [
@@ -1138,17 +1169,19 @@ async fn test_snapshot_private_oram_store_files_are_archived() {
             "snapshot archive contains client-owned private ORAM state marker {forbidden}: {archive_paths:?}",
         );
     }
-    let forbidden_temp_prefixes = [
-        format!("{PRIVATE_RESULT_ORAM_DIR}/temp"),
-        format!("{PRIVATE_HNSW_ORAM_DIR}/{vector_name}/temp"),
-    ];
-    for forbidden_temp_prefix in forbidden_temp_prefixes {
+    let result_temp_dir = format!("{PRIVATE_RESULT_ORAM_DIR}/temp");
+    assert!(
+        !archive_paths.contains(&result_temp_dir),
+        "snapshot archive contains private result ORAM temp directory: {archive_paths:?}",
+    );
+    // HNSW temp is retained as the parent of durable owner archives. This fixture
+    // has no owner archive, so the directory must be empty; result temp is omitted.
+    for temp_dir in [result_temp_dir, hnsw_temp_dir] {
         assert!(
             !archive_paths
                 .iter()
-                .any(|path| path == &forbidden_temp_prefix
-                    || path.starts_with(&format!("{forbidden_temp_prefix}/"))),
-            "snapshot archive contains private ORAM temp subtree {forbidden_temp_prefix}: {archive_paths:?}",
+                .any(|path| path.starts_with(&format!("{temp_dir}/"))),
+            "snapshot archive contains private ORAM temp contents under {temp_dir}: {archive_paths:?}",
         );
     }
 

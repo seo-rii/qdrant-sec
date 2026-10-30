@@ -582,9 +582,11 @@ pub use private_oram_point_staging::{
 };
 pub use private_oram_recovery::{
     PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_SIGNATURE_DOMAIN,
-    PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_VERSION, PrivateOramExternalRecoveryCheckpoint,
+    PRIVATE_ORAM_EXTERNAL_RECOVERY_CHECKPOINT_VERSION,
+    PRIVATE_ORAM_RECOVERY_INDEX_STATE_DIGEST_DOMAIN, PrivateOramExternalRecoveryCheckpoint,
     PrivateOramExternalRecoveryCheckpointBundle, PrivateOramRecoveryError,
-    PrivateOramRecoverySignature, PrivateOramRecoveryValidationContext,
+    PrivateOramRecoveryIndexKind, PrivateOramRecoveryIndexStateRef, PrivateOramRecoverySignature,
+    PrivateOramRecoveryValidationContext, canonical_private_oram_recovery_index_state_digest,
     package_private_oram_external_recovery_checkpoint,
     sign_private_oram_external_recovery_checkpoint,
     try_private_oram_external_recovery_checkpoint_signature_message,

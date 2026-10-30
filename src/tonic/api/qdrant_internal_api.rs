@@ -3152,6 +3152,7 @@ fn validate_private_oram_shard_recovery_request_shape(
     if request.collection_name.is_empty()
         || request.collection_name.len() > 255
         || request.source_peer_id == request.target_peer_id
+        || request.resume_if_task_missing && request.active_transfer_resume.is_none()
     {
         return Err(Status::invalid_argument(
             "private ORAM shard recovery request shape is invalid",
@@ -5132,6 +5133,21 @@ impl QdrantInternal for QdrantInternalService {
             let transfer_task_requires_restart = collection
                 .shard_transfer_task_requires_restart(&transfer_key)
                 .await;
+            if request.resume_if_task_missing {
+                if !collection
+                    .private_oram_fixed_transfer_preinstall_intent_matches(&transfer)
+                    .map_err(StorageError::from)?
+                {
+                    return Err(Status::failed_precondition(
+                        "private ORAM source transfer resume requires its durable preinstall intent",
+                    ));
+                }
+                if !transfer_task_requires_restart {
+                    return Ok(Response::new(RequestPrivateOramShardRecoveryResponse {
+                        accepted: true,
+                    }));
+                }
+            }
             let first_resume_request = collection
                 .mark_private_oram_fixed_transfer_resume(&transfer)
                 .await;
@@ -5386,6 +5402,7 @@ mod tests {
             source_peer_id: 7,
             target_peer_id: 11,
             active_transfer_resume: None,
+            resume_if_task_missing: false,
         }
     }
 
@@ -5417,6 +5434,13 @@ mod tests {
             .to_string();
         assert!(rendered.contains("shape is invalid"));
         assert!(!rendered.contains(&request.collection_name));
+
+        let mut source_retry_without_transfer = request.clone();
+        source_retry_without_transfer.resume_if_task_missing = true;
+        assert!(
+            validate_private_oram_shard_recovery_request_shape(&source_retry_without_transfer, 7)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5464,6 +5488,8 @@ mod tests {
             new_layout_digest: "private-oram-new-layout-digest-sentinel".to_string(),
             index_state_digest: "private-oram-index-state-digest-sentinel".to_string(),
         });
+        validate_private_oram_shard_recovery_request_shape(&request, 7).unwrap();
+        request.resume_if_task_missing = true;
         validate_private_oram_shard_recovery_request_shape(&request, 7).unwrap();
         let context = request.active_transfer_resume.as_ref().unwrap();
         let transfer = ShardTransfer {

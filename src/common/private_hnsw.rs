@@ -4860,6 +4860,7 @@ mod private_hnsw_tests {
         assert!(!rendered.contains("2"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_proof_bucket_commitment_mismatch_rejects_without_ciphertext_leak() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -5940,6 +5941,7 @@ mod private_hnsw_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovered_snapshot_signature_preflight_verifies_manifest_signature() {
         let temp_dir = tempfile::Builder::new()
@@ -6120,6 +6122,7 @@ mod private_hnsw_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn restored_snapshot_storage_recheck_requires_bucket_file() {
         let mut session = fixture_session("session-1", 20);
@@ -6217,6 +6220,7 @@ mod private_hnsw_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn active_session_current_epoch_preflight_rejects_stale_store_epoch() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -6248,6 +6252,7 @@ mod private_hnsw_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn session_open_storage_recheck_rejects_manifest_or_epoch_drift() {
         let mut session = fixture_session("session-1", 20);

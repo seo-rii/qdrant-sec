@@ -424,7 +424,7 @@ impl ChannelService {
         Ok(())
     }
 
-    /// Wait until the given peer reaches the given commit
+    /// Wait until the given peer has applied the given commit
     ///
     /// # Errors
     ///
@@ -433,29 +433,36 @@ impl ChannelService {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
-    async fn await_commit_on_peer(
+    pub async fn await_commit_on_peer(
         &self,
         peer_id: PeerId,
         commit: u64,
         term: u64,
         timeout: Duration,
     ) -> CollectionResult<()> {
-        let response = self
-            .with_qdrant_client(peer_id, |mut client| async move {
+        let response = tokio::time::timeout(
+            timeout,
+            self.with_qdrant_client(peer_id, |mut client| async move {
                 let request = WaitOnConsensusCommitRequest {
                     commit: commit as i64,
                     term: term as i64,
                     timeout: timeout.as_secs() as i64,
                 };
                 client.wait_on_consensus_commit(Request::new(request)).await
-            })
-            .await
-            .map_err(|err| {
-                CollectionError::service_error(format!(
-                    "Failed to wait for consensus commit on peer {peer_id}: {err}"
-                ))
-            })?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| CollectionError::Timeout {
+            description: format!(
+                "Failed to wait for consensus commit on peer {peer_id}, timed out."
+            ),
+        })?
+        .map_err(|err| {
+            CollectionError::service_error(format!(
+                "Failed to wait for consensus commit on peer {peer_id}: {err}"
+            ))
+        })?
+        .into_inner();
 
         // Create error if wait request failed
         if !response.ok {
@@ -2455,6 +2462,7 @@ mod tests {
             source_peer_id: 13,
             target_peer_id: 17,
             active_transfer_resume: None,
+            resume_if_task_missing: false,
         };
         let error = service
             .request_private_oram_shard_recovery(13, recovery)

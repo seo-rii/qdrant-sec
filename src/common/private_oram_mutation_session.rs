@@ -4,8 +4,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use collection::config::{CollectionConfigInternal, EncryptionSelector};
 use collection::operations::verification::new_unchecked_verification_pass;
+use collection::private_hnsw_oram_store::PrivateHnswOramStore;
 use collection::shards::shard::PeerId;
+use collection::{
+    PrivateOramOwnerPrestageStoreV2,
+    collection::Collection,
+    private_oram_owner_journal::{
+        PrivateOramOwnerNewGenerationReadinessExpectationV2, PrivateOramOwnerSnapshotGuardV2,
+    },
+};
 use data_encoding::BASE64URL_NOPAD;
 use qdrant_sec::{
     PAYLOAD_PRIVATE_RESULT_ORAM_PROVIDER, PAYLOAD_PRIVATE_RESULT_ORAM_V2_PROVIDER,
@@ -32,18 +41,23 @@ use qdrant_sec::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage::content_manager::consensus_manager::PrivateOramMutationV2ActivationStatus;
+use storage::content_manager::consensus_manager::{
+    PrivateOramMutationRejectedAdmissionAcknowledgementV2, PrivateOramMutationV2ActivationStatus,
+    PrivateOramOwnerEnrollmentPlanV2,
+};
 use storage::content_manager::consensus_ops::{
-    CompareAndSwapPrivateOramLayout, InitializePrivateOramMutationState,
-    PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION, PrivateOramConsensusCollectionIndexStateV2,
-    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusLayout,
-    PrivateOramConsensusTransitionV2, PrivateOramEpochKey, PrivateOramIndexKind,
-    PrivateOramLayoutKey, PrivateOramMutationKey, PrivateOramMutationLeaseSlotV2,
+    CompareAndSwapPrivateOramLayout, EnrollPrivateOramMutationStateV2,
+    InitializePrivateOramMutationState, PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
+    PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
+    PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2,
+    PrivateOramEpochKey, PrivateOramExternalRecoveryKey, PrivateOramExternalRecoveryState,
+    PrivateOramIndexKind, PrivateOramLayoutKey, PrivateOramMutationKey, PrivateOramMutationLease,
+    PrivateOramMutationLeaseSlotV2, canonical_private_oram_index_state_digest,
 };
 use storage::content_manager::errors::{StorageError, StorageResult};
 use storage::content_manager::private_oram_mutation_journal::{
     PrivateOramMutationAdmissionPlanV2, PrivateOramMutationAllOwnersPrestagedV2,
-    PrivateOramMutationNeedLocalCleanupV2,
+    PrivateOramMutationNeedLocalCleanupV2, derive_private_oram_mutation_admission_plan_v2,
 };
 use storage::dispatcher::{
     Dispatcher, PrivateOramLiveAdmissionPermitV2, PrivateOramLiveAdmissionSeedV2,
@@ -53,15 +67,17 @@ use tokio::sync::Notify;
 
 use super::auth::Auth;
 use super::private_hnsw::{
-    PrivateHnswClientSignature, PrivateHnswReadPadding, PrivateHnswReadPathsResponse,
-    PrivateHnswSessionResponse, do_open_private_hnsw_session_for_paired_mutation,
+    PrivateHnswClientSignature, PrivateHnswManifestRecord, PrivateHnswReadPadding,
+    PrivateHnswReadPathsResponse, PrivateHnswSessionResponse, do_get_private_hnsw_manifest,
+    do_open_private_hnsw_session_for_paired_mutation,
     do_read_private_hnsw_paths_for_paired_mutation,
     release_private_hnsw_session_for_paired_mutation, resolve_private_hnsw_context_from_snapshot,
 };
 use super::private_oram_mutation::run_private_oram_owner_enrollment_v2;
 use super::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use super::private_result_oram::{
-    PrivateResultOramReadBucketsResponse, PrivateResultOramSessionResponse,
+    PrivateResultOramManifestRecord, PrivateResultOramReadBucketsResponse,
+    PrivateResultOramSessionResponse, do_get_private_result_oram_manifest,
     do_open_private_result_oram_session_for_paired_mutation,
     do_read_private_result_oram_buckets_for_paired_mutation,
     release_private_result_oram_session_for_paired_mutation,
@@ -264,6 +280,110 @@ impl Debug for PrivateOramMutationEnrollResponseV2 {
             .debug_struct("PrivateOramMutationEnrollResponseV2")
             .field("manifest_digest", &"[redacted]")
             .field("genesis_state_digest", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateOramMutationGenesisEnrollmentInputV2 {
+    pub vector_name: String,
+    pub immutable_manifest: PrivateOramImmutableManifestBundleV2,
+    pub genesis_state: PrivateOramSignedStateBundleV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrivateOramMutationGenesisEnrollmentStatusV2 {
+    Open,
+    Enrolled,
+    Closed,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationGenesisEnrollmentContextV2 {
+    pub collection_id: String,
+    pub vector_name: String,
+    pub layout_generation: u64,
+    pub layout_digest: String,
+    pub owner_peer_ids: Vec<u64>,
+    pub hnsw_manifest: PrivateHnswManifestRecord,
+    pub result_manifest: Option<PrivateResultOramManifestRecord>,
+    pub enrollment_status: PrivateOramMutationGenesisEnrollmentStatusV2,
+}
+
+impl Debug for PrivateOramMutationGenesisEnrollmentContextV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationGenesisEnrollmentContextV2")
+            .field("collection_id", &"[redacted]")
+            .field("vector_name", &"[redacted]")
+            .field("layout_generation", &self.layout_generation)
+            .field("layout_digest", &"[redacted]")
+            .field("owner_peer_ids", &self.owner_peer_ids)
+            .field("hnsw_manifest", &"[redacted]")
+            .field(
+                "has_result_manifest",
+                &self.result_manifest.as_ref().map(|_| true).unwrap_or(false),
+            )
+            .field("enrollment_status", &self.enrollment_status)
+            .finish()
+    }
+}
+
+impl Debug for PrivateOramMutationGenesisEnrollmentInputV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationGenesisEnrollmentInputV2")
+            .field("vector_name", &"[redacted]")
+            .field("immutable_manifest", &"[redacted]")
+            .field("genesis_state", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationGenesisEnrollmentResponseV2 {
+    pub collection_id: String,
+    pub manifest_digest: String,
+    pub signed_state_digest: String,
+    pub layout_generation: u64,
+    pub layout_digest: String,
+    pub index_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateOramMutationOwnerEnrollmentInputV2 {}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PrivateOramMutationOwnerEnrollmentResponseV2 {
+    pub collection_id: String,
+    pub owner_peer_id: u64,
+    pub active: bool,
+}
+
+impl Debug for PrivateOramMutationOwnerEnrollmentResponseV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationOwnerEnrollmentResponseV2")
+            .field("collection_id", &"[redacted]")
+            .field("owner_peer_id", &self.owner_peer_id)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+
+impl Debug for PrivateOramMutationGenesisEnrollmentResponseV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateOramMutationGenesisEnrollmentResponseV2")
+            .field("collection_id", &"[redacted]")
+            .field("manifest_digest", &"[redacted]")
+            .field("signed_state_digest", &"[redacted]")
+            .field("layout_generation", &self.layout_generation)
+            .field("layout_digest", &"[redacted]")
+            .field("index_count", &self.index_count)
             .finish()
     }
 }
@@ -591,6 +711,23 @@ struct PrivateOramMutationCleanupClaimBindingV2 {
     cleanup_evidence_digest: String,
 }
 
+struct PrivateOramMutationRuntimeHistoryV2 {
+    authority: PrivateOramMutationRuntimeAuthorityV2,
+    saw_job: bool,
+    cleanup_tombstone: Option<PrivateOramMutationCleanupClaimBindingV2>,
+    rejected_tombstone: Option<PrivateOramMutationRejectedRuntimeClaimV2>,
+}
+
+/// A negative outcome never consumed this generation. Keep its exact runtime binding until the
+/// next validated job replaces it, so old cleanup claims cannot be mistaken for restart absence.
+#[derive(Clone, PartialEq, Eq)]
+struct PrivateOramMutationRejectedRuntimeClaimV2 {
+    authority: PrivateOramMutationRuntimeAuthorityV2,
+    binding: PrivateOramMutationAppendJobBindingV2,
+    recovery_manifest_digest: String,
+    rejection_digest: String,
+}
+
 #[derive(Default)]
 struct PrivateOramMutationSessionRegistryV2 {
     sessions: HashMap<String, PrivateOramMutationSessionV2>,
@@ -599,12 +736,114 @@ struct PrivateOramMutationSessionRegistryV2 {
     append_jobs: HashMap<String, Arc<PrivateOramMutationAppendJobV2>>,
     cleanup_claimed_collections: HashSet<String>,
     cleanup_claims: HashMap<String, PrivateOramMutationCleanupClaimBindingV2>,
-    seen_job_authorities: HashSet<PrivateOramMutationRuntimeAuthorityV2>,
-    cleanup_tombstones:
-        HashMap<PrivateOramMutationRuntimeAuthorityV2, PrivateOramMutationCleanupClaimBindingV2>,
+    // Keep the latest generation even after cleanup so an old claim can never be
+    // mistaken for restart absence after its exact tombstone has been superseded.
+    runtime_history: HashMap<String, PrivateOramMutationRuntimeHistoryV2>,
 }
 
 impl PrivateOramMutationSessionRegistryV2 {
+    fn runtime_history_for(
+        &self,
+        authority: &PrivateOramMutationRuntimeAuthorityV2,
+    ) -> StorageResult<Option<&PrivateOramMutationRuntimeHistoryV2>> {
+        let Some(history) = self.runtime_history.get(&authority.collection_id) else {
+            return Ok(None);
+        };
+        if history.authority.generation > authority.generation
+            || (history.authority.generation == authority.generation
+                && history.authority != *authority)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM mutation runtime authority is stale or changed",
+            ));
+        }
+        Ok((history.authority.generation == authority.generation).then_some(history))
+    }
+
+    // Only call after validating the new job against its consensus lease slot. A
+    // session opening or an append reservation alone must not advance this watermark.
+    fn remember_job_authority(
+        &mut self,
+        authority: PrivateOramMutationRuntimeAuthorityV2,
+    ) -> StorageResult<()> {
+        let rejected_generation_reuse = self
+            .runtime_history
+            .get(&authority.collection_id)
+            .is_some_and(|history| {
+                history.authority.generation == authority.generation
+                    && history.authority.owner_peer_id == authority.owner_peer_id
+                    && history.authority.mutation_id != authority.mutation_id
+                    && history.rejected_tombstone.is_some()
+                    && history.cleanup_tombstone.is_none()
+            });
+        if !rejected_generation_reuse && self.runtime_history_for(&authority)?.is_some() {
+            return Err(StorageError::service_error(
+                "private ORAM mutation runtime job authority was already observed",
+            ));
+        }
+        self.runtime_history.insert(
+            authority.collection_id.clone(),
+            PrivateOramMutationRuntimeHistoryV2 {
+                authority,
+                saw_job: true,
+                cleanup_tombstone: None,
+                rejected_tombstone: None,
+            },
+        );
+        Ok(())
+    }
+
+    // A typed cleanup permit is the other authority that can advance the latest
+    // generation after a restart. Preserve exact replay until a later generation
+    // reaches this method or installs its validated job.
+    fn remember_completed_cleanup(
+        &mut self,
+        claim: &PrivateOramMutationCleanupClaimBindingV2,
+    ) -> StorageResult<()> {
+        let history = self.runtime_history_for(&claim.authority)?;
+        if history.is_some_and(|history| {
+            history.cleanup_tombstone.is_some() || history.rejected_tombstone.is_some()
+        }) {
+            return Err(StorageError::service_error(
+                "private ORAM mutation cleanup tombstone changed concurrently",
+            ));
+        }
+        let saw_job = history.is_some_and(|history| history.saw_job);
+        self.runtime_history.insert(
+            claim.authority.collection_id.clone(),
+            PrivateOramMutationRuntimeHistoryV2 {
+                authority: claim.authority.clone(),
+                saw_job,
+                cleanup_tombstone: Some(claim.clone()),
+                rejected_tombstone: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn remember_rejected_cleanup(
+        &mut self,
+        claim: PrivateOramMutationRejectedRuntimeClaimV2,
+    ) -> StorageResult<()> {
+        let history = self
+            .runtime_history_for(&claim.authority)?
+            .filter(|history| history.saw_job && history.cleanup_tombstone.is_none())
+            .ok_or_else(invalid_mutation_session)?;
+        if let Some(retained) = &history.rejected_tombstone {
+            return if retained == &claim {
+                Ok(())
+            } else {
+                Err(invalid_mutation_session())
+            };
+        }
+        let history = self
+            .runtime_history
+            .get_mut(&claim.authority.collection_id)
+            .ok_or_else(invalid_mutation_session)?;
+        history.rejected_tombstone = Some(claim);
+        Ok(())
+    }
+
     fn reserve_open(&mut self, collection_id: &str, _now_unix: u64) -> StorageResult<()> {
         if self.sessions.len() >= PRIVATE_ORAM_MUTATION_MAX_SESSION_COUNT {
             return Err(StorageError::bad_request(
@@ -863,10 +1102,10 @@ impl PrivateOramMutationAppendReservationV2 {
         }
 
         let runtime_authority = private_oram_mutation_job_authority_v2(&job)?;
+        registry.remember_job_authority(runtime_authority)?;
         registry
             .append_jobs
             .insert(job.binding.job_key.clone(), Arc::clone(&job));
-        registry.seen_job_authorities.insert(runtime_authority);
         let session = registry
             .sessions
             .get_mut(&self.session_id)
@@ -970,15 +1209,22 @@ struct PrivateOramMutationAppendJobV2 {
 fn private_oram_mutation_job_authority_v2(
     job: &PrivateOramMutationAppendJobV2,
 ) -> StorageResult<PrivateOramMutationRuntimeAuthorityV2> {
+    let session = &job.material.session;
     let slot = &job.material.consensus_slot;
-    let generation = job.material.session.response.mutation_lease_generation;
-    if slot.active.is_some() || slot.generation.checked_add(1) != Some(generation) {
+    let generation = session.response.mutation_lease_generation;
+    if slot.active.is_some()
+        || slot.generation.checked_add(1) != Some(generation)
+        || slot.max_writer_fence.checked_add(1) != Some(session.response.writer_fence)
+        || session.response.collection_id != job.binding.collection_id
+        || session.response.mutation_id != job.binding.mutation_id
+        || session.leader != job.binding.token.leader
+    {
         return Err(invalid_mutation_session());
     }
     Ok(PrivateOramMutationRuntimeAuthorityV2 {
         collection_id: job.binding.collection_id.clone(),
         mutation_id: job.binding.mutation_id.clone(),
-        owner_peer_id: job.binding.token.leader.peer_id,
+        owner_peer_id: session.leader.peer_id,
         generation,
     })
 }
@@ -1343,22 +1589,6 @@ impl PrivateOramDetachedMutationAppendV2 {
         )
     }
 
-    pub(crate) fn mark_not_submitted(&self) -> StorageResult<()> {
-        self.ensure_cleanup_not_claimed()?;
-        let mut phase = self.job.phase.lock().map_err(|_| {
-            StorageError::service_error("private ORAM mutation append job poisoned")
-        })?;
-        if !matches!(
-            *phase,
-            PrivateOramMutationAppendJobPhaseV2::AdmissionReady
-                | PrivateOramMutationAppendJobPhaseV2::AdmissionSubmitting
-        ) {
-            return Err(invalid_mutation_session());
-        }
-        *phase = PrivateOramMutationAppendJobPhaseV2::NotSubmitted;
-        Ok(())
-    }
-
     pub(crate) fn mark_preadmission_recovery_required(&self) -> StorageResult<()> {
         self.ensure_cleanup_not_claimed()?;
         let mut phase = self.job.phase.lock().map_err(|_| {
@@ -1419,6 +1649,10 @@ impl PrivateOramDetachedMutationAppendV2 {
         &self.job.material.session.collection_name
     }
 
+    pub(crate) fn collection_id(&self) -> &str {
+        &self.job.binding.collection_id
+    }
+
     pub(crate) fn vector_name(&self) -> &str {
         &self.job.material.session.response.vector_name
     }
@@ -1457,6 +1691,524 @@ fn session_registry() -> &'static Mutex<PrivateOramMutationSessionRegistryV2> {
     REGISTRY.get_or_init(|| Mutex::new(PrivateOramMutationSessionRegistryV2::default()))
 }
 
+/// Serializes every owner-local mutation phase for one collection.
+///
+/// This guard is deliberately non-reentrant. Guarded code must not call another guarded entry
+/// point for the same collection, and consensus apply/receipt delivery must never acquire it.
+pub(crate) async fn acquire_private_oram_mutation_execution_v2(
+    key: &PrivateOramMutationKey,
+) -> StorageResult<tokio::sync::OwnedMutexGuard<()>> {
+    static EXECUTION_LOCKS: OnceLock<
+        Mutex<HashMap<PrivateOramMutationKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let execution = {
+        let mut locks = EXECUTION_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| {
+                StorageError::service_error(
+                    "private ORAM mutation execution lock registry poisoned",
+                )
+            })?;
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        match locks.get(key).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    Ok(execution.lock_owned().await)
+}
+
+pub(crate) struct PrivateOramLegacySnapshotGuardV1 {
+    collection: Arc<Collection>,
+    config: CollectionConfigInternal,
+    key: PrivateOramMutationKey,
+    external_recovery_state: Option<PrivateOramExternalRecoveryState>,
+    _execution: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PrivateOramLegacySnapshotGuardV1 {
+    async fn validate_held(&self, dispatcher: &Dispatcher) -> StorageResult<()> {
+        let mutation_state = if dispatcher.consensus_state().is_some() {
+            dispatcher.private_oram_consensus_mutation_state(&self.key)?
+        } else {
+            None
+        };
+        let external_recovery_state =
+            private_oram_snapshot_external_recovery_state(dispatcher, &self.key.collection_id)?;
+        if self.collection.config_snapshot().await != self.config
+            || self.config.stable_crypto_id(self.collection.name())? != self.key.collection_id
+            || mutation_state.is_some()
+            || !private_oram_snapshot_external_recovery_state_matches(
+                &self.external_recovery_state,
+                &external_recovery_state,
+            )
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM legacy snapshot authority changed during export"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct PrivateOramMutationSnapshotGuardMutationV2 {
+    collection: Arc<Collection>,
+    config: CollectionConfigInternal,
+    key: PrivateOramMutationKey,
+    expectation: PrivateOramOwnerNewGenerationReadinessExpectationV2,
+    external_recovery_state: Option<PrivateOramExternalRecoveryState>,
+    owner: PrivateOramOwnerSnapshotGuardV2,
+    _execution: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PrivateOramMutationSnapshotGuardMutationV2 {
+    async fn validate_held(&self, dispatcher: &Dispatcher) -> StorageResult<()> {
+        let external_recovery_state =
+            private_oram_snapshot_external_recovery_state(dispatcher, &self.key.collection_id)?;
+        if self.collection.config_snapshot().await != self.config
+            || dispatcher
+                .private_oram_consensus_mutation_state(&self.key)?
+                .is_none()
+            || dispatcher.private_oram_owner_new_generation_readiness_expectation_v2(
+                &self.key,
+                dispatcher.this_peer_id(),
+            )? != self.expectation
+            || !private_oram_snapshot_external_recovery_state_matches(
+                &self.external_recovery_state,
+                &external_recovery_state,
+            )
+        {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM V2 snapshot authority changed during export".to_string(),
+            });
+        }
+        self.owner
+            .validate_held_v2()
+            .map_err(|_| StorageError::PreconditionFailed {
+                description: "private ORAM V2 snapshot owner archive chain is not ready"
+                    .to_string(),
+            })
+    }
+}
+
+pub(crate) enum PrivateOramMutationSnapshotGuardV2 {
+    LegacyV1(PrivateOramLegacySnapshotGuardV1),
+    MutationV2(PrivateOramMutationSnapshotGuardMutationV2),
+}
+
+impl PrivateOramMutationSnapshotGuardV2 {
+    pub(crate) async fn validate_held(&self, dispatcher: &Dispatcher) -> StorageResult<()> {
+        match self {
+            Self::LegacyV1(guard) => guard.validate_held(dispatcher).await,
+            Self::MutationV2(guard) => guard.validate_held(dispatcher).await,
+        }
+    }
+
+    pub(crate) fn is_legacy_v1(&self) -> bool {
+        matches!(self, Self::LegacyV1(_))
+    }
+
+    pub(crate) fn expectation(
+        &self,
+    ) -> Option<&PrivateOramOwnerNewGenerationReadinessExpectationV2> {
+        match self {
+            Self::LegacyV1(_) => None,
+            Self::MutationV2(guard) => Some(&guard.expectation),
+        }
+    }
+}
+
+pub(crate) async fn acquire_private_oram_mutation_snapshot_guard_v2(
+    dispatcher: &Dispatcher,
+    collection: Arc<Collection>,
+    config: &CollectionConfigInternal,
+) -> StorageResult<Option<PrivateOramMutationSnapshotGuardV2>> {
+    let Some(vector_name) = private_oram_mutation_snapshot_vector_name_v2(config)? else {
+        return Ok(None);
+    };
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+
+    let execution = acquire_private_oram_mutation_execution_v2(&key).await?;
+    if collection.config_snapshot().await != *config {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM V2 snapshot collection configuration changed".to_string(),
+        });
+    }
+    let mutation_state = if dispatcher.consensus_state().is_some() {
+        dispatcher.private_oram_consensus_mutation_state(&key)?
+    } else {
+        None
+    };
+    let external_recovery_state =
+        private_oram_snapshot_external_recovery_state(dispatcher, &collection_id)?;
+    if !private_oram_snapshot_external_recovery_state_is_inactive(&external_recovery_state) {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM snapshot conflicts with active external recovery"
+                .to_string(),
+        });
+    }
+    if mutation_state.is_none() {
+        let guard =
+            PrivateOramMutationSnapshotGuardV2::LegacyV1(PrivateOramLegacySnapshotGuardV1 {
+                collection,
+                config: config.clone(),
+                key,
+                external_recovery_state,
+                _execution: execution,
+            });
+        guard.validate_held(dispatcher).await?;
+        return Ok(Some(guard));
+    }
+
+    let expectation = dispatcher.private_oram_owner_new_generation_readiness_expectation_v2(
+        &key,
+        dispatcher.this_peer_id(),
+    )?;
+    let hnsw_store = PrivateHnswOramStore::new(collection.path(), &vector_name).map_err(|_| {
+        StorageError::PreconditionFailed {
+            description: "private ORAM V2 snapshot owner store is unavailable".to_string(),
+        }
+    })?;
+    let owner = PrivateOramOwnerPrestageStoreV2::try_new_pinned_absolute_v2(hnsw_store.root_path())
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM V2 snapshot owner store is unavailable".to_string(),
+        })?
+        .acquire_snapshot_guard_v2(&expectation)
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM V2 snapshot owner archive chain is not ready".to_string(),
+        })?;
+    let guard = PrivateOramMutationSnapshotGuardV2::MutationV2(
+        PrivateOramMutationSnapshotGuardMutationV2 {
+            collection,
+            config: config.clone(),
+            key,
+            expectation,
+            external_recovery_state,
+            owner,
+            _execution: execution,
+        },
+    );
+    guard.validate_held(dispatcher).await?;
+    Ok(Some(guard))
+}
+
+fn private_oram_snapshot_external_recovery_state(
+    dispatcher: &Dispatcher,
+    collection_id: &str,
+) -> StorageResult<Option<PrivateOramExternalRecoveryState>> {
+    if dispatcher.consensus_state().is_none() {
+        return Ok(None);
+    }
+    dispatcher.private_oram_consensus_external_recovery(&PrivateOramExternalRecoveryKey {
+        collection_id: collection_id.to_string(),
+    })
+}
+
+fn private_oram_snapshot_external_recovery_state_matches(
+    expected: &Option<PrivateOramExternalRecoveryState>,
+    observed: &Option<PrivateOramExternalRecoveryState>,
+) -> bool {
+    observed == expected && private_oram_snapshot_external_recovery_state_is_inactive(observed)
+}
+
+fn private_oram_snapshot_external_recovery_state_is_inactive(
+    state: &Option<PrivateOramExternalRecoveryState>,
+) -> bool {
+    state
+        .as_ref()
+        .is_none_or(|state| state.active_lease.is_none())
+}
+
+fn private_oram_mutation_snapshot_vector_name_v2(
+    config: &CollectionConfigInternal,
+) -> StorageResult<Option<String>> {
+    let Some(encryption) = config.params.effective_encryption() else {
+        return Ok(None);
+    };
+    let mut vector_name = None;
+    for rule in encryption
+        .rules
+        .iter()
+        .filter(|rule| rule.binding.as_deref() == Some(PRIVATE_HNSW_ORAM_BINDING))
+    {
+        let EncryptionSelector::VectorNames { names } = &rule.selector else {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM V2 snapshot vector binding is invalid".to_string(),
+            });
+        };
+        if names.len() != 1 || vector_name.replace(names[0].clone()).is_some() {
+            return Err(StorageError::PreconditionFailed {
+                description: "private ORAM V2 snapshot requires exactly one HNSW vector"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(vector_name)
+}
+
+fn private_oram_job_admission_plan_v2(
+    job: &PrivateOramMutationAppendJobV2,
+) -> StorageResult<PrivateOramMutationAdmissionPlanV2> {
+    let authority = private_oram_mutation_job_authority_v2(job)?;
+    derive_private_oram_mutation_admission_plan_v2(
+        authority.owner_peer_id,
+        authority.generation,
+        job.material.session.response.writer_fence,
+        &job.material.consensus_slot,
+        &job.material.consensus_state,
+        &job.material.validated_owner_prepare,
+    )
+    .map_err(|_| invalid_mutation_session())
+}
+
+fn private_oram_rejected_runtime_phase_v2(phase: PrivateOramMutationAppendJobPhaseV2) -> bool {
+    matches!(
+        phase,
+        PrivateOramMutationAppendJobPhaseV2::Prestaging
+            | PrivateOramMutationAppendJobPhaseV2::AdmissionReady
+            | PrivateOramMutationAppendJobPhaseV2::AdmissionSubmitting
+            | PrivateOramMutationAppendJobPhaseV2::AdmissionUnknown
+            | PrivateOramMutationAppendJobPhaseV2::RejectedAckPending
+            | PrivateOramMutationAppendJobPhaseV2::RejectedAckComplete
+            | PrivateOramMutationAppendJobPhaseV2::NotSubmitted
+            | PrivateOramMutationAppendJobPhaseV2::Quarantined
+    )
+}
+
+fn validate_private_oram_rejected_runtime_binding_v2(
+    claim: &PrivateOramMutationRejectedRuntimeClaimV2,
+    authority: &PrivateOramMutationRuntimeAuthorityV2,
+    binding: &PrivateOramMutationAppendJobBindingV2,
+    session: &PrivateOramMutationSessionV2,
+    phase: PrivateOramMutationAppendJobPhaseV2,
+    worker_active: bool,
+) -> StorageResult<()> {
+    if worker_active
+        || !private_oram_rejected_runtime_phase_v2(phase)
+        || claim.authority != *authority
+        || claim.binding != *binding
+        || binding.collection_id != authority.collection_id
+        || binding.mutation_id != authority.mutation_id
+        || session.response.collection_id != authority.collection_id
+        || session.response.mutation_id != authority.mutation_id
+        || session.response.mutation_lease_generation != authority.generation
+        || session.leader.peer_id != authority.owner_peer_id
+        || session.collection_name != binding.collection_name
+        || session.response.session_id != binding.session_id
+        || session.incarnation != binding.token.session_incarnation
+        || session.leader != binding.token.leader
+        || session.freeze_owner.as_ref()
+            != Some(&PrivateOramMutationFreezeOwnerV2::Job {
+                mutation_id: authority.mutation_id.clone(),
+                token: binding.token.clone(),
+            })
+    {
+        return Err(StorageError::service_error(
+            "private ORAM rejected runtime cleanup binding changed or worker is active",
+        ));
+    }
+    Ok(())
+}
+
+fn private_oram_same_admitted_lease_v2(
+    original: &PrivateOramMutationLease,
+    active: &PrivateOramMutationLease,
+) -> bool {
+    let mut immutable = active.clone();
+    immutable.phase = original.phase.clone();
+    immutable.expires_at_unix = original.expires_at_unix;
+    immutable.renewal_revision = original.renewal_revision;
+    immutable == *original
+        && active.renewal_revision >= original.renewal_revision
+        && active.expires_at_unix >= original.expires_at_unix
+}
+
+/// The supervisor runs this on every peer, including the former coordinator after a leader
+/// change. A negative consensus outcome plus all owner acknowledgements permits retiring only
+/// its exact, stopped local job. No generation was admitted, so the next validated mutation may
+/// reuse it; the retained runtime tombstone still rejects old cleanup authorities.
+pub(crate) async fn reconcile_private_oram_rejected_runtime_jobs_v2(
+    dispatcher: &Dispatcher,
+) -> StorageResult<usize> {
+    let consensus = dispatcher.consensus_state().ok_or_else(|| {
+        StorageError::service_error("private ORAM runtime reconciliation requires distributed mode")
+    })?;
+    let jobs = session_registry()
+        .lock()
+        .map_err(|_| invalid_mutation_session())?
+        .append_jobs
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut retired = 0;
+    for job in jobs {
+        if job.worker_active.load(Ordering::Acquire)
+            || !private_oram_rejected_runtime_phase_v2(
+                *job.phase.lock().map_err(|_| invalid_mutation_session())?,
+            )
+        {
+            continue;
+        }
+        let plan = private_oram_job_admission_plan_v2(&job)?;
+        let lease = plan.lease();
+        if lease.owner_peer_id != dispatcher.this_peer_id() {
+            return Err(invalid_mutation_session());
+        }
+        let key = PrivateOramMutationKey {
+            collection_id: lease.collection_id.clone(),
+        };
+        let _execution = acquire_private_oram_mutation_execution_v2(&key).await?;
+        if let Some(proof) =
+            consensus.private_oram_mutation_v2_rejected_admission_acknowledgement(&key, lease)?
+        {
+            retire_private_oram_rejected_runtime_job_v2(dispatcher, &job, &proof)?;
+            retired += 1;
+            continue;
+        }
+
+        // Admission may have won after the live worker's bounded outcome poll ended. Only an
+        // exact applied lease and retained admission manifest can convert that unknown local
+        // phase into admitted recovery; terminal cleanup keeps its existing phase checks.
+        if let Some(active) = consensus.private_oram_mutation_lease(&key)
+            && private_oram_same_admitted_lease_v2(lease, &active)
+            && consensus
+                .private_oram_mutation_v2_exact_admitted_recovery_manifest(&key, &active)?
+                .is_some()
+        {
+            let mut phase = job.phase.lock().map_err(|_| invalid_mutation_session())?;
+            if !job.worker_active.load(Ordering::Acquire)
+                && !job.cleanup_claimed.load(Ordering::Acquire)
+                && matches!(
+                    *phase,
+                    PrivateOramMutationAppendJobPhaseV2::Prestaging
+                        | PrivateOramMutationAppendJobPhaseV2::AdmissionReady
+                        | PrivateOramMutationAppendJobPhaseV2::AdmissionSubmitting
+                        | PrivateOramMutationAppendJobPhaseV2::AdmissionUnknown
+                        | PrivateOramMutationAppendJobPhaseV2::Quarantined
+                )
+            {
+                *phase = PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery;
+            }
+        }
+    }
+    Ok(retired)
+}
+
+fn retire_private_oram_rejected_runtime_job_v2(
+    dispatcher: &Dispatcher,
+    job: &Arc<PrivateOramMutationAppendJobV2>,
+    proof: &PrivateOramMutationRejectedAdmissionAcknowledgementV2,
+) -> StorageResult<()> {
+    let plan = private_oram_job_admission_plan_v2(job)?;
+    if plan.lease() != proof.lease() {
+        return Err(invalid_mutation_session());
+    }
+    let claim = PrivateOramMutationRejectedRuntimeClaimV2 {
+        authority: private_oram_mutation_job_authority_v2(job)?,
+        binding: job.binding.clone(),
+        recovery_manifest_digest: proof.recovery_manifest_digest().to_string(),
+        rejection_digest: proof.rejection_digest().to_string(),
+    };
+    let collection_id = &claim.authority.collection_id;
+    let session = {
+        let mut registry = session_registry()
+            .lock()
+            .map_err(|_| invalid_mutation_session())?;
+        if registry
+            .runtime_history_for(&claim.authority)?
+            .and_then(|history| history.rejected_tombstone.as_ref())
+            == Some(&claim)
+        {
+            return Ok(());
+        }
+        if registry.opening_collections.contains(collection_id)
+            || registry.cleanup_claims.contains_key(collection_id)
+            || !registry
+                .append_jobs
+                .get(&job.binding.job_key)
+                .is_some_and(|current| Arc::ptr_eq(current, job))
+            || registry.active_by_collection.get(collection_id) != Some(&job.binding.session_id)
+        {
+            return Err(invalid_mutation_session());
+        }
+        let session = registry
+            .sessions
+            .get(&job.binding.session_id)
+            .ok_or_else(invalid_mutation_session)?
+            .clone();
+        validate_private_oram_rejected_runtime_binding_v2(
+            &claim,
+            &private_oram_mutation_job_authority_v2(job)?,
+            &job.binding,
+            &session,
+            *job.phase.lock().map_err(|_| invalid_mutation_session())?,
+            job.worker_active.load(Ordering::Acquire),
+        )?;
+        registry
+            .cleanup_claimed_collections
+            .insert(collection_id.clone());
+        job.cleanup_claimed.store(true, Ordering::Release);
+        session
+    };
+    release_underlying_sessions(&session)?;
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    if dispatcher
+        .consensus_state()
+        .ok_or_else(invalid_mutation_session)?
+        .private_oram_mutation_v2_rejected_admission_acknowledgement(&key, plan.lease())?
+        .as_ref()
+        != Some(proof)
+    {
+        return Err(invalid_mutation_session());
+    }
+    let mut registry = session_registry()
+        .lock()
+        .map_err(|_| invalid_mutation_session())?;
+    let retained = registry
+        .sessions
+        .get(&job.binding.session_id)
+        .ok_or_else(invalid_mutation_session)?;
+    validate_private_oram_rejected_runtime_binding_v2(
+        &claim,
+        &private_oram_mutation_job_authority_v2(job)?,
+        &job.binding,
+        retained,
+        *job.phase.lock().map_err(|_| invalid_mutation_session())?,
+        job.worker_active.load(Ordering::Acquire),
+    )?;
+    if !job.cleanup_claimed.load(Ordering::Acquire)
+        || !registry.cleanup_claimed_collections.contains(collection_id)
+        || registry.active_by_collection.get(collection_id) != Some(&job.binding.session_id)
+        || !registry
+            .append_jobs
+            .get(&job.binding.job_key)
+            .is_some_and(|current| Arc::ptr_eq(current, job))
+    {
+        return Err(invalid_mutation_session());
+    }
+    registry.remember_rejected_cleanup(claim.clone())?;
+    registry.append_jobs.remove(&job.binding.job_key);
+    registry.sessions.remove(&job.binding.session_id);
+    registry.active_by_collection.remove(collection_id);
+    registry.cleanup_claimed_collections.remove(collection_id);
+    drop(registry);
+    if let Some(seed) = &session.admission_seed {
+        dispatcher.revoke_private_oram_mutation_live_admission_seed_v2(seed);
+    }
+    Ok(())
+}
+
 pub(crate) fn private_oram_detached_job_exists_for_collection_v2(
     collection_id: &str,
 ) -> StorageResult<bool> {
@@ -1471,14 +2223,12 @@ pub(crate) fn private_oram_detached_job_exists_for_collection_v2(
         let phase = *job.phase.lock().map_err(|_| {
             StorageError::service_error("private ORAM mutation append job poisoned")
         })?;
-        if !matches!(
+        // Deciding and terminal jobs rely on the collection execution guard instead: allowing the
+        // supervisor to dispatch here is what lets it wait behind the active owner without racing
+        // admitted work or cleanup.
+        if private_oram_mutation_job_blocks_supervisor_v2(
+            job.worker_active.load(Ordering::Acquire),
             phase,
-            PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
-                | PrivateOramMutationAppendJobPhaseV2::Deciding
-                | PrivateOramMutationAppendJobPhaseV2::Finalizing
-                | PrivateOramMutationAppendJobPhaseV2::Cleaning
-                | PrivateOramMutationAppendJobPhaseV2::TerminalCommitted
-                | PrivateOramMutationAppendJobPhaseV2::TerminalAborted
         ) {
             return Ok(true);
         }
@@ -1508,6 +2258,22 @@ pub(crate) fn private_oram_detached_job_deciding_for_collection_v2(
         }
     }
     Ok(false)
+}
+
+fn private_oram_mutation_job_blocks_supervisor_v2(
+    worker_active: bool,
+    phase: PrivateOramMutationAppendJobPhaseV2,
+) -> bool {
+    worker_active
+        && !matches!(
+            phase,
+            PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery
+                | PrivateOramMutationAppendJobPhaseV2::Deciding
+                | PrivateOramMutationAppendJobPhaseV2::Finalizing
+                | PrivateOramMutationAppendJobPhaseV2::Cleaning
+                | PrivateOramMutationAppendJobPhaseV2::TerminalCommitted
+                | PrivateOramMutationAppendJobPhaseV2::TerminalAborted
+        )
 }
 
 #[must_use]
@@ -1622,7 +2388,8 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
         let mut registry = session_registry().lock().map_err(|_| {
             StorageError::service_error("private ORAM mutation session registry poisoned")
         })?;
-        if let Some(existing) = registry.cleanup_tombstones.get(authority) {
+        let history = registry.runtime_history_for(authority)?;
+        if let Some(existing) = history.and_then(|history| history.cleanup_tombstone.as_ref()) {
             if existing != &claim {
                 return Err(StorageError::service_error(
                     "private ORAM mutation cleanup tombstone binding changed",
@@ -1656,7 +2423,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             .collect::<Vec<_>>();
         match matching.as_slice() {
             [] => {
-                if registry.seen_job_authorities.contains(authority) {
+                if history.is_some_and(|history| history.saw_job) {
                     return Err(StorageError::service_error(
                         "private ORAM mutation cleanup found an unexpectedly missing same-process job",
                     ));
@@ -1743,6 +2510,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
     let mut registry = session_registry().lock().map_err(|_| {
         StorageError::service_error("private ORAM mutation session registry poisoned")
     })?;
+    registry.runtime_history_for(authority)?;
     let matching_job = registry
         .append_jobs
         .iter()
@@ -1786,8 +2554,9 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             return Err(invalid_mutation_session());
         }
         registry.active_by_collection.remove(collection_id);
-    } else if registry.seen_job_authorities.contains(authority)
-        && !registry.cleanup_tombstones.contains_key(authority)
+    } else if registry
+        .runtime_history_for(authority)?
+        .is_some_and(|history| history.saw_job && history.cleanup_tombstone.is_none())
     {
         return Err(StorageError::service_error(
             "private ORAM mutation cleanup lost its claimed same-process job",
@@ -1813,15 +2582,7 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
             "private ORAM mutation cleanup did not preserve exact negative presence",
         ));
     }
-    if registry
-        .cleanup_tombstones
-        .insert(authority.clone(), claim.clone())
-        .is_some()
-    {
-        return Err(StorageError::service_error(
-            "private ORAM mutation cleanup tombstone changed concurrently",
-        ));
-    }
+    registry.remember_completed_cleanup(&claim)?;
     registry.cleanup_claims.remove(collection_id);
     registry.cleanup_claimed_collections.remove(collection_id);
     Ok(PrivateOramMutationQuiescedCleanupV2 {
@@ -1829,6 +2590,559 @@ async fn complete_private_oram_detached_job_local_cleanup_with_binding_v2(
         process_incarnation,
         restart_absence,
     })
+}
+
+pub(crate) async fn do_enroll_private_oram_mutation_genesis_v2(
+    dispatcher: &Dispatcher,
+    auth: &Auth,
+    settings: &Settings,
+    collection_name: &str,
+    input: PrivateOramMutationGenesisEnrollmentInputV2,
+) -> StorageResult<PrivateOramMutationGenesisEnrollmentResponseV2> {
+    let consensus = dispatcher.consensus_state().ok_or_else(|| {
+        StorageError::service_error(
+            "private ORAM mutation genesis enrollment requires distributed mode",
+        )
+    })?;
+    consensus.require_private_oram_mutation_coordinator_is_local_leader()?;
+    if consensus.hard_state().term == 0 {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM mutation leader term is unavailable".to_string(),
+        });
+    }
+
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_genesis_enrollment_v2",
+    )?;
+    let verification_pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &verification_pass);
+    let collection = toc.get_collection(&pass).await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let owner_key_id = &input.immutable_manifest.manifest.owner_signing_key_id;
+    let hnsw_context = resolve_private_hnsw_context_from_snapshot(
+        settings,
+        collection.name(),
+        collection.path(),
+        &config,
+        &input.vector_name,
+        owner_key_id,
+    )?;
+    if hnsw_context.collection_crypto_id() != collection_id {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    let verification = PrivateOramSignatureVerification {
+        expected_key_id: owner_key_id,
+        public_key: hnsw_context.public_key(),
+    };
+    validate_private_oram_immutable_manifest_v2_shape(&input.immutable_manifest.manifest)
+        .map_err(|_| invalid_mutation_genesis_enrollment())?;
+    validate_private_oram_immutable_manifest_v2_signature(
+        &input.immutable_manifest.manifest,
+        Some(&input.immutable_manifest.signature),
+        verification,
+    )
+    .map_err(|_| invalid_mutation_genesis_enrollment())?;
+    validate_private_oram_signed_state_v2_shape(&input.genesis_state.state)
+        .map_err(|_| invalid_mutation_genesis_enrollment())?;
+    validate_private_oram_signed_state_v2_signature(
+        &input.genesis_state.state,
+        Some(&input.genesis_state.signature),
+        verification,
+    )
+    .map_err(|_| invalid_mutation_genesis_enrollment())?;
+
+    let manifest_digest =
+        private_oram_immutable_manifest_v2_digest(&input.immutable_manifest.manifest)
+            .map_err(|_| invalid_mutation_genesis_enrollment())?;
+    let signed_state_digest = private_oram_signed_state_v2_digest(&input.genesis_state.state)
+        .map_err(|_| invalid_mutation_genesis_enrollment())?;
+    let signed_state = &input.genesis_state.state;
+    if input.immutable_manifest.manifest.collection_id != collection_id
+        || signed_state.collection_id != collection_id
+        || signed_state.manifest_digest != manifest_digest
+        || signed_state.owner_signing_key_id != *owner_key_id
+        || signed_state.state_sequence != 0
+        || signed_state.last_mutation_id.is_some()
+        || signed_state.indexes.len() != input.immutable_manifest.manifest.indexes.len()
+        || signed_state
+            .indexes
+            .iter()
+            .zip(&input.immutable_manifest.manifest.indexes)
+            .any(|(state, manifest)| {
+                state.kind != manifest.kind() || state.index_name != manifest.index_name
+            })
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+
+    let hnsw_record =
+        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, &input.vector_name)
+            .await?;
+    validate_private_oram_genesis_hnsw_binding_v2(
+        &collection_id,
+        &input.immutable_manifest,
+        signed_state,
+        &hnsw_record,
+    )?;
+    let result_record =
+        if manifest_index_optional(&input.immutable_manifest, PrivateOramIndexKindV2::Result)
+            .is_some()
+        {
+            Some(do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?)
+        } else {
+            None
+        };
+    validate_private_oram_genesis_result_binding_v2(
+        &collection_id,
+        &input.immutable_manifest,
+        signed_state,
+        result_record.as_ref(),
+    )?;
+
+    let collection_name_owned = collection.name().to_string();
+    let (owner_peer_ids, layout_digest) = dispatcher
+        .private_oram_stable_shard_layout_digest(&collection_name_owned, &collection_id)
+        .await?;
+    if signed_state.layout_generation != 1 || signed_state.layout_digest != layout_digest {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    let indexes = private_oram_genesis_consensus_indexes_v2(signed_state);
+    for index in &indexes {
+        let key = PrivateOramEpochKey {
+            collection_id: collection_id.clone(),
+            index_kind: index.index_kind,
+            index_name: index.index_name.clone(),
+        };
+        let mut unbound = index.epoch.clone();
+        unbound.writeback_digest = None;
+        let current = dispatcher.private_oram_consensus_epoch(&key)?;
+        if current.as_ref() != Some(&unbound) && current.as_ref() != Some(&index.epoch) {
+            return Err(invalid_mutation_genesis_enrollment());
+        }
+    }
+    let digest_states = indexes
+        .iter()
+        .map(|index| {
+            (
+                PrivateOramEpochKey {
+                    collection_id: collection_id.clone(),
+                    index_kind: index.index_kind,
+                    index_name: index.index_name.clone(),
+                },
+                index.epoch.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let index_state_digest =
+        canonical_private_oram_index_state_digest(&collection_id, &digest_states)?;
+    let layout = PrivateOramConsensusLayout {
+        generation: signed_state.layout_generation,
+        owner_peer_ids,
+        layout_digest: layout_digest.clone(),
+        index_state_digest,
+    };
+    let state = PrivateOramConsensusCollectionStateV2 {
+        version: PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
+        collection_id: collection_id.clone(),
+        manifest_digest: manifest_digest.clone(),
+        layout_generation: signed_state.layout_generation,
+        layout_digest: layout_digest.clone(),
+        state_sequence: 0,
+        signed_state_digest: signed_state_digest.clone(),
+        indexes,
+        client_state_digest: signed_state.client_state_digest.clone(),
+        last_transition: PrivateOramConsensusTransitionV2::Genesis,
+    };
+    let response = PrivateOramMutationGenesisEnrollmentResponseV2 {
+        collection_id: collection_id.clone(),
+        manifest_digest,
+        signed_state_digest,
+        layout_generation: signed_state.layout_generation,
+        layout_digest: layout_digest.clone(),
+        index_count: u32::try_from(signed_state.indexes.len())
+            .map_err(|_| invalid_mutation_genesis_enrollment())?,
+    };
+
+    let mutation_key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let _execution = acquire_private_oram_mutation_execution_v2(&mutation_key).await?;
+    dispatcher
+        .linearizable_private_oram_snapshot_barrier(None)
+        .await?;
+    let (current_owner_peer_ids, current_layout_digest) = dispatcher
+        .private_oram_stable_shard_layout_digest(&collection_name_owned, &collection_id)
+        .await?;
+    if current_owner_peer_ids != layout.owner_peer_ids
+        || current_layout_digest != layout.layout_digest
+        || collection.config_snapshot().await != config
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    if let Some(current_state) = dispatcher.private_oram_consensus_mutation_state(&mutation_key)? {
+        let layout_key = PrivateOramLayoutKey {
+            collection_id: collection_id.clone(),
+        };
+        let mut epochs_match = true;
+        for index in &state.indexes {
+            let epoch_key = PrivateOramEpochKey {
+                collection_id: collection_id.clone(),
+                index_kind: index.index_kind,
+                index_name: index.index_name.clone(),
+            };
+            if dispatcher
+                .private_oram_consensus_epoch(&epoch_key)?
+                .as_ref()
+                != Some(&index.epoch)
+            {
+                epochs_match = false;
+                break;
+            }
+        }
+        if current_state != state
+            || dispatcher
+                .private_oram_consensus_layout(&layout_key)?
+                .as_ref()
+                != Some(&layout)
+            || !epochs_match
+        {
+            return Err(invalid_mutation_genesis_enrollment());
+        }
+    }
+    // Exact replays also pass through Raft so committed-but-unapplied evolution
+    // cannot be hidden by this leader's local applied-state snapshot.
+    dispatcher
+        .submit_private_oram_mutation_genesis_enrollment_v2(
+            EnrollPrivateOramMutationStateV2 {
+                key: mutation_key,
+                layout,
+                state,
+            },
+            None,
+        )
+        .await?;
+
+    Ok(response)
+}
+
+pub(crate) async fn do_get_private_oram_mutation_genesis_enrollment_context_v2(
+    dispatcher: &Dispatcher,
+    auth: &Auth,
+    settings: &Settings,
+    collection_name: &str,
+    vector_name: &str,
+) -> StorageResult<PrivateOramMutationGenesisEnrollmentContextV2> {
+    let consensus = dispatcher.consensus_state().ok_or_else(|| {
+        StorageError::service_error(
+            "private ORAM mutation genesis enrollment context requires distributed mode",
+        )
+    })?;
+    consensus.require_private_oram_mutation_coordinator_is_local_leader()?;
+    if consensus.hard_state().term == 0 {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM mutation leader term is unavailable".to_string(),
+        });
+    }
+
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_genesis_enrollment_context_v2",
+    )?;
+    let verification_pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(auth, &verification_pass);
+    let collection = toc.get_collection(&pass).await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+
+    let hnsw_manifest =
+        do_get_private_hnsw_manifest(toc, auth, settings, collection_name, vector_name).await?;
+    if hnsw_manifest.manifest.collection_id != collection_id
+        || hnsw_manifest.manifest.vector_name != vector_name
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    let has_result_binding = config
+        .params
+        .effective_encryption()
+        .is_some_and(|encryption| {
+            encryption
+                .rules
+                .iter()
+                .any(|rule| rule.binding.as_deref() == Some(PRIVATE_RESULT_ORAM_BINDING))
+        });
+    let result_manifest = if has_result_binding {
+        let record =
+            do_get_private_result_oram_manifest(toc, auth, settings, collection_name).await?;
+        if record.manifest.collection_id != collection_id
+            || record.manifest.owner_signing_key_id != hnsw_manifest.manifest.owner_signing_key_id
+            || record.manifest.created_at_unix != hnsw_manifest.manifest.created_at_unix
+        {
+            return Err(invalid_mutation_genesis_enrollment());
+        }
+        Some(record)
+    } else {
+        None
+    };
+
+    let collection_name_owned = collection.name().to_string();
+    let (owner_peer_ids, layout_digest) = dispatcher
+        .private_oram_stable_shard_layout_digest(&collection_name_owned, &collection_id)
+        .await?;
+    let mutation_key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let layout_key = PrivateOramLayoutKey {
+        collection_id: collection_id.clone(),
+    };
+    let enrolled_state = dispatcher.private_oram_consensus_mutation_state(&mutation_key)?;
+    let enrolled_layout = dispatcher.private_oram_consensus_layout(&layout_key)?;
+    if enrolled_state.is_some() != enrolled_layout.is_some() {
+        return Err(StorageError::service_error(
+            "private ORAM mutation genesis enrollment state is incomplete",
+        ));
+    }
+    if let (Some(state), Some(layout)) = (&enrolled_state, &enrolled_layout)
+        && (state.collection_id != collection_id
+            || state.layout_generation != 1
+            || state.layout_digest != layout_digest
+            || layout.generation != 1
+            || layout.layout_digest != layout_digest
+            || layout.owner_peer_ids != owner_peer_ids)
+    {
+        return Err(StorageError::service_error(
+            "private ORAM mutation genesis enrollment state does not match the live layout",
+        ));
+    }
+    let enrollment_status = if enrolled_state.is_some() {
+        PrivateOramMutationGenesisEnrollmentStatusV2::Enrolled
+    } else if consensus.private_oram_mutation_v2_activation_status()?
+        == PrivateOramMutationV2ActivationStatus::Unprepared
+    {
+        PrivateOramMutationGenesisEnrollmentStatusV2::Open
+    } else {
+        PrivateOramMutationGenesisEnrollmentStatusV2::Closed
+    };
+
+    let (current_owner_peer_ids, current_layout_digest) = dispatcher
+        .private_oram_stable_shard_layout_digest(&collection_name_owned, &collection_id)
+        .await?;
+    if current_owner_peer_ids != owner_peer_ids
+        || current_layout_digest != layout_digest
+        || collection.config_snapshot().await != config
+    {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM mutation genesis enrollment context changed".to_string(),
+        });
+    }
+
+    Ok(PrivateOramMutationGenesisEnrollmentContextV2 {
+        collection_id,
+        vector_name: vector_name.to_string(),
+        layout_generation: 1,
+        layout_digest,
+        owner_peer_ids,
+        hnsw_manifest,
+        result_manifest,
+        enrollment_status,
+    })
+}
+
+pub(crate) async fn do_enroll_private_oram_mutation_owner_v2(
+    dispatcher: &Dispatcher,
+    auth: &Auth,
+    identity: &PrivateOramPeerRecoveryIdentity,
+    collection_name: &str,
+    _input: PrivateOramMutationOwnerEnrollmentInputV2,
+) -> StorageResult<PrivateOramMutationOwnerEnrollmentResponseV2> {
+    let leader = current_active_mutation_leader_token(dispatcher)?;
+    let consensus = dispatcher.consensus_state().ok_or_else(|| {
+        StorageError::service_error("private ORAM owner enrollment requires distributed mode")
+    })?;
+    if !consensus.private_oram_mutation_v3_write_floor_active()? {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM mutation V3 write floor is not active".to_string(),
+        });
+    }
+    let pass = auth.check_collection_access(
+        collection_name,
+        AccessRequirements::new().write(),
+        "private_oram_mutation_owner_enrollment_v2",
+    )?;
+    let verification_pass = new_unchecked_verification_pass();
+    let collection = dispatcher
+        .toc(auth, &verification_pass)
+        .get_collection(&pass)
+        .await?;
+    let config = collection.config_snapshot().await;
+    let collection_id = config.stable_crypto_id(collection.name())?;
+    let key = PrivateOramMutationKey {
+        collection_id: collection_id.clone(),
+    };
+    let layout_key = PrivateOramLayoutKey {
+        collection_id: collection_id.clone(),
+    };
+    let layout = dispatcher
+        .private_oram_consensus_layout(&layout_key)?
+        .ok_or_else(invalid_mutation_genesis_enrollment)?;
+    if layout.owner_peer_ids != [leader.peer_id] || identity.peer_id() != leader.peer_id {
+        return Err(StorageError::PreconditionFailed {
+            description:
+                "private ORAM V2 owner enrollment currently requires the sole layout owner leader"
+                    .to_string(),
+        });
+    }
+    identity
+        .require_process_lifetime_fence(leader.peer_id)
+        .map_err(|_| {
+            StorageError::service_error(
+                "private ORAM owner enrollment process-lifetime fence is unavailable",
+            )
+        })?;
+    let signer_pin = consensus.private_oram_peer_recovery_signer_pin(leader.peer_id)?;
+    if identity.public_key() != signer_pin.signer() {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM owner enrollment signer is not pinned".to_string(),
+        });
+    }
+    let owner_signer = identity.owner_cleanup_signer().map_err(|_| {
+        StorageError::service_error("private ORAM owner enrollment signer is unavailable")
+    })?;
+    let peer_id_bytes = leader.peer_id.to_be_bytes();
+    let layout_generation_bytes = layout.generation.to_be_bytes();
+    let signer_epoch_bytes = owner_signer.key_epoch.to_be_bytes();
+    let owner_store_incarnation_digest = private_oram_owner_enrollment_digest_v2(
+        b"qdrant-sec/private-oram-owner-store-incarnation/v2",
+        &[
+            collection_id.as_bytes(),
+            &peer_id_bytes,
+            &layout_generation_bytes,
+            layout.layout_digest.as_bytes(),
+            owner_signer.key_id.as_bytes(),
+            &signer_epoch_bytes,
+            owner_signer.public_key.as_bytes(),
+        ],
+    );
+    let authority_registry_digest = signer_pin.manifest_digest().to_string();
+    let owner_registry_digest = private_oram_owner_enrollment_digest_v2(
+        b"qdrant-sec/private-oram-owner-registry/v2",
+        &[
+            collection_id.as_bytes(),
+            &peer_id_bytes,
+            layout.layout_digest.as_bytes(),
+            authority_registry_digest.as_bytes(),
+            owner_signer.key_id.as_bytes(),
+            owner_signer.public_key.as_bytes(),
+        ],
+    );
+    let owner_enrollment_id = private_oram_owner_enrollment_digest_v2(
+        b"qdrant-sec/private-oram-owner-enrollment-id/v2",
+        &[
+            collection_id.as_bytes(),
+            owner_store_incarnation_digest.as_bytes(),
+            authority_registry_digest.as_bytes(),
+            owner_registry_digest.as_bytes(),
+        ],
+    );
+    let enrollment_operation_id = private_oram_owner_enrollment_digest_v2(
+        b"qdrant-sec/private-oram-owner-enrollment-operation/v2",
+        &[
+            collection_id.as_bytes(),
+            owner_enrollment_id.as_bytes(),
+            layout.layout_digest.as_bytes(),
+        ],
+    );
+    let state = dispatcher
+        .private_oram_consensus_mutation_state(&key)?
+        .ok_or_else(invalid_mutation_genesis_enrollment)?;
+    let mut hnsw_indexes = state
+        .indexes
+        .iter()
+        .filter(|index| index.index_kind == PrivateOramIndexKind::Hnsw);
+    let vector_name = hnsw_indexes
+        .next()
+        .filter(|index| !index.index_name.is_empty())
+        .map(|index| index.index_name.as_str())
+        .ok_or_else(invalid_mutation_genesis_enrollment)?;
+    if hnsw_indexes.next().is_some()
+        || state.collection_id != collection_id
+        || state.layout_generation != layout.generation
+        || state.layout_digest != layout.layout_digest
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    let hnsw_store = PrivateHnswOramStore::new(collection.path(), vector_name)?;
+    let owner_store = PrivateOramOwnerPrestageStoreV2::new(hnsw_store.root_path());
+
+    for _ in 0..3 {
+        let plan = dispatcher.private_oram_mutation_v2_owner_enrollment_plan(
+            &key,
+            leader.peer_id,
+            owner_signer.clone(),
+            owner_store_incarnation_digest.clone(),
+            owner_enrollment_id.clone(),
+            authority_registry_digest.clone(),
+            owner_registry_digest.clone(),
+            enrollment_operation_id.clone(),
+        )?;
+        match plan {
+            PrivateOramOwnerEnrollmentPlanV2::Missing(prepared) => {
+                dispatcher
+                    .submit_private_oram_owner_enrollment_prepared_v2(&prepared, None)
+                    .await?;
+            }
+            PrivateOramOwnerEnrollmentPlanV2::Pending(prepared) => {
+                owner_store
+                    .install_genesis_enrollment_v2(&owner_store_incarnation_digest)
+                    .map_err(|_| {
+                        StorageError::service_error(
+                            "private ORAM owner enrollment local state is unavailable",
+                        )
+                    })?;
+                let commitment = identity
+                    .sign_owner_enrollment_genesis_commitment(&prepared)
+                    .map_err(|_| {
+                        StorageError::service_error(
+                            "private ORAM owner enrollment commitment signing failed",
+                        )
+                    })?;
+                dispatcher
+                    .submit_private_oram_owner_enrollment_activated_v2(&commitment, None)
+                    .await?;
+            }
+            PrivateOramOwnerEnrollmentPlanV2::Active => {
+                owner_store
+                    .require_enrollment_v2(&owner_store_incarnation_digest)
+                    .map_err(|_| {
+                        StorageError::service_error(
+                            "private ORAM owner enrollment local state is unavailable",
+                        )
+                    })?;
+                if current_active_mutation_leader_token(dispatcher)? != leader
+                    || dispatcher
+                        .private_oram_consensus_layout(&layout_key)?
+                        .as_ref()
+                        != Some(&layout)
+                    || collection.config_snapshot().await != config
+                {
+                    return Err(StorageError::PreconditionFailed {
+                        description: "private ORAM owner enrollment authority changed".to_string(),
+                    });
+                }
+                return Ok(PrivateOramMutationOwnerEnrollmentResponseV2 {
+                    collection_id,
+                    owner_peer_id: leader.peer_id,
+                    active: true,
+                });
+            }
+        }
+    }
+    Err(StorageError::service_error(
+        "private ORAM owner enrollment did not converge",
+    ))
 }
 
 pub(crate) async fn do_open_private_oram_mutation_session_v2(
@@ -1897,6 +3211,15 @@ pub(crate) async fn do_open_private_oram_mutation_session_v2(
         &current_slot,
         &layout,
     )?;
+    if !dispatcher
+        .consensus_state()
+        .ok_or_else(invalid_mutation_session)?
+        .private_oram_mutation_v2_owner_roster_is_active(&key, &layout)?
+    {
+        return Err(StorageError::PreconditionFailed {
+            description: "private ORAM mutation owner enrollment is incomplete".to_string(),
+        });
+    }
 
     let mutation_lease_generation = current_slot
         .generation
@@ -2568,6 +3891,17 @@ pub(crate) async fn do_validate_private_oram_mutation_append_v2(
     let key = PrivateOramMutationKey {
         collection_id: collection_id.clone(),
     };
+    let _execution = acquire_private_oram_mutation_execution_v2(&key).await?;
+    let has_pending_acknowledgement = || {
+        dispatcher
+            .private_oram_mutation_pending_acknowledgement_keys()
+            .map(|pending| pending.iter().any(|(pending_key, ..)| pending_key == &key))
+    };
+    if has_pending_acknowledgement()? {
+        return Err(StorageError::bad_request(
+            "private ORAM mutation clear acknowledgement is pending",
+        ));
+    }
     let state = dispatcher
         .private_oram_consensus_mutation_state(&key)?
         .ok_or_else(invalid_mutation_session)?;
@@ -2587,6 +3921,28 @@ pub(crate) async fn do_validate_private_oram_mutation_append_v2(
         &slot,
         &layout,
     )?;
+    let owner_store = PrivateOramOwnerPrestageStoreV2::try_new_pinned_absolute_v2(
+        PrivateHnswOramStore::new(
+            hnsw_context.collection_path(),
+            &session.response.vector_name,
+        )
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM owner journal is not ready for a new generation".to_string(),
+        })?
+        .root_path(),
+    )
+    .map_err(|_| StorageError::PreconditionFailed {
+        description: "private ORAM owner journal is not ready for a new generation".to_string(),
+    })?;
+    let owner_readiness = dispatcher.private_oram_owner_new_generation_readiness_expectation_v2(
+        &key,
+        dispatcher.this_peer_id(),
+    )?;
+    owner_store
+        .require_ready_for_new_generation_v2(&owner_readiness)
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM owner journal is not ready for a new generation".to_string(),
+        })?;
 
     let (staged_insert_frame, staged_insert_frame_bytes, point_id, staged_insert_digest) =
         decode_append_staged_insert_frame(input.staged_insert_frame_b64.as_deref())?;
@@ -2660,6 +4016,7 @@ pub(crate) async fn do_validate_private_oram_mutation_append_v2(
     let post_now_unix = current_unix_secs()?;
     if post_now_unix >= session.response.lease_expires_unix
         || collection.config_snapshot().await != config
+        || has_pending_acknowledgement()?
         || dispatcher
             .private_oram_consensus_mutation_state(&key)?
             .as_ref()
@@ -2675,6 +4032,19 @@ pub(crate) async fn do_validate_private_oram_mutation_append_v2(
     {
         return Err(invalid_mutation_session());
     }
+    let post_owner_readiness = dispatcher
+        .private_oram_owner_new_generation_readiness_expectation_v2(
+            &key,
+            dispatcher.this_peer_id(),
+        )?;
+    if post_owner_readiness != owner_readiness {
+        return Err(invalid_mutation_session());
+    }
+    owner_store
+        .require_ready_for_new_generation_v2(&post_owner_readiness)
+        .map_err(|_| StorageError::PreconditionFailed {
+            description: "private ORAM owner journal is not ready for a new generation".to_string(),
+        })?;
 
     let observed_read_transcripts = validated_owner_prepare
         .indexes()
@@ -3071,6 +4441,148 @@ fn index_session_view(
         tree_height: state.tree_height,
         fixed_append_read_path_count: state.fixed_append_read_path_count,
     })
+}
+
+fn validate_private_oram_genesis_hnsw_binding_v2(
+    collection_id: &str,
+    bundle: &PrivateOramImmutableManifestBundleV2,
+    state: &PrivateOramSignedStateV2,
+    record: &PrivateHnswManifestRecord,
+) -> StorageResult<()> {
+    let immutable = manifest_index(bundle, PrivateOramIndexKindV2::Hnsw)?;
+    let signed = signed_index(state, PrivateOramIndexKindV2::Hnsw)?;
+    let PrivateOramImmutableIndexParamsV2::Hnsw {
+        provider,
+        binding,
+        key_id,
+        rk_id,
+        rk_epoch,
+        dim,
+        distance,
+        hnsw,
+        oram,
+        fixed_search_budget,
+        ..
+    } = &immutable.params
+    else {
+        return Err(invalid_mutation_genesis_enrollment());
+    };
+    let live = &record.manifest;
+    let occupancy = live
+        .logical_node_count
+        .checked_add(live.dummy_node_count)
+        .ok_or_else(invalid_mutation_genesis_enrollment)?;
+    if bundle.manifest.collection_id != collection_id
+        || immutable.index_name != live.vector_name
+        || signed.index_name != immutable.index_name
+        || provider != VECTOR_PRIVATE_HNSW_ORAM_V2_PROVIDER
+        || binding != PRIVATE_HNSW_ORAM_V2_BINDING
+        || live.provider != VECTOR_PRIVATE_HNSW_ORAM_PROVIDER
+        || live.binding != PRIVATE_HNSW_ORAM_BINDING
+        || key_id != &live.key_id
+        || rk_id != &live.rk_id
+        || *rk_epoch != live.rk_epoch
+        || *dim != live.dim
+        || distance != &live.distance
+        || hnsw != &live.hnsw
+        || oram != &live.oram
+        || fixed_search_budget != &live.fixed_budget
+        || immutable.capacity.bucket_count != live.bucket_count
+        || immutable.capacity.logical_capacity != occupancy
+        || signed.index_epoch != live.index_epoch
+        || signed.root_hash != live.root_hash
+        || signed.logical_count != live.logical_node_count
+        || signed.dummy_count != live.dummy_node_count
+        || bundle.manifest.result_privacy != live.result_privacy
+        || bundle.manifest.owner_signing_key_id != live.owner_signing_key_id
+        || bundle.manifest.created_at_unix != live.created_at_unix
+        || record.signature.key_id != live.owner_signing_key_id
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    Ok(())
+}
+
+fn validate_private_oram_genesis_result_binding_v2(
+    collection_id: &str,
+    bundle: &PrivateOramImmutableManifestBundleV2,
+    state: &PrivateOramSignedStateV2,
+    record: Option<&PrivateResultOramManifestRecord>,
+) -> StorageResult<()> {
+    let immutable = manifest_index_optional(bundle, PrivateOramIndexKindV2::Result);
+    let (Some(immutable), Some(record)) = (immutable, record) else {
+        return if immutable.is_none() && record.is_none() {
+            Ok(())
+        } else {
+            Err(invalid_mutation_genesis_enrollment())
+        };
+    };
+    let signed = signed_index(state, PrivateOramIndexKindV2::Result)?;
+    let PrivateOramImmutableIndexParamsV2::Result {
+        provider,
+        binding,
+        key_id,
+        rk_id,
+        rk_epoch,
+        oram,
+    } = &immutable.params
+    else {
+        return Err(invalid_mutation_genesis_enrollment());
+    };
+    let live = &record.manifest;
+    let occupancy = live
+        .logical_result_count
+        .checked_add(live.dummy_result_count)
+        .ok_or_else(invalid_mutation_genesis_enrollment)?;
+    if bundle.manifest.collection_id != collection_id
+        || signed.index_name != immutable.index_name
+        || provider != PAYLOAD_PRIVATE_RESULT_ORAM_V2_PROVIDER
+        || binding != PRIVATE_RESULT_ORAM_V2_BINDING
+        || live.provider != PAYLOAD_PRIVATE_RESULT_ORAM_PROVIDER
+        || live.binding != PRIVATE_RESULT_ORAM_BINDING
+        || key_id != &live.key_id
+        || rk_id != &live.rk_id
+        || *rk_epoch != live.rk_epoch
+        || oram != &live.oram
+        || immutable.capacity.bucket_count != live.bucket_count
+        || immutable.capacity.logical_capacity != occupancy
+        || signed.index_epoch != live.index_epoch
+        || signed.root_hash != live.root_hash
+        || signed.logical_count != live.logical_result_count
+        || signed.dummy_count != live.dummy_result_count
+        || bundle.manifest.owner_signing_key_id != live.owner_signing_key_id
+        || bundle.manifest.created_at_unix != live.created_at_unix
+        || record.signature.key_id != live.owner_signing_key_id
+    {
+        return Err(invalid_mutation_genesis_enrollment());
+    }
+    Ok(())
+}
+
+fn private_oram_genesis_consensus_indexes_v2(
+    state: &PrivateOramSignedStateV2,
+) -> Vec<PrivateOramConsensusCollectionIndexStateV2> {
+    state
+        .indexes
+        .iter()
+        .map(|index| PrivateOramConsensusCollectionIndexStateV2 {
+            index_kind: match index.kind {
+                PrivateOramIndexKindV2::Hnsw => PrivateOramIndexKind::Hnsw,
+                PrivateOramIndexKindV2::Result => PrivateOramIndexKind::ResultPayload,
+            },
+            index_name: match index.kind {
+                PrivateOramIndexKindV2::Hnsw => index.index_name.clone(),
+                PrivateOramIndexKindV2::Result => String::new(),
+            },
+            epoch: PrivateOramConsensusEpoch {
+                index_epoch: index.index_epoch,
+                root_hash: index.root_hash.clone(),
+                writeback_digest: Some(index.last_writeback_digest.clone()),
+            },
+            logical_count: index.logical_count,
+            dummy_count: index.dummy_count,
+        })
+        .collect()
 }
 
 fn validate_live_hnsw_binding(
@@ -3561,6 +5073,21 @@ fn invalid_mutation_session() -> StorageError {
     StorageError::bad_request("private ORAM mutation session is invalid")
 }
 
+fn invalid_mutation_genesis_enrollment() -> StorageError {
+    StorageError::bad_request("private ORAM mutation genesis enrollment is invalid")
+}
+
+fn private_oram_owner_enrollment_digest_v2(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u32).to_be_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    BASE64URL_NOPAD.encode(&hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use qdrant_sec::{
@@ -3572,12 +5099,81 @@ mod tests {
         PrivateOramSignature, PrivateOramSignedStateBundleV2, PrivateOramSignedStateV2,
         ResultPrivacyMode, encode_private_hnsw_oram_leaf_label,
     };
+    use storage::content_manager::consensus_ops::{
+        PrivateOramExternalRecoveryAuthority, PrivateOramExternalRecoveryLease,
+        PrivateOramExternalRecoveryLeasePhase,
+    };
     use storage::rbac::Access;
 
     use super::*;
 
     fn test_digest(fill: u8) -> String {
         BASE64URL_NOPAD.encode(&[fill; 32])
+    }
+
+    fn runtime_cleanup_claim(
+        collection_id: &str,
+        generation: u64,
+    ) -> PrivateOramMutationCleanupClaimBindingV2 {
+        PrivateOramMutationCleanupClaimBindingV2 {
+            authority: PrivateOramMutationRuntimeAuthorityV2 {
+                collection_id: collection_id.to_string(),
+                mutation_id: test_digest((generation % 256) as u8),
+                owner_peer_id: 11,
+                generation,
+            },
+            descriptor_digest: test_digest(201),
+            terminal_record_digest: test_digest(202),
+            witness_digest: test_digest(203),
+            cleanup_evidence_digest: test_digest(204),
+        }
+    }
+
+    fn external_recovery_state_fixture(
+        committed_backup_generation: u64,
+        active: bool,
+    ) -> Option<PrivateOramExternalRecoveryState> {
+        Some(PrivateOramExternalRecoveryState {
+            committed_backup_generation,
+            committed_checkpoint_digest: (committed_backup_generation != 0)
+                .then(|| test_digest(91)),
+            committed_install_intent_digest: (committed_backup_generation != 0)
+                .then(|| test_digest(92)),
+            active_lease: active.then(|| PrivateOramExternalRecoveryLease {
+                owner_peer_id: 101,
+                operation_id_hash: test_digest(93),
+                checkpoint_digest: test_digest(94),
+                backup_generation: committed_backup_generation + 1,
+                issued_at_unix: 100,
+                expires_at_unix: 200,
+                authority: PrivateOramExternalRecoveryAuthority::MutationV2,
+                install_intent_digest: None,
+                phase: PrivateOramExternalRecoveryLeasePhase::Staging,
+            }),
+        })
+    }
+
+    #[test]
+    fn snapshot_external_recovery_fence_requires_exact_inactive_state() {
+        let inactive = external_recovery_state_fixture(1, false);
+        let advanced = external_recovery_state_fixture(2, false);
+        let active = external_recovery_state_fixture(1, true);
+
+        assert!(private_oram_snapshot_external_recovery_state_matches(
+            &None, &None
+        ));
+        assert!(private_oram_snapshot_external_recovery_state_matches(
+            &inactive, &inactive
+        ));
+        assert!(!private_oram_snapshot_external_recovery_state_matches(
+            &inactive, &advanced
+        ));
+        assert!(!private_oram_snapshot_external_recovery_state_matches(
+            &inactive, &active
+        ));
+        assert!(!private_oram_snapshot_external_recovery_state_matches(
+            &active, &active
+        ));
     }
 
     fn hnsw_live_binding_fixture() -> (
@@ -3927,6 +5523,404 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn runtime_history_is_bounded_per_collection_across_generations() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let unrelated = runtime_cleanup_claim("retained-unrelated-collection", 7);
+        registry.remember_completed_cleanup(&unrelated).unwrap();
+
+        for generation in 1..=4_096 {
+            let claim = runtime_cleanup_claim("retained-long-lived-collection", generation);
+            registry
+                .remember_job_authority(claim.authority.clone())
+                .unwrap();
+            assert_eq!(registry.runtime_history.len(), 2);
+            assert!(
+                registry
+                    .runtime_history_for(&claim.authority)
+                    .unwrap()
+                    .unwrap()
+                    .cleanup_tombstone
+                    .is_none()
+            );
+            registry.remember_completed_cleanup(&claim).unwrap();
+            let history = registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .unwrap();
+            assert!(history.saw_job);
+            assert!(history.cleanup_tombstone.as_ref() == Some(&claim));
+            assert_eq!(registry.runtime_history.len(), 2);
+            assert!(
+                registry
+                    .runtime_history_for(&unrelated.authority)
+                    .unwrap()
+                    .unwrap()
+                    .cleanup_tombstone
+                    .as_ref()
+                    == Some(&unrelated)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_history_rejects_nonmonotonic_job_replacement() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let current = runtime_cleanup_claim("job-history-generation-collection", 2);
+        registry
+            .remember_job_authority(current.authority.clone())
+            .unwrap();
+        let older = runtime_cleanup_claim("job-history-generation-collection", 1);
+        let mut changed_mutation = current.authority.clone();
+        changed_mutation.mutation_id = test_digest(33);
+        let mut changed_owner = current.authority.clone();
+        changed_owner.owner_peer_id += 1;
+        for authority in [
+            older.authority,
+            changed_mutation,
+            changed_owner,
+            current.authority.clone(),
+        ] {
+            assert!(registry.remember_job_authority(authority).is_err());
+            assert_eq!(registry.runtime_history.len(), 1);
+            assert!(
+                registry
+                    .runtime_history_for(&current.authority)
+                    .unwrap()
+                    .unwrap()
+                    .saw_job
+            );
+        }
+        registry.remember_completed_cleanup(&current).unwrap();
+        assert!(
+            registry
+                .remember_job_authority(current.authority.clone())
+                .is_err()
+        );
+        let next = runtime_cleanup_claim("job-history-generation-collection", 3);
+        registry
+            .remember_job_authority(next.authority.clone())
+            .unwrap();
+        assert!(registry.runtime_history_for(&current.authority).is_err());
+        assert_eq!(registry.runtime_history.len(), 1);
+    }
+
+    fn rejected_runtime_fixture() -> (
+        PrivateOramMutationSessionV2,
+        PrivateOramMutationRejectedRuntimeClaimV2,
+    ) {
+        let mut session = mutation_session_fixture(
+            "rejected-runtime-collection",
+            "rejected-runtime-session",
+            PrivateOramServerReadEvidenceRecorderV1::new(),
+        );
+        let authority = PrivateOramMutationRuntimeAuthorityV2 {
+            collection_id: session.response.collection_id.clone(),
+            mutation_id: session.response.mutation_id.clone(),
+            owner_peer_id: session.leader.peer_id,
+            generation: session.response.mutation_lease_generation,
+        };
+        let token = PrivateOramMutationFreezeTokenV2 {
+            session_incarnation: session.incarnation,
+            freeze_nonce: [3; 32],
+            leader: session.leader,
+        };
+        session.freeze_owner = Some(PrivateOramMutationFreezeOwnerV2::Job {
+            mutation_id: authority.mutation_id.clone(),
+            token: token.clone(),
+        });
+        let claim = PrivateOramMutationRejectedRuntimeClaimV2 {
+            authority,
+            binding: PrivateOramMutationAppendJobBindingV2 {
+                job_key: test_digest(54),
+                collection_name: session.collection_name.clone(),
+                collection_id: session.response.collection_id.clone(),
+                session_id: session.response.session_id.clone(),
+                mutation_id: session.response.mutation_id.clone(),
+                token,
+            },
+            recovery_manifest_digest: test_digest(55),
+            rejection_digest: test_digest(56),
+        };
+        (session, claim)
+    }
+
+    #[test]
+    fn rejected_runtime_retirement_requires_exact_quiescent_session() {
+        let (session, claim) = rejected_runtime_fixture();
+        let check = |candidate: &PrivateOramMutationRejectedRuntimeClaimV2,
+                     session: &PrivateOramMutationSessionV2,
+                     phase,
+                     active| {
+            validate_private_oram_rejected_runtime_binding_v2(
+                candidate,
+                &claim.authority,
+                &claim.binding,
+                session,
+                phase,
+                active,
+            )
+        };
+        let phase = PrivateOramMutationAppendJobPhaseV2::RejectedAckComplete;
+        check(&claim, &session, phase, false).unwrap();
+        assert!(check(&claim, &session, phase, true).is_err());
+        assert!(
+            check(
+                &claim,
+                &session,
+                PrivateOramMutationAppendJobPhaseV2::AdmittedRecovery,
+                false,
+            )
+            .is_err()
+        );
+        let mut wrong_mutation = claim.clone();
+        wrong_mutation.authority.mutation_id = test_digest(77);
+        assert!(check(&wrong_mutation, &session, phase, false).is_err());
+        let mut wrong_owner = claim.clone();
+        wrong_owner.authority.owner_peer_id += 1;
+        assert!(check(&wrong_owner, &session, phase, false).is_err());
+        let mut wrong_claim_incarnation = claim.clone();
+        wrong_claim_incarnation.binding.token.session_incarnation += 1;
+        assert!(check(&wrong_claim_incarnation, &session, phase, false).is_err());
+        let mut replacement_session = session.clone();
+        replacement_session.incarnation += 1;
+        assert!(check(&claim, &replacement_session, phase, false).is_err());
+        let mut unfrozen = session.clone();
+        unfrozen.freeze_owner = None;
+        assert!(check(&claim, &unfrozen, phase, false).is_err());
+    }
+
+    #[test]
+    fn rejected_runtime_history_allows_only_a_fresh_validated_job_at_the_same_generation() {
+        let (_, claim) = rejected_runtime_fixture();
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        registry
+            .remember_job_authority(claim.authority.clone())
+            .unwrap();
+        let mut next = claim.authority.clone();
+        next.mutation_id = test_digest(78);
+        assert!(registry.remember_job_authority(next.clone()).is_err());
+        registry.remember_rejected_cleanup(claim.clone()).unwrap();
+        registry.remember_rejected_cleanup(claim.clone()).unwrap();
+        let mut changed_proof = claim.clone();
+        changed_proof.rejection_digest = test_digest(79);
+        assert!(registry.remember_rejected_cleanup(changed_proof).is_err());
+        assert!(
+            registry
+                .remember_job_authority(claim.authority.clone())
+                .is_err()
+        );
+        let mut wrong_owner = next.clone();
+        wrong_owner.owner_peer_id += 1;
+        assert!(registry.remember_job_authority(wrong_owner).is_err());
+
+        let mut old_positive =
+            runtime_cleanup_claim(&claim.authority.collection_id, claim.authority.generation);
+        old_positive.authority = claim.authority.clone();
+        assert!(registry.remember_completed_cleanup(&old_positive).is_err());
+        registry.remember_job_authority(next.clone()).unwrap();
+        assert!(registry.remember_rejected_cleanup(claim.clone()).is_err());
+        assert!(registry.remember_completed_cleanup(&old_positive).is_err());
+        assert!(registry.runtime_history_for(&claim.authority).is_err());
+        assert!(
+            registry
+                .runtime_history_for(&next)
+                .unwrap()
+                .unwrap()
+                .rejected_tombstone
+                .is_none()
+        );
+        assert_eq!(registry.runtime_history.len(), 1);
+    }
+
+    #[test]
+    fn rejected_runtime_history_is_bounded_across_same_generation_attempts() {
+        let (_, mut claim) = rejected_runtime_fixture();
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        for attempt in 0_u64..1_024 {
+            claim.authority.mutation_id = format!("rejected-mutation-{attempt}");
+            claim.binding.mutation_id = claim.authority.mutation_id.clone();
+            claim.binding.token.session_incarnation = attempt + 1;
+            registry
+                .remember_job_authority(claim.authority.clone())
+                .unwrap();
+            registry.remember_rejected_cleanup(claim.clone()).unwrap();
+            assert_eq!(registry.runtime_history.len(), 1);
+            assert_eq!(
+                registry
+                    .runtime_history_for(&claim.authority)
+                    .unwrap()
+                    .unwrap()
+                    .rejected_tombstone
+                    .as_ref()
+                    .map(|proof| proof.binding.token.session_incarnation),
+                Some(attempt + 1),
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_runtime_reconciliation_preserves_immutable_lease_authority() {
+        let original = PrivateOramMutationLease {
+            generation: 1,
+            collection_id: "runtime-admitted-collection".to_string(),
+            owner_peer_id: 11,
+            mutation_id: test_digest(81),
+            signed_mutation_digest: test_digest(82),
+            transition_digest: test_digest(83),
+            base_record_digest: test_digest(84),
+            base_state_sequence: 1,
+            writer_lease_digest: test_digest(85),
+            writer_fence: 1,
+            issued_at_unix: 100,
+            expires_at_unix: 200,
+            renewal_revision: 0,
+            phase:
+                storage::content_manager::consensus_ops::PrivateOramMutationLeasePhase::Preparing,
+        };
+        let mut renewed = original.clone();
+        renewed.expires_at_unix = 300;
+        renewed.renewal_revision = 1;
+        renewed.phase =
+            storage::content_manager::consensus_ops::PrivateOramMutationLeasePhase::ConsensusCommitted {
+                committed_record_digest: test_digest(87),
+                committed_state_sequence: 2,
+                committed_signed_state_digest: test_digest(88),
+                receipt_digest: test_digest(89),
+            };
+        assert!(private_oram_same_admitted_lease_v2(&original, &renewed));
+        for changed in [
+            PrivateOramMutationLease {
+                mutation_id: test_digest(86),
+                ..renewed.clone()
+            },
+            PrivateOramMutationLease {
+                owner_peer_id: 12,
+                ..renewed.clone()
+            },
+            PrivateOramMutationLease {
+                writer_fence: 2,
+                ..renewed.clone()
+            },
+            PrivateOramMutationLease {
+                expires_at_unix: 199,
+                ..renewed
+            },
+        ] {
+            assert!(!private_oram_same_admitted_lease_v2(&original, &changed));
+        }
+    }
+
+    #[test]
+    fn session_open_and_install_do_not_retire_completed_runtime_history() {
+        let mut registry = PrivateOramMutationSessionRegistryV2::default();
+        let mut session = mutation_session_fixture(
+            "session-history-retention-collection",
+            "00000000-0000-4000-8000-000000000301",
+            PrivateOramServerReadEvidenceRecorderV1::new(),
+        );
+        let collection_id = session.response.collection_id.clone();
+        let claim = runtime_cleanup_claim(&collection_id, 1);
+        registry.remember_completed_cleanup(&claim).unwrap();
+        session.response.mutation_lease_generation = 2;
+        registry.reserve_open(&collection_id, 100).unwrap();
+        registry.release_open(&collection_id);
+        assert!(
+            registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .is_some()
+        );
+        registry.reserve_open(&collection_id, 100).unwrap();
+        registry.install(session).unwrap();
+        assert!(registry.reserve_open(&collection_id, 100).is_err());
+        assert!(
+            registry
+                .runtime_history_for(&claim.authority)
+                .unwrap()
+                .unwrap()
+                .cleanup_tombstone
+                .as_ref()
+                == Some(&claim)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_history_rejects_pruned_generation_without_restart_absence() {
+        let collection_id = "cleanup-history-pruned-generation-collection";
+        let first = runtime_cleanup_claim(collection_id, 1);
+        let process_incarnation = "cleanup-history-process".to_string();
+        for _ in 0..2 {
+            let cleanup = complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                first.clone(),
+                process_incarnation.clone(),
+            )
+            .await
+            .unwrap();
+            cleanup
+                .validate_binding(&first, &process_incarnation)
+                .unwrap();
+        }
+        let next = runtime_cleanup_claim(collection_id, 2);
+        session_registry()
+            .lock()
+            .unwrap()
+            .remember_job_authority(next.authority.clone())
+            .unwrap();
+        for claim in [first.clone(), next.clone()] {
+            assert!(
+                complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                    claim,
+                    process_incarnation.clone(),
+                )
+                .await
+                .is_err(),
+                "an old claim or a lost same-process job must not become restart absence"
+            );
+        }
+
+        let restarted = runtime_cleanup_claim(collection_id, 3);
+        let cleanup = complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+            restarted.clone(),
+            process_incarnation.clone(),
+        )
+        .await
+        .unwrap();
+        cleanup
+            .validate_binding(&restarted, &process_incarnation)
+            .unwrap();
+        let mut changed_claim = restarted.clone();
+        changed_claim.witness_digest = test_digest(50);
+        let mut changed_mutation = restarted.clone();
+        changed_mutation.authority.mutation_id = test_digest(51);
+        let mut changed_owner = restarted.clone();
+        changed_owner.authority.owner_peer_id += 1;
+        for claim in [first, next, changed_claim, changed_mutation, changed_owner] {
+            assert!(
+                complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+                    claim,
+                    process_incarnation.clone(),
+                )
+                .await
+                .is_err()
+            );
+        }
+        complete_private_oram_detached_job_local_cleanup_with_binding_v2(
+            restarted.clone(),
+            process_incarnation,
+        )
+        .await
+        .unwrap();
+        let mut registry = session_registry().lock().unwrap();
+        let history = registry
+            .runtime_history_for(&restarted.authority)
+            .unwrap()
+            .unwrap();
+        assert!(!history.saw_job);
+        assert!(history.cleanup_tombstone.as_ref() == Some(&restarted));
+        registry.runtime_history.remove(collection_id);
+    }
+
     #[tokio::test]
     async fn cleanup_rejects_same_process_job_loss_and_replays_restart_absence() {
         let collection_id = "cleanup-absence-regression-collection";
@@ -3955,8 +5949,8 @@ mod tests {
         {
             let mut registry = session_registry().lock().unwrap();
             registry
-                .seen_job_authorities
-                .insert(observed_authority.clone());
+                .remember_job_authority(observed_authority.clone())
+                .unwrap();
         }
         assert!(
             complete_private_oram_detached_job_local_cleanup_with_binding_v2(
@@ -4020,8 +6014,7 @@ mod tests {
         );
 
         let mut registry = session_registry().lock().unwrap();
-        registry.seen_job_authorities.remove(&observed_authority);
-        registry.cleanup_tombstones.remove(&restart_claim.authority);
+        registry.runtime_history.remove(collection_id);
         registry.cleanup_claims.remove(collection_id);
         registry.cleanup_claimed_collections.remove(collection_id);
     }
@@ -4098,7 +6091,7 @@ mod tests {
             .unwrap();
 
         let mut registry = session_registry().lock().unwrap();
-        registry.cleanup_tombstones.remove(&authority);
+        registry.runtime_history.remove(&authority.collection_id);
         registry.cleanup_claims.remove(&collection_id);
         registry.cleanup_claimed_collections.remove(&collection_id);
     }
@@ -4238,6 +6231,22 @@ mod tests {
                 ))
         );
         remove_test_mutation_session(session_id);
+    }
+
+    #[test]
+    fn inactive_detached_job_does_not_block_supervisor_recovery() {
+        assert!(private_oram_mutation_job_blocks_supervisor_v2(
+            true,
+            PrivateOramMutationAppendJobPhaseV2::PointsStaging,
+        ));
+        assert!(!private_oram_mutation_job_blocks_supervisor_v2(
+            false,
+            PrivateOramMutationAppendJobPhaseV2::PointsStaging,
+        ));
+        assert!(!private_oram_mutation_job_blocks_supervisor_v2(
+            true,
+            PrivateOramMutationAppendJobPhaseV2::Deciding,
+        ));
     }
 
     #[test]

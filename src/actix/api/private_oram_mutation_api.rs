@@ -19,11 +19,14 @@ use crate::common::private_oram_mutation::run_private_oram_mutation_append_v2;
 use crate::common::private_oram_mutation_session::{
     PrivateOramMutationAppendInputV2, PrivateOramMutationAppendJobPhaseV2,
     PrivateOramMutationEnrollInputV2, PrivateOramMutationEnrollmentTemplateInputV2,
-    PrivateOramMutationOpenInputV2, close_private_oram_mutation_session_v2,
-    do_enroll_private_oram_mutation_collection_v2, do_open_private_oram_mutation_session_v2,
-    do_read_private_oram_mutation_hnsw_paths_v2, do_read_private_oram_mutation_result_buckets_v2,
-    do_validate_private_oram_mutation_append_v2, private_oram_mutation_enrollment_template_v2,
-    private_oram_mutation_session_status_v2,
+    PrivateOramMutationGenesisEnrollmentInputV2, PrivateOramMutationOpenInputV2,
+    PrivateOramMutationOwnerEnrollmentInputV2, close_private_oram_mutation_session_v2,
+    do_enroll_private_oram_mutation_collection_v2, do_enroll_private_oram_mutation_genesis_v2,
+    do_enroll_private_oram_mutation_owner_v2,
+    do_get_private_oram_mutation_genesis_enrollment_context_v2,
+    do_open_private_oram_mutation_session_v2, do_read_private_oram_mutation_hnsw_paths_v2,
+    do_read_private_oram_mutation_result_buckets_v2, do_validate_private_oram_mutation_append_v2,
+    private_oram_mutation_enrollment_template_v2, private_oram_mutation_session_status_v2,
 };
 use crate::common::private_oram_peer_identity::PrivateOramPeerRecoveryIdentity;
 use crate::common::private_result_oram::PrivateResultOramReadBucketsResponse;
@@ -36,6 +39,14 @@ struct PrivateOramMutationPathV2 {
     #[validate(nested)]
     #[serde(flatten)]
     collection: CollectionPath,
+}
+
+#[derive(Deserialize, Validate)]
+struct PrivateOramMutationEnrollmentContextPathV2 {
+    #[validate(nested)]
+    #[serde(flatten)]
+    collection: CollectionPath,
+    vector_name: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -222,6 +233,56 @@ where
     }
 }
 
+async fn genesis_enrollment_context(
+    dispatcher: web::Data<Dispatcher>,
+    settings: web::Data<Settings>,
+    path: Path<PrivateOramMutationEnrollmentContextPathV2>,
+    ActixAuth(auth): ActixAuth,
+) -> HttpResponse {
+    let path = path.into_inner();
+    let timing = Instant::now();
+    let result = do_get_private_oram_mutation_genesis_enrollment_context_v2(
+        dispatcher.get_ref(),
+        &auth,
+        settings.get_ref(),
+        &path.collection.collection_name,
+        &path.vector_name,
+    )
+    .await
+    .map(PrivateOramMutationWireV2);
+    process_response(result, timing, None)
+}
+
+async fn enroll_owner(
+    dispatcher: web::Data<Dispatcher>,
+    identity: web::Data<Option<std::sync::Arc<PrivateOramPeerRecoveryIdentity>>>,
+    path: Path<PrivateOramMutationPathV2>,
+    request: Json<PrivateOramMutationWireV2<PrivateOramMutationOwnerEnrollmentInputV2>>,
+    ActixAuth(auth): ActixAuth,
+) -> HttpResponse {
+    let collection_name = path.into_inner().collection.collection_name;
+    let request = request.into_inner().into_inner();
+    let timing = Instant::now();
+    let result = async {
+        let identity = identity.get_ref().as_ref().cloned().ok_or_else(|| {
+            storage::content_manager::errors::StorageError::service_error(
+                "private ORAM mutation peer identity is unavailable",
+            )
+        })?;
+        do_enroll_private_oram_mutation_owner_v2(
+            dispatcher.get_ref(),
+            &auth,
+            identity.as_ref(),
+            &collection_name,
+            request,
+        )
+        .await
+    }
+    .await
+    .map(PrivateOramMutationWireV2);
+    process_response(result, timing, None)
+}
+
 async fn open_session(
     dispatcher: web::Data<Dispatcher>,
     settings: web::Data<Settings>,
@@ -264,35 +325,59 @@ async fn enrollment_template(
     process_response(result, timing, None)
 }
 
+// The original enrollment ceremony includes a client id. The genesis-only ceremony omits it
+// and enrolls owners separately; preserve both strict request shapes on the existing route.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PrivateOramMutationEnrollmentRequestV2 {
+    Collection(PrivateOramMutationEnrollInputV2),
+    Genesis(PrivateOramMutationGenesisEnrollmentInputV2),
+}
+
 async fn enroll(
     dispatcher: web::Data<Dispatcher>,
     settings: web::Data<Settings>,
     identity: web::Data<Option<std::sync::Arc<PrivateOramPeerRecoveryIdentity>>>,
     path: Path<PrivateOramMutationPathV2>,
-    request: Json<PrivateOramMutationWireV2<PrivateOramMutationEnrollInputV2>>,
+    request: Json<PrivateOramMutationWireV2<PrivateOramMutationEnrollmentRequestV2>>,
     ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let collection_name = path.into_inner().collection.collection_name;
-    let request = request.into_inner().into_inner();
     let timing = Instant::now();
-    let result = match identity.get_ref().as_deref() {
-        Some(identity) => do_enroll_private_oram_mutation_collection_v2(
-            dispatcher.get_ref(),
-            &auth,
-            settings.get_ref(),
-            identity,
-            &collection_name,
-            request,
-        )
-        .await
-        .map(PrivateOramMutationWireV2),
-        None => Err(
-            storage::content_manager::errors::StorageError::service_error(
-                "private ORAM mutation peer identity is unavailable",
-            ),
-        ),
-    };
-    process_response(result, timing, None)
+    match request.into_inner().into_inner() {
+        PrivateOramMutationEnrollmentRequestV2::Collection(request) => {
+            let result = match identity.get_ref().as_deref() {
+                Some(identity) => do_enroll_private_oram_mutation_collection_v2(
+                    dispatcher.get_ref(),
+                    &auth,
+                    settings.get_ref(),
+                    identity,
+                    &collection_name,
+                    request,
+                )
+                .await
+                .map(PrivateOramMutationWireV2),
+                None => Err(
+                    storage::content_manager::errors::StorageError::service_error(
+                        "private ORAM mutation peer identity is unavailable",
+                    ),
+                ),
+            };
+            process_response(result, timing, None)
+        }
+        PrivateOramMutationEnrollmentRequestV2::Genesis(request) => {
+            let result = do_enroll_private_oram_mutation_genesis_v2(
+                dispatcher.get_ref(),
+                &auth,
+                settings.get_ref(),
+                &collection_name,
+                request,
+            )
+            .await
+            .map(PrivateOramMutationWireV2);
+            process_response(result, timing, None)
+        }
+    }
 }
 
 async fn read(
@@ -423,6 +508,11 @@ pub fn config_private_oram_mutation_api(cfg: &mut web::ServiceConfig) {
             .app_data(private_oram_mutation_json_config())
             .route("/enrollment-template", web::post().to(enrollment_template))
             .route("/enroll", web::post().to(enroll))
+            .route(
+                "/enrollment-context/{vector_name}",
+                web::get().to(genesis_enrollment_context),
+            )
+            .route("/owner-enroll", web::post().to(enroll_owner))
             .route("/open", web::post().to(open_session))
             .route("/read", web::post().to(read))
             .route("/append", web::post().to(append))
@@ -554,6 +644,7 @@ fn is_u64_field(name: &str) -> bool {
             | "new_leaf"
             | "old_epoch"
             | "old_leaf"
+            | "owner_peer_id"
             | "reserved_physical_slots"
             | "rk_epoch"
             | "signed_at_unix"
@@ -563,7 +654,7 @@ fn is_u64_field(name: &str) -> bool {
 }
 
 fn is_u64_array_field(name: &str) -> bool {
-    matches!(name, "bucket_ids")
+    matches!(name, "bucket_ids" | "owner_peer_ids")
 }
 
 #[cfg(test)]
@@ -578,7 +669,9 @@ mod tests {
     #[serde(deny_unknown_fields)]
     struct U64WireFixture {
         writer_fence: u64,
+        owner_peer_id: u64,
         bucket_ids: Vec<u64>,
+        owner_peer_ids: Vec<u64>,
     }
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,12 +691,19 @@ mod tests {
         for value in [(1u64 << 53) - 1, 1u64 << 53, u64::MAX] {
             let encoded = serde_json::to_value(PrivateOramMutationWireV2(U64WireFixture {
                 writer_fence: value,
+                owner_peer_id: value,
                 bucket_ids: vec![value],
+                owner_peer_ids: vec![value],
             }))
             .unwrap();
             assert_eq!(
                 encoded,
-                json!({ "writer_fence": value.to_string(), "bucket_ids": [value.to_string()] })
+                json!({
+                    "writer_fence": value.to_string(),
+                    "owner_peer_id": value.to_string(),
+                    "bucket_ids": [value.to_string()],
+                    "owner_peer_ids": [value.to_string()],
+                })
             );
             let decoded =
                 serde_json::from_value::<PrivateOramMutationWireV2<U64WireFixture>>(encoded)
@@ -617,7 +717,9 @@ mod tests {
         assert!(
             serde_json::from_value::<PrivateOramMutationWireV2<U64WireFixture>>(json!({
                 "writer_fence": 9_007_199_254_740_992u64,
-                "bucket_ids": ["1"]
+                "owner_peer_id": "1",
+                "bucket_ids": ["1"],
+                "owner_peer_ids": ["1"]
             }))
             .is_err()
         );
@@ -625,7 +727,9 @@ mod tests {
             assert!(
                 serde_json::from_value::<PrivateOramMutationWireV2<U64WireFixture>>(json!({
                     "writer_fence": encoded,
-                    "bucket_ids": ["1"]
+                    "owner_peer_id": "1",
+                    "bucket_ids": ["1"],
+                    "owner_peer_ids": ["1"]
                 }))
                 .is_err()
             );
@@ -633,7 +737,18 @@ mod tests {
         assert!(
             serde_json::from_value::<PrivateOramMutationWireV2<U64WireFixture>>(json!({
                 "writer_fence": "1",
-                "bucket_ids": [1]
+                "owner_peer_id": "1",
+                "bucket_ids": [1],
+                "owner_peer_ids": ["1"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PrivateOramMutationWireV2<U64WireFixture>>(json!({
+                "writer_fence": "1",
+                "owner_peer_id": "1",
+                "bucket_ids": ["1"],
+                "owner_peer_ids": [1]
             }))
             .is_err()
         );

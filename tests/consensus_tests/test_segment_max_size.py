@@ -40,7 +40,17 @@ def test_max_segment_size(tmp_path: pathlib.Path):
     assert collection_cluster_info_before["segments_count"] == 2
     assert collection_cluster_info_before["payload_schema"]["city"]["points"] == 0
 
-    upsert_random_points(peer_api_uris[0], 20, batch_size=5)
+    upsert_random_points(peer_api_uris[0], 10, batch_size=5)
+
+    # Point updates complete before the optimizer publishes a new appendable segment.
+    def segments_grew():
+        info = get_collection_info(peer_api_uris[0], COLLECTION_NAME)
+        return info["segments_count"] > collection_cluster_info_before["segments_count"]
+
+    wait_for(segments_grew)
+
+    # Write into the newly available segment to verify it also maintains the payload index.
+    upsert_random_points(peer_api_uris[0], 10, offset=10, batch_size=5)
 
     collection_cluster_info_after = get_collection_info(peer_api_uris[0], COLLECTION_NAME)
 

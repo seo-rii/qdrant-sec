@@ -9013,6 +9013,7 @@ mod tests {
         assert!(!message.contains("CKKS vector ciphertext"), "{message}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_query_paths_require_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9095,6 +9096,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_lookup_source_requires_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9210,6 +9212,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_group_lookup_source_requires_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9300,6 +9303,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_context_and_mmr_require_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9384,6 +9388,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_legacy_and_batch_search_require_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9805,6 +9810,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_search_matrix_requires_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9861,6 +9867,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_recommend_and_discover_require_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -9988,6 +9995,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_hnsw_oram_group_paths_require_client_led_session() {
         let fixture = PrivateHnswRouteWireFixture::build_uploaded();
@@ -10068,6 +10076,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn ckks_score_query_source_batch_forwards_query_rk_id_not_key_id() {
         let bridge_dir = tempfile::Builder::new()

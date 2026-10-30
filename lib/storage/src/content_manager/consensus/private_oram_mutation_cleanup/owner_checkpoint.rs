@@ -158,6 +158,10 @@ impl PrivateOramOwnerCheckpointRecordV1 {
     pub(crate) fn owner_signer(&self) -> &PrivateOramOwnerCleanupSignerV1 {
         &self.owner_signer
     }
+
+    pub(crate) fn owner_store_incarnation_digest(&self) -> &str {
+        &self.owner_store_incarnation_digest
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,6 +493,43 @@ impl PrivateOramOwnerCheckpointTableV1 {
 
     pub(crate) fn checkpoints(&self) -> &[PrivateOramOwnerCheckpointRecordV1] {
         &self.checkpoints
+    }
+
+    pub(crate) fn roster_membership_epoch(&self) -> Option<u64> {
+        self.roster_membership_epoch
+    }
+
+    pub(crate) fn pending_enrollment_for_owner(
+        &self,
+        owner_peer_id: u64,
+    ) -> Option<&PrivateOramOwnerEnrollmentPreparedV1> {
+        self.pending_enrollments
+            .iter()
+            .find(|pending| pending.prepared.owner_peer_id == owner_peer_id)
+            .map(|pending| &pending.prepared)
+    }
+
+    pub(crate) fn checkpoint_for_owner(
+        &self,
+        owner_peer_id: u64,
+    ) -> Option<&PrivateOramOwnerCheckpointRecordV1> {
+        self.checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.owner_peer_id == owner_peer_id)
+    }
+
+    pub(crate) fn enrollment_roster_is_active(&self, owner_peer_ids: &[u64]) -> bool {
+        let mut checkpoint_owner_peer_ids = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.owner_peer_id)
+            .collect::<Vec<_>>();
+        checkpoint_owner_peer_ids.sort_unstable();
+        self.roster_membership_epoch.is_some()
+            && self.pending_enrollments.is_empty()
+            && self.active_leases.is_empty()
+            && self.repair_pending_owner_enrollment_ids.is_empty()
+            && checkpoint_owner_peer_ids == owner_peer_ids
     }
 
     pub(crate) fn pending_enrollment_count(&self) -> usize {
@@ -2361,6 +2402,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn enrollment_roster_readiness_requires_exact_fully_active_owners() {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[41; 32]).unwrap();
+        let base = table();
+        let enrollment = prepared(&key, 11, 20, 30);
+        let pending = prepare_private_oram_owner_enrollment_transition_v1(
+            &base,
+            enrollment.clone(),
+            locator(1, 2),
+        )
+        .unwrap();
+        assert!(!base.enrollment_roster_is_active(&[11]));
+        assert!(!pending.enrollment_roster_is_active(&[11]));
+
+        let commitment =
+            sign_private_oram_owner_enrollment_genesis_commitment_v1(&key, &enrollment).unwrap();
+        let active = activate_private_oram_owner_enrollment_transition_v1(
+            &pending,
+            &commitment,
+            locator(1, 3),
+        )
+        .unwrap();
+        assert!(active.enrollment_roster_is_active(&[11]));
+        assert!(!active.enrollment_roster_is_active(&[]));
+        assert!(!active.enrollment_roster_is_active(&[11, 12]));
+        assert!(!active.enrollment_roster_is_active(&[12]));
     }
 
     #[test]

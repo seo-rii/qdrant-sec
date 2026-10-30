@@ -45,8 +45,61 @@
 - Encrypted payload read policy: raw envelope 반환은 기본값이고, REST/gRPC redacted/decrypted modes와 collection-scoped `payload_decrypt` capability는 연결되어 있다. 남은 범위는 export/read dump 정책과 SDK-side client envelope decrypt flow다.
 - KMS/Vault key providers: local/env/file/fd/`unix_socket`/`vault_kv2`/wrapped material 기반은 있지만 external KMS lifecycle은 future work다.
 - Broader distributed integration: current unit/integration coverage는 많지만 multi-node parity/restore/replay ledger e2e는 남아 있다.
-- Private HNSW ORAM productionization: read-only bulk-built consensus-backed single-writer MVP, result ORAM fetch path, fixed multi-shard owner-union replication, per-shard manual/automatic `stream_records` preinstall, ReplicateShard/MoveShard/automatic recovery process E2E, partial live-preinstall failure/retry, active transfer abort/retry, exact active marked fixed-layout 및 reshard transfer restart/repreinstall, active reshard source hard-crash 상태 보존과 target-triggered automatic fresh-preinstall resume, existing-peer active-reshard Raft snapshot topology recovery, topology-only non-owner, exact scale-up target, 그리고 `MigratingPoints`의 redundant non-endpoint pre-layout owner와 transfer-complete single-shard scale-down endpoint snapshot bootstrap, durable exact-reshard rollback marker, precommitted recovery layout CAS, chunked internal full-store transport, 63-bucket large-bundle process benchmark, durable collection-level layout CAS, typed scale-up/scale-down reshard start/progress/finish, exact active `resharding_stream_records` preinstall, existing/new-owner custom shard-key create와 non-final drop, HNSW-only 및 HNSW+result process E2E 기반은 들어갔다. Fixed-target resume의 source-side durable preinstall intent, crash-point, stale root/signature process fault matrix도 닫혔다. Non-redundant owner external restore에는 signed checkpoint, consensus lease, bounded staging, read-only full-topology preflight, durable install marker, lifecycle tombstone, rollback/commit CAS와 REST commit route까지 들어갔다. 남은 release gate는 RF=1 single/multi-shard hard-crash process E2E와 첫 proof-verified read/writeback이며, 그 다음 v2 범위는 새 provider의 fixed-capacity append-only insertion이다. True multi-writer는 v3로 분리한다.
+- Private HNSW ORAM productionization: read-only bulk-built consensus-backed single-writer MVP, result ORAM fetch path, fixed multi-shard owner-union replication, per-shard manual/automatic `stream_records` preinstall, ReplicateShard/MoveShard/automatic recovery process E2E, partial live-preinstall failure/retry, active transfer abort/retry, exact active marked fixed-layout 및 reshard transfer restart/repreinstall, active reshard source hard-crash 상태 보존과 target-triggered automatic fresh-preinstall resume, existing-peer active-reshard Raft snapshot topology recovery, topology-only non-owner, exact scale-up target, 그리고 `MigratingPoints`의 redundant non-endpoint pre-layout owner와 transfer-complete single-shard scale-down endpoint snapshot bootstrap, durable exact-reshard rollback marker, precommitted recovery layout CAS, chunked internal full-store transport, 63-bucket large-bundle process benchmark, durable collection-level layout CAS, typed scale-up/scale-down reshard start/progress/finish, exact active `resharding_stream_records` preinstall, existing/new-owner custom shard-key create와 non-final drop, HNSW-only 및 HNSW+result process E2E 기반은 들어갔다. Fixed-target resume의 source-side durable preinstall intent, crash-point, stale root/signature process fault matrix도 닫혔다. Non-redundant owner external restore에는 signed checkpoint, consensus lease, bounded staging, read-only full-topology preflight, durable install marker, lifecycle tombstone, rollback/commit CAS와 REST commit route까지 들어갔다. 현재 검증된 external restore topology는 RF=1이고 같은 peer가 정확히 1개 또는 2개 shard를 소유하는 경우이며 RF>1과 split-owner는 부작용 없이 거부한다. Archive install과 process restart 뒤 HNSW Merkle proof/AEAD 및 result Merkle commitment 검증, 다음 epoch writeback도 1·2 shard에서 통과했다. `verified`부터 `post_resource_release`까지 10개 고정 commit crash point의 abort/restart/reconcile 및 private session 재개 matrix도 동일 범위로 고정한다. 별도 정상 commit 직후 `SIGKILL` 재시작과 committed live store sentinel scan도 통과했다. 확장된 leakage scan, deterministic directory-transition/비특권 permission-denial matrix, isolated tmpfs에서 production tar writer의 실제 partial-write ENOSPC와 reset/retry도 통과했다. Signed valid large ORAM collection, REST coordinator, 실제 Qdrant process까지 포함한 post-preflight extraction `StorageFull`/partial tree/same-token retry·commit gate와 install prepare의 verified/live bulk-sync `ENOSPC`/same-token retry gate도 통과했다. Skip/migration flags를 끈 `rocksdb,staging` runner에서도 실제 segment RocksDB artifact를 확인하고 두 gate를 3회 반복 통과했다. Exact commit local projection 전 pause, concurrent supervisor, immutable owner `SIGKILL`, foreign leader 무변경, owner follower restart와 단일 cleanup process gate가 통과했고, clear 뒤 archive 전 및 archive 뒤 ACK 전 crash/restart matrix도 통과했다. Private HNSW store의 temp-file/temp-directory fsync 뒤 rename 전과 rename 뒤 target-parent fsync 전 경계는 실제 ext4/`dm-flakey` write-loss 및 process `SIGKILL` matrix로 old/new exact recovery와 다음 writeback까지 통과했다. 실제 이전 wire-7 바이너리는 wire-8 floor가 적용된 data directory에서 무변경 fail-closed하고, wire-7 voter가 남은 혼합 cluster는 wire-8 successor activation과 enrollment를 거부하는 process gate도 통과했다. Client key/position-map/stash/entry-node/token-map과 Qdrant snapshot을 한 generation으로 운영하는 절차는 `docs/private-hnsw-oram-backup-recovery.md`에 고정했다. 남은 release gate는 더 넓은 external-recovery archive/live-tree 및 consensus persistent-image syscall의 delayed-write/power-loss, remote panic-report sink와 OS crash artifact이며, fixed-capacity append-only insertion은 v2에 포함한다. True multi-writer는 v3로 분리한다.
 - 2026-07-29 snapshot 상태 교정: fixed-layout active transfer는 ordered index checkpoint와 consensus-bound pre/post layout을 검증한다. 모든 로컬 shard에 다른 `Active` replica가 있는 wiped fixed-transfer source/owner와 transfer-complete scale-down endpoint는 durable exact-abort marker 뒤 stable automatic recovery를 수행하며, multi-shard endpoint는 shard별 generation-`+1` CAS로 복구한다. Pre-layout owner가 아니고 다른 pre-layout shard도 소유하지 않는 fresh `Partial` target은 collection 전체 또는 모든 configured ORAM store가 사라졌을 때 durable exact-resume marker 뒤 source의 새 reservation/full-store preinstall과 same-key restart로 복구한다. Partial store loss, stale existing store, already-active target은 계속 fail closed 한다. RF=1 비중복 owner/source의 same-peer external recovery install/commit primitive는 구현됐지만 process-level restore/restart/readback gate가 끝날 때까지 experimental fail-closed 경계로 유지한다.
+- 2026-08-21 V2-E 갱신: 위 external recovery process gate는 configured RF=1,
+  automatic sharding, same-peer one/two-shard 범위에서 끝났다. Healthy/degraded RF2,
+  custom sharding, split-owner와 three-or-more shards는 무부작용으로 거부한다.
+  Begin/commit/abort 직렬화, Prepared-CAS 보상, operation-bound context, 10-phase
+  crash/restart 및 restore 뒤 proof/writeback이 process regression으로 고정됐다.
+  Node-wide external recovery resource controller는 signed archive size와 configured
+  maximum unpacked size를 합산 예약하고, startup에서 유효 staging 예약을 재구성한다.
+  Configured archive/total-staged/logical-unpacked/free-space 상한과 shared
+  verify/install worker budget도 fail-closed admission 및 정상 sparse-WAL restore
+  regression으로 고정했다. Node-wide reserved/staging-reservation/worker gauges와
+  successful-preflight logical-byte/entry counters는 identifier-free operator
+  telemetry/Prometheus metrics로 고정했고 generic anonymized telemetry에서는 전체
+  필드를 제거한다. Main metrics route는 global access를 요구하고 standalone
+  metrics port는 기존 internal-monitoring network boundary를 따른다.
+  두 collection의 verify/verify 및 verify/install이 cap 1을 공유하는 process
+  regression은 첫 요청의 `workers_in_use=1`, 두 번째 요청의 429, rejected operation
+  tree digest 불변, permit 해제 뒤 retry와 최종 in-use 0을 고정한다.
+  State/install-marker atomic write는 temp-file fsync 전 ENOSPC와 rename 뒤
+  parent-directory fsync failure가 exact retry로 수렴하는 unit fault matrix를 갖는다.
+  Verification output promotion과 live-to-backup/verified-to-live 전환은 pre-rename 및
+  post-rename parent-sync 오류를 deterministic unit fault로 구분하고, rollback 뒤 exact
+  old tree와 `Prepared` marker로 수렴한다. 비특권 Unix test는 실제 parent write permission을
+  제거한 rename 거부와 permission 복구 뒤 retry도 검증한다. 별도 ignored Linux release gate는
+  user/mount namespace의 4 MiB tmpfs에서 production tar writer가 첫 entry 완료 뒤 둘째 entry를
+  실제 `ENOSPC` partial write로 끝내는지 확인하고, verification-output reset/retry/promotion을
+  검증한다. 이는 synthetic two-file tar를 사용하므로 signed valid collection/process 경로의
+  disk exhaustion이나 kernel/storage power-loss를 증명하지 않는다.
+  별도 opt-in process gate는 256 MiB isolated tmpfs에서 large-profile signed HNSW/result
+  collection을 실제 REST begin/upload/verify에 통과시키고, archive/free-space/checkpoint 검증 뒤
+  staging-only pause에서 공간을 소비한다. Production unpacker가 내부 `StorageFull` marker와 partial
+  pending tree를 남기고 operation은 `uploading`/session-fenced 상태를 유지해야 하며, filler 제거 뒤
+  same token verify/commit과 private session 재개가 통과한다. 로컬 검증은 non-RocksDB `staging`과
+  skip/migration flags를 끈 실제 `rocksdb,staging` payload-index runner에서 모두 통과했다. RocksDB
+  `CURRENT`/`MANIFEST`/`OPTIONS`/`LOG` artifact도 restore 뒤 확인했다. Install prepare의 verified/live
+  tree `bulk_sync_dir` 경계도 exact operation hash에
+  묶인 staging-only one-shot `ENOSPC` process fault로 고정했다. 별도 control collection이 같은 sync
+  target을 먼저 정상 통과해도 fault를 소비하지 않는다. 두 경우 모두 install marker/backup 없이 local 및
+  consensus-bound status가 `verified`에 머물고 old live collection이 active-recovery fence 아래 다시
+  load되며, 같은 token retry/commit과 session 재개가 5회 반복 통과했다. RocksDB runner에서는 extract와
+  install gate를 각각 3회 반복했다. 실제 filesystem delayed-write exhaustion과
+  power-loss는 별도 gate다.
+  Consensus-unreferenced orphan staging GC는 startup의 persisted state 부재만으로
+  수행하면 unapplied Raft `Begin`을 삭제할 수 있으므로, leader의 linearizable
+  apply/read barrier와 privileged power-loss/disk fault harness가 계속 V2-E
+  release gate다.
+- 2026-08-31 V2-E gate 3 갱신: digest-pinned MinIO server/client를 사용하는 opt-in
+  3-peer process gate가 S3-compatible snapshot 경로를 통과했다. Post-prepare validation
+  failure는 object를 0개 남기고, 성공한 full snapshot은 child collection snapshot을 별도
+  object로 게시하지 않는 self-contained object 하나만 만든다. Mutation V2 generation 1을
+  archive한 external recovery snapshot은 MinIO에서 다시 읽은 byte/size/SHA-256이 signed
+  checkpoint와 일치하고, restore commit 뒤 generation 2 append/ACK까지 통과하며 delete 뒤
+  bucket은 비어 있다. 이 gate는 upload 완료 뒤 local cleanup 또는 HEAD 실패가 남길 수 있는
+  orphan object와 AWS S3 고유 동작까지 원자적으로 증명하지 않는다.
 
 ## Phase 0: 기준선 고정
 
@@ -472,8 +525,8 @@
 - REST/gRPC private result ORAM live fixture도 collection/full snapshot guard가 잡힌 동안 session open, manifest upload, bucket upload를 거부하고, active result ORAM session이 있는 collection의 collection/full snapshot 생성도 거부한다. 오류는 session id, result root hash, bucket ciphertext, collection-local `private_result_oram` path를 반사하지 않는지 검증한다. Registry-level upload/snapshot guards는 collection id suffix/prefix 충돌 없이 exact collection marker만 막는지도 회귀 테스트로 고정한다.
 - REST/gRPC snapshot route fixture는 collection/full snapshot creation과 active lifecycle window 및 active private HNSW/result ORAM session의 상호배제, shard snapshot list/create/stream/download/delete/recover, partial snapshot manifest, partial recover_from route가 private ORAM bucket store collection에서 fail closed 되는지도 고정한다. REST collection recovery route fixture는 active private ORAM snapshot/upload window 및 active private HNSW/result ORAM session과 recovery의 상호배제를 고정한다. 오류는 submitted snapshot location, operation label, root hash, bucket ciphertext, collection-local private ORAM store path를 반사하지 않는다.
 - SDK/client state, upload bundles, REST/common wire DTO, canonical signature input/context, bucket validation context, AEAD/commitment context, verifier public key, collection-local private ORAM store의 Rust `Debug` surface도 session id, root hash, decoded epoch root hash, path label, bucket id, ORAM epoch, ciphertext length/body, signature key id/body, RK id, client position/stash, client ORAM tree/ciphertext sizing config, manifest-build HNSW/ORAM/fixed-budget policy internals, node deleted/generation/token-presence state, build-point vector length, upload/build/batch/proof/read-signature/store-Merkle bucket counts, search access metrics, common session bucket/tree/path-batch/ciphertext-budget values and embedded manifests, payload bytes, collection-local filesystem path를 반사하지 않도록 수동 redaction으로 바꿨고, qdrant-sec/qdrant/collection unit tests가 client-state/client-states, position-map, stash, ciphertext/hash/sha256 alias family의 sentinel leak absence를 검증한다.
-- collection snapshot 생성은 archive 작성 전에 private HNSW ORAM manifest/current epoch/bucket/Merkle restore-layout parity를 preflight하고, 누락 bucket 같은 layout 오류를 collection-local path나 root hash 반사 없이 fail closed 한다.
-- collection snapshot 생성은 private result ORAM store도 archive 작성 전에 manifest/current epoch/bucket/Merkle restore-layout parity를 preflight하고, configured binding 없는 orphan store나 누락 bucket 같은 layout 오류를 collection-local path나 root hash 반사 없이 fail closed 한다.
+- collection snapshot 생성은 archive 작성 전에 private HNSW ORAM manifest/current epoch/bucket/Merkle restore-layout parity를 preflight하고, 누락 bucket 같은 layout 오류를 collection-local path나 root hash 반사 없이 fail closed 한다. Commit 뒤 snapshot은 client가 refresh·재서명한 manifest epoch/root가 current와 정확히 일치해야 하며 server-local commit digest만으로 unsigned advanced state를 승인하지 않는다.
+- collection snapshot 생성은 private result ORAM store도 archive 작성 전에 manifest/current epoch/bucket/Merkle restore-layout parity를 preflight하고, configured binding 없는 orphan store나 누락 bucket 같은 layout 오류를 collection-local path나 root hash 반사 없이 fail closed 한다. 부분 Path ORAM writeback의 mixed bucket epoch는 각 bucket의 실제 epoch commitment와 signed current Merkle root로 검증한다.
 - private HNSW ORAM과 private result ORAM restore preflight는 manifest bucket range 전체를 검사하며 first/middle/last bucket 누락과 storage-level restore 경로를 bucket filename, collection-local path, root hash, signature/ciphertext-like base64url token 반사 없이 fail closed 한다.
 - private ORAM snapshot source preflight와 archive append도 canonical store layout 외 파일을 거부한다. restore preflight는 추가 bucket/layout 파일, malformed current/epoch commit file, missing temp directory archive 형태를 회귀 테스트로 고정했고, current/epoch commit file은 bounded JSON epoch/root shape와 canonical root hash를 요구하며 commit file은 filename epoch 일치도 요구한다.
 - REST/gRPC ORAM session fixture는 writeback commit 이후 manifest 재업로드 없이 새 epoch session을 열고 그 live epoch/root로 `read_paths`/`read_buckets`를 수행할 수 있으며, closed session id는 `read_paths`와 `commit`에 재사용할 수 없음을 검증한다.
@@ -705,9 +758,18 @@ Signed fields:
 
 - Recovery checkpoint DTO와 canonical package/sign/verify, exact context validator,
   deterministic known-answer 및 malformed/tamper/redaction unit test를 추가했다.
+- Fixture signer는 별도 recovery signing key와 사전 고정된 signing intent를 사용한다.
+  Intent는 collection/generation/source/shards/layout, snapshot size/hash,
+  client-state digest와 key id를 묶고, signer는 archive hash 및 모든 HNSW/result
+  kind/name/epoch/root/writeback tuple의 canonical index-state digest를 독립적으로
+  다시 계산해 exact match할 때만 checkpoint를 발행한다. Signer, server admission,
+  staged/loaded validator는 crypto crate의 동일 canonical helper를 사용한다.
 - Server restore admission, isolated read-only preflight, durable live
-  install/commit은 V2-C에 연결됐다. Export와 complete client recovery-state DTO,
-  RF=1 hard-crash/readback process gate는 아직 남아 있다.
+  install/commit은 V2-C에 연결됐다. 정상 commit된 RF=1 single/multi-shard store의
+  `SIGKILL` 재시작과 proof-verified read/writeback은 통과했다. External restore의
+  signed export fixture, archive install 뒤 동일 proof-verified read/writeback 및
+  10단계 commit crash/restart matrix도 통과했다. Complete client recovery-state DTO는
+  여전히 남아 있다.
 
 완료 조건:
 
@@ -823,11 +885,15 @@ Signed fields:
 - Verify는 archive를 operation-local pending directory에 복원하고 stable UUID와
   byte-exact config, source-local shard set, payload schema, 모든 HNSW/result
   manifest/signature/bucket/root를 재검증한다. 추가 read-only inspector는 current
-  version, no recovery/initializing/dummy state, complete replica state, all-Active
-  owner topology, local WAL/segment 구조를 쓰기 없이 검사하고 canonical layout
-  digest를 checkpoint와 대조한 뒤에만 verified staging으로 승격한다.
-- Lease가 만료돼도 동일 owner/token은 abort할 수 있고, 유효한 takeover는 이전
-  local staging을 best-effort 정리한다.
+  version, no recovery/initializing/dummy state, complete replica state, local
+  WAL/segment 구조를 쓰기 없이 검사한다. V2-C의 검증된 topology는 configured
+  replication factor 1과 automatic sharding을 사용하고 같은 source peer가 정확히
+  1개 또는 2개 shard의 sole `Active` owner인 경우로 제한한다. Healthy/degraded RF>1,
+  custom sharding과 split-owner는 snapshot 생성이나 layout state 변경 없이 거부한다.
+  Canonical layout digest와 checkpoint를 대조한 뒤에만 verified staging으로 승격한다.
+- Lease가 만료돼도 동일 owner/token은 abort할 수 있다. Active lease가 남아 있는
+  동안 replacement begin은 만료 여부와 무관하게 거부되며, owner가 abort로 staging과
+  consensus lease를 정리한 뒤에만 새 begin을 허용한다.
 - Durable install marker는 stopped old tree와 verified new tree digest, stable
   identity, semantic config digest, operation/checkpoint/layout/index-state
   binding, fresh 256-bit install-attempt nonce를 fsync한다. Nonce가 install-intent
@@ -839,6 +905,12 @@ Signed fields:
   reconcile하고 consensus rollback 관찰 전에는 marker를 보존한다.
   `PrepareInstall`은 exact `Staging -> Installing` CAS로 session과 일반 collection
   접근을 막고, local rename 전후 crash를 old 전체 또는 new 전체로 reconcile한다.
+- `Verified` staging은 full tree digest와 private-state digest를 저장한다.
+  `prepare_install`은 두 digest를 다시 계산해 exact match하고 install marker에
+  결합하므로 verification 뒤 tree나 private store 치환을 거부한다. Staged tree,
+  실제 loaded store, `Loaded` 직후 Commit 직전 검증은 모든 HNSW/result index의
+  kind/name/epoch/root/writeback digest를 exact match한 뒤 shared canonical
+  index-state digest를 다시 계산한다.
 - Registry detach tombstone은 read/meta/create/delete/alias와 Raft snapshot apply를
   fence하고 collection snapshot에는 cached state를 합쳐 detached collection이
   삭제된 것으로 직렬화되지 않게 한다. 일반 collection/shard snapshot recovery,
@@ -866,6 +938,18 @@ Signed fields:
   확인해야 backup을 지운다. Timeout 또는 불명확한 submit 결과는 파일을 되돌리지
   않고, exact marker/token retry가 tombstone 또는 live registry의
   Installing/Committed 상태를 이어서 정리한다.
+- Begin, commit, abort는 같은 collection별 mutex로 상호
+  직렬화한다. Prepared marker 뒤 PrepareInstall CAS가 관찰되지 않으면 exact marker를
+  제거하고 old collection을 검증·재게시한 뒤에만 오류를 반환한다. REST
+  handler는 전체 commit future를 TOC runtime task로 넘겨 기다리므로 client 연결이
+  끊겨 handler future가 취소되어도 이미 시작된 install/rollback/finalize 작업은
+  중간에 drop되지 않고 durable terminal state까지 계속 진행한다.
+- Commit/abort context는 exact operation-bound detached state 또는 active live binding만
+  허용한다. Operation-specific validation 오류를 ordinary live context로 fallback하지
+  않으며 이미 종료돼 binding이 없는 재호출도 fail closed 한다.
+- Execution coordinator는 process-local이다. V2-E same-peer 계약은 기존 peer-identity
+  process lock이 같은 storage/peer identity를 두 Qdrant process가 동시에 열지 못하게
+  하는 불변식에 의존하며 distributed recovery lock을 주장하지 않는다.
 - External verify는 archived replica peer identity를 rewrite하지 않고 source peer와
   다르면 그대로 거부한다. Persistent snapshot apply save failure는 in-memory
   recovery fence를 원상복구하고, exact rollback과 inexact transition을 분리한다.
@@ -873,14 +957,24 @@ Signed fields:
   substitution, config substitution, destructive rollback crash points,
   committed-marker resume, load-before-cleanup, exact/inexact rollback snapshot과 기존
   signature/CAS matrix를 고정한다.
+- Linux process matrix는 `verified`, `prepared`, `old_moved`, `new_promoted`,
+  `load_in_progress`, `loaded`, `post_consensus`, `pre_finalize`에서 실제 process를
+  abort하고 같은 peer directory/port로 재기동한다. RF=1 same-peer one/two-shard
+  모두 exact marker/consensus 상태를 확인하고 commit을 재개한 뒤 HNSW/result
+  session이 checkpoint epoch/root로 다시 열리는 것을 검증한다. 별도 one/two-shard
+  E2E는 restore와 재기동 뒤 production proof/AEAD read 및 다음 writeback을 검증한다.
+  이 matrix는
+  fsync syscall 내부 전원 장애나 disk-full/permission fault를 증명하지 않는다.
+- 별도 process fault는 Prepared marker 직후 PrepareInstall CAS를 강제로 실패시키고
+  marker 제거, old collection 재게시, abort와 private session 재개를 검증한다.
+  Concurrent commit/abort 요청은 같은 execution coordinator 아래 직렬화된다.
+  Configured RF2에서 한 replica를 제거해 sole current owner만 남긴 degraded topology도
+  snapshot/layout/staging 부작용 없이 export를 거부한다.
 
 다음 작업:
 
-- Consensus commit 전후, `LoadInProgress`/`Loaded` marker, marker cleanup,
-  pre-commit load 실패의
-  hard-crash process matrix를 추가한다.
-- RF=1 single/multi-shard same-peer restore E2E에서 archive upload부터 commit,
-  process restart, 첫 proof-verified read/writeback까지 검증한다.
+- fsync/rename 내부 power-loss, disk-full/permission/fsync failure를 별도 fault
+  injection으로 고정한다.
 - Commit submit ambiguity와 delayed Raft apply, detached/live-fenced snapshot
   generation/apply, lifecycle create/delete/alias/peer-removal race를 실제
   process/concurrency fault test로 고정한다.
@@ -1156,11 +1250,46 @@ Signed fields:
 - 완료: Enrollment는 standalone v1 epoch/layout mutation과 새 v1 search-session lease를
   막는다. Mutation acquire와 external recovery/session은 consensus apply 지점에서
   양방향으로 충돌하고 transfer/reshard는 enrolled layout CAS에서 fail closed 한다.
+- 완료: External recovery consensus state는 `LegacyV1`과 `MutationV2` authority를
+  명시적으로 보존하고 legacy persisted/Raft image는 `LegacyV1`로만 decode한다. Active
+  lease renewal은 authority 변경을 거부하고, recovery와 genesis enrollment는 두 operation
+  순서 모두 같은 state-machine 경계에서 상호 배제된다. Genesis exact retry는 signed
+  genesis state, layout과 모든 epoch/root/writeback binding이 그대로일 때만 idempotent하며
+  이후 state에서는 거부한다.
+- 완료: Mutation enrollment는 stable voter 전원이 wire 8 capability epoch에 서명하고 V3
+  descriptor의 external-recovery authority, snapshot barrier, enrollment floor 기능을
+  확인한 뒤에만 허용된다. Activation manifest는 exact
+  `required_binary_capability_digest`를 고정하며 startup/snapshot admission은 실행 binary와
+  reader/writer protocol 일치를 강제한다. Capability evidence 또는 binary digest 변경은 새
+  membership generation 없이는 허용하지 않는다.
+- 완료: Snapshot과 독립된 monotonic local checkpoint가 format floor, non-removable
+  collection enrollment floor와 activated authority floor를 보존한다. Restore/restart는
+  enrollment 제거, authority ordinal 또는 format epoch rollback, binary capability 변경을
+  거부한다. Post-activation enrollment는 현재 format-floor locator/digest에 고정된 tagged
+  authority를 생성하며 recovery/enrollment 조합은 `LegacyV1 + not enrolled` 또는
+  `MutationV2 + enrolled`만 유효하다.
 - 완료: Raft snapshot은 active preparing/committed slot을 차단하지 않고 그대로
   포함한다. Legacy snapshot은 두 top-level map 부재를 non-enrolled로 decode하며, V2
   state/slot/layout/epoch mismatch, rogue slot owner, active session/recovery overlap은
   reject한다. Startup command-line snapshot restore는 persisted active mutation을
   거부한다.
+- 완료: Collection/full/external-recovery export는 archive를 비공개 `TempPath`에 prepare한
+  뒤 held LegacyV1 또는 MutationV2 authority를 재검증하고 나서만 publish한다. Full
+  snapshot은 lifecycle lock 아래 고정한 exact sorted collection/alias plan을 사용하고,
+  prepared child archives를 하나의 self-contained full archive로 소비하므로 child snapshot을
+  순차 공개하지 않는다. Prepare 뒤 owner archive namespace를 변조하는 실제 3-node process
+  회귀는 collection/full API가 list entry와 public file을 전혀 만들지 않고 staged file을
+  정리하는지 고정한다.
+- 완료: Enrolled snapshot의 post-prepare 재검증은 requester peer, random process
+  incarnation과 monotonic sequence로 유일한 `PrivateOramSnapshotBarrierV2`를 제안하고 local
+  applied receipt를 기다린다. 그 뒤 collection config, mutation readiness/owner archive chain,
+  guard 획득 시점의 exact inactive external-recovery state를 다시 비교한다. 명시적으로 abort되지
+  않은 active lease는 만료됐더라도 snapshot을 거부한다.
+- 완료: 실제 3-voter process 회귀는 다른 peer가 제출한 `UpdateCollection`의 owner-local apply를
+  archive prepare 뒤까지 지연한다. Remote request가 먼저 commit/return해도 두 번째 barrier가
+  owner apply 전에는 완료되지 않고, apply 뒤 config mismatch로 collection/full publication을
+  거부하는지 검증한다. 별도 process 회귀는 active external recovery 중 collection/full snapshot
+  거부, public list 불변, explicit abort 뒤 snapshot 재개를 검증한다.
 - 완료: State/slot/receipt/operation/Persistent/SnapshotData Debug와 consensus WAL log
   projection은 collection/index/root/mutation/client-state digest를 redaction한다.
 - 유지 조건: D2 operation은 consensus state-machine/WAL decode에만 존재하며 Dispatcher
@@ -1450,6 +1579,17 @@ Signed fields:
   certificate pair는 다음 reservation 동안 보존되고 admission에서 acknowledged GC obligation으로
   원자적으로 이전된다. Partial certificate, pending tombstone, mismatched generation은 reservation
   전에 fail closed한다.
+- 완료(D3-B3-C-CanonicalParentArchiveGrant): Storage parent archive는 exact completed-generation
+  directory에 canonical terminal과 `owner_child_archive_grant_v1.json`을 no-replace로 publish한다.
+  Grant는 terminal의 exact byte length/SHA-256, collection/mutation/vector/owner/fence, pre-ACK
+  tombstone/clear receipt와 parent/child evidence를 domain-separated digest로 묶는다. Child owner store의
+  safe archive API는 generation만 받고 자신의 HNSW root에서 고정 parent ancestry를 descriptor로 열어
+  grant/terminal을 검증·fsync·rebind한 뒤에만 retire한다. Caller-selected path/evidence authority는 없고,
+  다음 generation readiness도 retained parent grant와 child archive의 exact chain을 다시 요구한다.
+- 완료(D3-B3-C-PendingAckConfigFence): Replicated clear ACK가 pending인 stable collection ID는 Raft
+  apply 시점의 ordinary non-replica collection config와 crypto migration 변경을 `Locked`로 거부한다.
+  Fence predicate는 collection ID별이며, owner restart와 foreign-leader 선출 뒤에도 persistent pending
+  aggregate에서 복원된다. ACK apply 뒤에는 같은 config 변경이 허용된다.
 
 #### V2-D4: Dedicated API activation
 
@@ -1489,6 +1629,12 @@ Signed fields:
   cleanup quiescence, same-process job loss rejection/restart absence replay, marker/archive post-rename
   fault convergence, immutable-owner bounded blocked status와 acknowledged terminal material의 다음
   admission GC transfer가 regression으로 고정됐다.
+- Fresh admitted completion, restart admitted reconciliation, terminal resume, post-clear archive 설치는
+  stable collection identity로 keyed된 동일 owner-execution guard를 사용하고 guard 획득 뒤 exact phase를
+  다시 읽는다. Commit postflight는 state/slot을 한 applied-state read guard로 읽고 exact-old/preparing만
+  최대 1초 bounded catch-up하며 third state는 즉시 fail closed한다. Archive 뒤 exact Raft ACK는 guard
+  해제 후 제출하지만 pending tombstone이 다음 admission을 차단하고 immutable-owner process fence가
+  중복 local supervisor를 금지한다.
 - 별도 test-binary process가 peer identity lock을 잡은 상태에서 `SIGSTOP`해도 두 번째 process의
   restart-absence 진입이 거부되고, `SIGKILL` 뒤에만 새 process가 lock을 획득하는 회귀가 통과했다.
   Cleanup permit은 collection/mutation/owner/generation/process-incarnation/claim digest 각 불일치를
@@ -1496,11 +1642,36 @@ Signed fields:
 - `cleanup_linearizes_against_open_reservation_and_session_install`은 outstanding open reservation이
   cleanup을 막고, cleanup claim 뒤 install이 실패하며, exact job 없는 active session도 restart absence를
   막는 두 경쟁 순서를 결정적으로 검증한다.
-- `cargo test -p storage --lib` 전체 386개가 2026-08-14 기준 통과했다. 이 결과는 deterministic
-  state-machine/filesystem fault coverage이며 실제 kernel/process power-loss 인증을 대체하지 않는다.
-- `cargo test --bin qdrant` 전체 927개도 같은 최종 구현 기준 통과했다.
+- `cargo test --locked -p storage --lib`는 2026-08-31 기준 433 passed, 1 ignored,
+  0 failed다. 이 결과는 deterministic state-machine/filesystem fault coverage이며 실제
+  kernel/process power-loss 인증을 대체하지 않는다.
+- `cargo test --locked --bin qdrant`도 같은 worktree에서 941 passed, 0 failed다. Wire-8
+  protocol descriptor의 protocol/binary capability digest는 독립 canonical 계산과 release
+  known-answer test로 고정했다.
 - `cargo check --workspace --all-targets`도 Python edge encrypted-payload unsupported projection과
   HNSW append-rewrite error projection을 포함한 최종 worktree에서 통과했다.
+- RF=1 single/multi-shard process E2E는 HNSW/result store를 epoch 43으로 commit한 뒤 owner를
+  `SIGKILL`하고 같은 peer directory로 재기동한다. 재기동 응답은 trusted epoch/root와 exact
+  requested bucket set에 묶어 HNSW Merkle proof와 node AEAD open, result Merkle commitment를
+  검증하고, ciphertext/proof/root/epoch/missing/extra bucket 변조를 거부한 뒤 epoch 44 writeback과
+  재개방까지 통과한다. 이 gate는 commit 중간 crash나 host power-loss durability를 증명하지 않는다.
+- 별도 3-voter process gate는 remote `UpdateCollection` commit/return 뒤 owner-local apply를
+  staging latch로 지연하고, post-prepare snapshot barrier가 해당 apply receipt를 기다린 뒤 config
+  mismatch로 publication을 거부하는지 검증한다. Active external recovery 중 collection/full
+  snapshot 거부와 public list 불변, explicit abort 뒤 snapshot 재개도 별도 process gate로
+  통과했다. Acknowledged snapshot restore 뒤 production private read와 다음 generation writeback
+  admission 회귀도 통과했다.
+- 별도 RF=1 process E2E는 실제 HNSW plaintext vector/node id/point token/payload fetch token과
+  client RK sentinel뿐 아니라 실제 private-result payload block을 client AEAD bucket으로 seal한다.
+  Position map과 plaintext stash를 포함한 encrypted result client-state snapshot도 만들고, server에는
+  그 canonical encrypted backup의 digest만 전달한다. Epoch 42 recovery snapshot과 epoch 43 refreshed
+  snapshot을 만든 뒤 live storage, shard WAL, collection metadata WAL, Raft state, 두 snapshot archive,
+  추출 파일, combined stdout/stderr, non-anonymous operator metrics/telemetry에서 raw/base64url/base64/
+  hex/JSON sentinel 표현이 없는지 chunk scan한다.
+- Panic hook log, telemetry panic-report payload serialization, loopback HTTP transport에 실제로
+  넘기는 body는 같은 실제 result payload/client recovery-state sentinel known-answer unit
+  regression으로 고정됐다. 이는 remote telemetry sink를 실제 네트워크로 intercept하는 process
+  E2E나 OS crash dump 검사를 대신하지 않는다.
 - Log projection은 private ORAM path/bucket/proof/position-map/stash/plaintext aliases를
   redaction하고, snapshot recovery error는 client recovery-state aliases를 노출하지 않는다.
 - 남은 release gate는 terminal Qdrant process를 fsync/rename/Raft 경계마다 kill하는 multi-process
@@ -1596,6 +1767,29 @@ Signed fields:
   leader로 보내야 한다. CI에서만 나던 실패도 고쳤다: dead replica 복구 test가 placement에 따라 layout
   generation 3이 되는 경우, V2 activation이 learner promotion 전에 실행되던 경우, scale-down snapshot
   test가 upload의 session lease release가 적용되기 전에 resharding을 시작하던 경우.
+- External restore의 10개 durable phase process abort/restart matrix와 stderr/metrics/operator
+  telemetry 및 실제 result payload/client recovery-state까지 확장한 leakage scan은 통과했다.
+  Verification promotion과 두 live-tree rename의 deterministic pre-rename/post-rename parent-sync
+  오류 및 비특권 parent permission revocation 회귀도 통과했다. Isolated tmpfs의 실제 archive
+  partial-write `ENOSPC`와 reset/retry gate도 통과했다. Signed valid collection과 REST/process
+  coordinator의 post-preflight extraction `StorageFull`, partial tree, same-token retry/commit도 통과했다.
+  Install prepare의 verified/live bulk-sync `ENOSPC` 반환은 operation-scoped selector, unrelated control
+  recovery, marker/backup 생성 전 실패, old-live reload, active fence 유지와 same-token retry까지 process
+  regression으로 통과했다.
+  Exact `ConsensusCommitted` apply 뒤 local projection 전 submitter를 멈추고 supervisor를 경쟁시킨 다음
+  immutable owner를 `SIGKILL`하고 foreign leader를 선출하는 process E2E도 통과했다. Foreign leader는
+  owner-local 또는 consensus terminal write를 수행하지 않고, 원 owner가 follower로 재시작해 exact
+  generation을 한 번만 cleanup한 뒤 private session을 재개한다. 별도 parameterized process gate는
+  clear 뒤 archive 전과 archive 뒤 acknowledgement 전 crash에서 pending tombstone을 active lease와
+  독립적으로 재발견하고, generation archive/tombstone digest를 재검증해 ACK까지 수렴한다. Archive 뒤
+  ACK 전 owner restart gate는 foreign leader에서 target metadata와 crypto migration apply가 계속
+  거부되고 ACK 뒤 metadata apply가 성공하는 것도 고정한다. Collection-scope unit gate는 collection A의
+  pending key가 collection B를 막지 않음을 같은 production predicate로 검증한다. 3-generation process
+  gate는 각 exact parent terminal/grant/child archive의 digest chain과 이전 두 세대 byte 보존을 검증하며,
+  canonical child archive와 retired intent를 함께 잃은 경우 다음 admission이 Raft proposal 전에 실패한다.
+  Private HNSW atomic publication의 두 rename/fsync 경계는 ext4/`dm-flakey`로 완료됐다.
+  남은 release gate는 external-recovery archive/live-tree 및 consensus persistent image의
+  real-filesystem delayed-write/power-loss injection, remote panic-report sink와 OS crash artifact 검증이다.
 - 2026-10-15: Live handoff의 여섯 지점(admission 직후, parent materialization 뒤, owner adoption 뒤,
   readiness의 capsule install 뒤, outcome ACK 전, 결정 전)에 test 전용 crash/fault point를 두었다.
   모든 지점에서 fault(같은 process)는 supervisor가 commit까지 끝내고, crash 뒤 재시작도 한 지점을
@@ -1607,6 +1801,9 @@ Signed fields:
   deserialize, UTF-8 검사와 hash에 쓰이고, Raft state 저장마다 private ORAM state 전체 검증(0.2-0.6 s)과
   650 KB state file 재기록이 든다. CI는 실패한 test의 peer warning과 traceback 위치를
   annotation으로 남긴다.
+- 2026-10-30 통합 검증: retained owner prepare를 재검증할 때 새 signed state의 서명 시각을
+  사용하도록 교정한 후보에서 parent materialization 직후의 crash/restart가 164.33초에
+  통과했다. 해당 사례의 expected failure 표시를 제거해 여섯 crash 경계를 모두 실행한다.
 
 완료 조건:
 
@@ -1620,13 +1817,51 @@ Signed fields:
 작업:
 
 - Backup rotation, client-state escrow, restore drill, key-loss 절차를 runbook으로
-  작성한다.
-  - 2026-10-09: `docs/private-oram-operations-runbook.md`에 초안을 작성했다. Checkpoint
-    서명과 client-state escrow를 자동화하는 tooling과 staging restore drill 결과 기록은
-    아직 남아 있다.
+  작성한다. `docs/private-hnsw-oram-backup-recovery.md`가 generation inventory,
+  key custody, exact checkpoint/snapshot binding, restore/rollback drill과 RPO/RTO
+  acceptance checklist를 고정한다.
+- Production signer/SDK는 untrusted export와 client-owned expected ORAM state,
+  operator-approved source/destination, locally pinned generation, independently hashed
+  snapshot의 provenance를 분리한다.
+- External recovery의 node-wide staged-byte quota, free-space preflight, logical tar
+  expansion bound, startup reservation reconstruction, bounded verify/install worker
+  budget과 scanned-byte/entry telemetry는 구현됐다. Consensus-unreferenced orphan
+  staging GC는 leader linearizable barrier와 generation fence를 먼저 추가한 뒤에만
+  구현한다.
+  - 초기 운영 절차 초안은 `docs/private-oram-operations-runbook.md`에도 기록되어 있다.
 - Active target recovery, RF=1 external restore, append mutation을 Linux
   multi-process cluster E2E와 latency/bandwidth/write-amplification benchmark로
   고정한다.
+- 완료된 RF=1 restart gate는 acknowledged epoch의 process persistence와 첫 verified
+  writeback을 고정한다. External restore도 10개 durable phase crash/restart와 session
+  재개, archive install 뒤 production proof/AEAD read 및 다음 writeback을 고정했다.
+  State/install-marker atomic write의 ENOSPC 및 post-rename parent-fsync retry unit
+  matrix는 완료됐다. Verification promotion과 live-tree 전환의 deterministic rename/parent-sync
+  error matrix, rollback 뒤 exact `Prepared` marker 수렴, 비특권 permission denial/retry도
+  완료됐다. Linux user/mount namespace의 isolated tmpfs에서 production tar extraction이 실제
+  `StorageFull` partial write를 반환하고 verification-output reset/retry/promotion이 수렴하는
+  explicit ignored release gate도 완료됐다. 별도 opt-in process gate는 signed valid large ORAM
+  collection을 REST begin/upload한 뒤 archive/checkpoint preflight 직후 isolated tmpfs를 소비하고,
+  production unpacker의 internal `StorageFull`, partial pending tree, active session fence와 filler 제거 뒤
+  same-token verify/commit/session 재개를 고정한다. 실제 result payload와 encrypted client recovery-state fixture를 쓰는
+  snapshot/WAL/stdout/stderr/metrics/operator-telemetry sentinel scan과 panic hook/report
+  serialization known-answer gate도 완료됐다. Install prepare의 verified/live bulk-sync boundary는
+  operation-scoped one-shot `ENOSPC` process fault, unrelated control recovery, marker/backup 무생성,
+  exact old-live reload, active fence와 same-token retry/commit을 양쪽 target 각각 5회 반복해 고정했다.
+  Skip/migration flags를 끈 `rocksdb,staging` runner의 동일 extract/install ENOSPC gate와 실제 RocksDB
+  artifact 검증도 3회 반복 완료됐다. Private HNSW atomic writer의 temp fsync 뒤 rename 전과
+  rename 뒤 parent-directory fsync 전은 privileged ext4/`dm-flakey` write-loss matrix 및 동일 경계
+  process `SIGKILL` matrix로 완료됐다. 실제 wire-7 downgrade와 mixed wire-7/wire-8 voter process
+  gate도 각각 protected state 무변경과 activation/enrollment fail-closed를 고정한다. Digest-pinned
+  MinIO gate는 pre-publication failure의 zero-object 결과, self-contained full snapshot 한 개,
+  signed external-recovery object의 byte/size/SHA-256 binding, restore 뒤 다음 mutation generation,
+  최종 object deletion을 실제 S3-compatible transport에서 고정한다. External-recovery
+  archive/live-tree와 consensus persistent image의 더 넓은 delayed-write/power-loss, remote panic-report
+  sink, OS crash artifact, post-upload orphan ambiguity와 AWS S3 검증은 별도 release gate로 유지한다.
+- `collection/testing` fixture는 cross-crate recovery regression 전용이며 root `qdrant`와 production
+  `storage` feature graph가 enable하지 않는다. Feature-public fixture에는 canonical parent grant 발행,
+  child archive 실행, clear ACK 조작 API가 없지만 fixture-shaped local store writer는 남아 있다. Production
+  build에서 이 feature를 금지하고, 장기적으로 별도 test-support crate로 옮기는 것을 후속 hardening으로 둔다.
 - v2는 single logical writer로 release한다.
 
 Deferred v3:

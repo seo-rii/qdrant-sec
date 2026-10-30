@@ -8,6 +8,7 @@ use std::{cmp, fmt};
 #[cfg(not(unix))]
 use atomicwrites::replace_atomic;
 use collection::operations::types::PeerMetadata;
+use collection::private_oram_owner_journal::PrivateOramOwnerNewGenerationReadinessExpectationV2;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::PeerId;
 use data_encoding::BASE64URL_NOPAD;
@@ -18,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use qdrant_sec::{
     PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION, PrivateOramActivationAuthorityBundleV1,
     PrivateOramActivationAuthorityTrustAnchorV1, PrivateOramActivationRegistryExpectationV1,
-    decode_private_oram_owner_enrollment_genesis_commitment_v1,
+    PrivateOramOwnerCleanupSignerV1, decode_private_oram_owner_enrollment_genesis_commitment_v1,
     decode_private_oram_owner_enrollment_prepared_v1,
     validate_private_oram_activation_authority_bundle_v1,
 };
@@ -42,6 +43,7 @@ use crate::content_manager::consensus::private_oram_activation_authority::{
 };
 use crate::content_manager::consensus::private_oram_mutation_activation_barrier::{
     PrivateOramMutationActivationApplyFactsV2, PrivateOramMutationActivationPendingV2,
+    private_oram_activation_history_and_group_digests,
     validate_private_oram_mutation_activation_barrier_v2,
     validate_private_oram_mutation_activation_pending_v2,
 };
@@ -51,10 +53,13 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::append_res
     decode_private_oram_mutation_prepared_reservation_challenge_v3,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::authority::{
-    DecodedPrivateOramMutationAuthorityWireV2, PrivateOramMutationAuthorityStateV2,
-    PrivateOramMutationConsensusAggregateV2, PrivateOramMutationMaterialOperationV2,
+    DecodedPrivateOramMutationAuthorityWireV2, OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1,
+    PrivateOramMutationAuthorityStateV2, PrivateOramMutationConsensusAggregateV2,
+    PrivateOramMutationMaterialOperationV2, PrivateOramMutationOwnerEnrollmentPlanV2,
     PrivateOramMutationPendingReservationChallengeV1,
+    PrivateOramMutationPreadmissionRecoveryCandidateV2,
     PrivateOramMutationRecoveryCapsulesCertificateV2,
+    PrivateOramMutationRejectedAdmissionAcknowledgementV2,
     PrivateOramMutationReservationChallengeOutcomeV1,
     acknowledge_private_oram_mutation_authority_clear_v2,
     activate_private_oram_mutation_authority_v2,
@@ -81,7 +86,7 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::authority:
     private_oram_mutation_activation_context_from_barrier_v2,
     private_oram_mutation_aggregate_apply_context_v2, private_oram_mutation_authority_key_v2,
     private_oram_mutation_collection_lifetime_id_digest_v2,
-    private_oram_mutation_outer_binding_digest_v2,
+    private_oram_mutation_outer_binding_digest_v2, private_oram_mutation_owner_enrollment_plan_v2,
     validate_private_oram_mutation_authority_state_v2,
 };
 use crate::content_manager::consensus::private_oram_mutation_cleanup::floor_store::{
@@ -92,6 +97,7 @@ use crate::content_manager::consensus::private_oram_mutation_cleanup::floor_stor
 use crate::content_manager::consensus::private_oram_mutation_cleanup::format::{
     PrivateOramMutationAuthorityFloorV2, PrivateOramMutationFormatFloorV2,
     plan_private_oram_mutation_authority_floor_acceptance_v2,
+    plan_private_oram_mutation_enrollment_floor_v2,
     plan_private_oram_mutation_snapshot_authority_acceptance_v2,
     validate_private_oram_mutation_format_floor_v2,
 };
@@ -113,12 +119,13 @@ use crate::content_manager::consensus_ops::{
     ApplyPrivateOramMutation, ApplyPrivateOramMutationMaterialV2, CompareAndSwapPrivateOramEpoch,
     CompareAndSwapPrivateOramExternalRecovery, CompareAndSwapPrivateOramLayout,
     CompareAndSwapPrivateOramMutationLease, CompareAndSwapPrivateOramSessionLease,
-    ConfirmPrivateOramMutationAuthorityV2, InitializePrivateOramMutationState,
-    PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION, PRIVATE_ORAM_MUTATION_CLEAR_RECEIPT_VERSION,
-    PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION, PRIVATE_ORAM_MUTATION_RECEIPT_VERSION,
-    PrivateOramCollectionLayoutTransition, PrivateOramConsensusCollectionIndexStateV2,
-    PrivateOramConsensusCollectionStateV2, PrivateOramConsensusEpoch, PrivateOramConsensusLayout,
-    PrivateOramConsensusTransitionV2, PrivateOramEpochKey, PrivateOramExternalRecoveryKey,
+    ConfirmPrivateOramMutationAuthorityV2, EnrollPrivateOramMutationStateV2,
+    InitializePrivateOramMutationState, PRIVATE_ORAM_CONSENSUS_COLLECTION_STATE_VERSION,
+    PRIVATE_ORAM_MUTATION_CLEAR_RECEIPT_VERSION, PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION,
+    PRIVATE_ORAM_MUTATION_RECEIPT_VERSION, PrivateOramCollectionLayoutTransition,
+    PrivateOramConsensusCollectionIndexStateV2, PrivateOramConsensusCollectionStateV2,
+    PrivateOramConsensusEpoch, PrivateOramConsensusLayout, PrivateOramConsensusTransitionV2,
+    PrivateOramEpochKey, PrivateOramExternalRecoveryAuthority, PrivateOramExternalRecoveryKey,
     PrivateOramExternalRecoveryLease, PrivateOramExternalRecoveryLeasePhase,
     PrivateOramExternalRecoveryOperation, PrivateOramExternalRecoveryPhase,
     PrivateOramExternalRecoveryState, PrivateOramIndexKind, PrivateOramLayoutKey,
@@ -161,6 +168,49 @@ const PRIVATE_ORAM_EXTERNAL_RECOVERY_LEASE_MAX_SECS: u64 = 3_600;
 const PRIVATE_ORAM_MUTATION_LEASE_MAX_SECS: u64 = 3_600;
 const PERSISTENT_PARENT_SYNC_ATTEMPTS: usize = 3;
 const PERSISTENT_SAVE_INDETERMINATE_MESSAGE: &str = "Raft persistent state durability is indeterminate; restart this peer before applying more consensus operations";
+
+// Immutable binary capability known answers from 76ca9ae178c8789c0eae3c2abcf7e7b4ff8d2189. This is
+// recognition of a signed historical capability, never a default inserted into a codec-1 floor.
+const PRIVATE_ORAM_LEGACY_WIRE_6_CAPABILITY_DIGEST: &str =
+    "476bxEnworZ3LqmqqKrsc1Udw7AjtJdwjNq_gyPsxok";
+const PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST: &str =
+    "dAtfKtcZBHNaXhM-amdoNULrgFbKmnO_EWz8LcJy3l4";
+
+/// Authority signatures, including any predecessor, must already have been verified by the caller.
+fn private_oram_format_floor_required_capability<'a>(
+    floor: &'a PrivateOramMutationFormatFloorV2,
+    authority: &'a PrivateOramActivationAuthorityStateV1,
+) -> Result<&'a str, StorageError> {
+    if let Some(digest) = floor.required_binary_capability_digest() {
+        return Ok(digest);
+    }
+    let invalid = || {
+        StorageError::service_error(
+            "legacy private ORAM mutation format floor has no matching signed capability authority",
+        )
+    };
+    let manifest = authority
+        .legacy_floor_manifest(floor.floor_digest())
+        .ok_or_else(invalid)?;
+    let (history, group) = private_oram_activation_history_and_group_digests(
+        &manifest.cluster_identity_digest,
+        manifest.cluster_first_voter_peer_id,
+    )
+    .map_err(|_| invalid())?;
+    let digest = &manifest.required_binary_capability_digest;
+    let recognized = match floor.minimum_reader_protocol() {
+        6 => digest == PRIVATE_ORAM_LEGACY_WIRE_6_CAPABILITY_DIGEST,
+        7 => digest == PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST,
+        _ => false,
+    };
+    if !recognized
+        || history != floor.consensus_history_id_digest()
+        || group != floor.raft_group_id_digest()
+    {
+        return Err(invalid());
+    }
+    Ok(digest)
+}
 
 fn validate_persisted_private_oram_activation_authority(
     authority: Option<&PrivateOramActivationAuthorityStateV1>,
@@ -338,7 +388,7 @@ pub struct Persistent {
     pub(crate) save_indeterminate: AtomicBool,
 }
 
-/// Off-side image for one legacy private-ORAM mutation state-machine transition.
+/// Off-side image for one private-ORAM mutation state-machine transition.
 ///
 /// The candidate is serialized and durably published before its mutation fields and applied
 /// cursor become visible through the live `Persistent` value.
@@ -349,11 +399,12 @@ struct PrivateOramMutationCompletePatch {
 
 enum PrivateOramMutationCommand<'a> {
     Initialize(&'a InitializePrivateOramMutationState),
-    EnrollV2 {
+    EnrollCollectionV2 {
         operation: &'a InitializePrivateOramMutationState,
         entry_term: u64,
         entry_index: u64,
     },
+    EnrollV2(&'a EnrollPrivateOramMutationStateV2),
     CompareAndSwapLease(&'a CompareAndSwapPrivateOramMutationLease),
     ConfirmAuthority(&'a ConfirmPrivateOramMutationAuthorityV2),
     Apply(&'a ApplyPrivateOramMutation),
@@ -380,7 +431,7 @@ pub(crate) enum PrivateOramMutationAtEntryOutcome {
     Rejected(StorageError),
 }
 
-/// The complete set of fields a legacy private-ORAM mutation may publish.
+/// The complete set of fields a private-ORAM mutation transition may publish.
 ///
 /// Keep construction and installation exhaustive so adding a field requires updating both sides.
 struct PrivateOramMutationDurableFields {
@@ -435,7 +486,7 @@ impl PrivateOramMutationDurableFields {
     }
 }
 
-/// Capability-limited reducer view for the legacy private-ORAM mutation bridge.
+/// Capability-limited reducer view for private-ORAM mutation transitions.
 ///
 /// Reducers cannot reach unrelated `Persistent` fields through this type. Read-only maps are
 /// exposed only for cross-operation exclusion checks; the four mutable maps exactly match the
@@ -449,15 +500,27 @@ struct PrivateOramMutationPatchView<'a> {
     private_oram_mutation_lease_slots:
         &'a mut HashMap<String, DecodedPrivateOramMutationAuthorityWireV2>,
     private_oram_activation_authority: Option<PrivateOramActivationAuthorityStateV1>,
-    private_oram_mutation_v3_write_floor_active: bool,
+    private_oram_mutation_format_floor: Option<PrivateOramMutationFormatFloorV2>,
 }
 
 impl<'a> PrivateOramMutationPatchView<'a> {
     fn new(persistent: &'a mut Persistent) -> Self {
         let private_oram_activation_authority =
             persistent.private_oram_activation_authority.clone();
-        let private_oram_mutation_v3_write_floor_active =
-            persistent.private_oram_mutation_v3_write_floor_active();
+        // Historical wire-8 entries still replay with their original V3 semantics after the
+        // binary raises its advertised protocol. New proposals use the current writer gate.
+        let private_oram_mutation_format_floor = persistent
+            .private_oram_mutation_format_floor
+            .as_ref()
+            .filter(|floor| {
+                floor.activation_enabled()
+                    && floor.minimum_reader_protocol() >= 8
+                    && floor.minimum_writer_protocol() >= 8
+                    && persistent
+                        .private_oram_mutation_activation_pending
+                        .is_none()
+            })
+            .cloned();
         Self {
             private_oram_epochs: &mut persistent.private_oram_epochs,
             private_oram_session_leases: &persistent.private_oram_session_leases,
@@ -466,12 +529,16 @@ impl<'a> PrivateOramMutationPatchView<'a> {
             private_oram_mutation_states: &mut persistent.private_oram_mutation_states,
             private_oram_mutation_lease_slots: &mut persistent.private_oram_mutation_lease_slots,
             private_oram_activation_authority,
-            private_oram_mutation_v3_write_floor_active,
+            private_oram_mutation_format_floor,
         }
     }
 
     fn private_oram_mutation_v3_write_floor_active(&self) -> bool {
-        self.private_oram_mutation_v3_write_floor_active
+        self.private_oram_mutation_v3_write_floor().is_some()
+    }
+
+    fn private_oram_mutation_v3_write_floor(&self) -> Option<&PrivateOramMutationFormatFloorV2> {
+        self.private_oram_mutation_format_floor.as_ref()
     }
 
     fn apply_initialize(
@@ -521,11 +588,7 @@ impl<'a> PrivateOramMutationPatchView<'a> {
         Ok(())
     }
 
-    /// Enrolls a collection after the cluster activated mutation V2: initializes the genesis
-    /// state exactly as `apply_initialize` does, then tags and activates its authority in the
-    /// same entry, as the activation barrier did for collections initialized before it. Every
-    /// refusal is deterministic (`bad_request`), so the entry is rejected on every replica.
-    fn apply_enroll_v2(
+    fn apply_enroll_collection_v2(
         &mut self,
         operation: &InitializePrivateOramMutationState,
         format_floor: Option<&PrivateOramMutationFormatFloorV2>,
@@ -615,6 +678,152 @@ impl<'a> PrivateOramMutationPatchView<'a> {
         self.private_oram_mutation_lease_slots.insert(
             key_digest,
             DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(activated),
+        );
+        Ok(())
+    }
+
+    fn apply_enroll_v2(
+        &mut self,
+        operation: &EnrollPrivateOramMutationStateV2,
+    ) -> Result<(), StorageError> {
+        validate_enroll_private_oram_mutation_state_v2(operation)?;
+        let key_digest = private_oram_mutation_key_digest(&operation.key);
+        let layout_key = PrivateOramLayoutKey {
+            collection_id: operation.key.collection_id.clone(),
+        };
+        let layout_key_digest = private_oram_layout_key_digest(&layout_key);
+        let genesis_slot = PrivateOramMutationLeaseSlotV2 {
+            version: PRIVATE_ORAM_MUTATION_LEASE_SLOT_VERSION,
+            generation: 0,
+            active: None,
+            last_clear: None,
+            max_writer_fence: 0,
+        };
+
+        let epoch_bindings = operation
+            .state
+            .indexes
+            .iter()
+            .map(|index| {
+                let key =
+                    private_oram_mutation_index_epoch_key(&operation.state.collection_id, index);
+                let mut expected = index.epoch.clone();
+                expected.writeback_digest = None;
+                (key, expected, index.epoch.clone())
+            })
+            .collect::<Vec<_>>();
+        let exact_replay = self.private_oram_mutation_states.get(&key_digest)
+            == Some(&operation.state)
+            && self
+                .private_oram_mutation_lease_slots
+                .get(&key_digest)
+                .map(DecodedPrivateOramMutationAuthorityWireV2::lease_slot)
+                == Some(&genesis_slot)
+            && self.private_oram_layouts.get(&layout_key_digest) == Some(&operation.layout)
+            && epoch_bindings
+                .iter()
+                .all(|(key, _, enrolled)| self.epoch(key).as_ref() == Some(enrolled));
+        if exact_replay {
+            return Ok(());
+        }
+
+        if self.external_recovery_is_active(&operation.key.collection_id) {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation genesis enrollment conflicts with active external recovery",
+            ));
+        }
+
+        let format_floor = self
+            .private_oram_mutation_v3_write_floor()
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::bad_request(
+                    "private ORAM mutation genesis enrollment requires the active cluster capability floor",
+                )
+            })?;
+
+        if self.private_oram_mutation_states.contains_key(&key_digest)
+            || self
+                .historical_mutation_lease_slot_by_digest(&key_digest)?
+                .is_some()
+            || self.private_oram_layouts.contains_key(&layout_key_digest)
+            || epoch_bindings
+                .iter()
+                .any(|(key, expected, _)| self.epoch(key).as_ref() != Some(expected))
+        {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation genesis enrollment precondition failed",
+            ));
+        }
+        if self.state_has_active_session(&operation.state) {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation genesis enrollment conflicts with active session lease",
+            ));
+        }
+        if self.private_oram_mutation_states.len() >= PRIVATE_ORAM_EPOCH_MAX_RECORDS
+            || self.private_oram_layouts.len() >= PRIVATE_ORAM_EPOCH_MAX_RECORDS
+        {
+            return Err(StorageError::bad_request(
+                "private ORAM mutation genesis enrollment capacity exceeded",
+            ));
+        }
+
+        let state_record_digest =
+            canonical_private_oram_consensus_state_record_digest(&operation.state)?;
+        let lifetime_digest =
+            private_oram_mutation_collection_lifetime_id_digest_v2(&operation.state.collection_id)
+                .map_err(private_oram_mutation_authority_corrupt)?;
+        let authority_key = private_oram_mutation_authority_key_v2(
+            &operation.state.collection_id,
+            format_floor.consensus_history_id_digest().to_string(),
+            format_floor.raft_group_id_digest().to_string(),
+            lifetime_digest,
+        )
+        .map_err(private_oram_mutation_authority_corrupt)?;
+        let outer_binding_digest = private_oram_mutation_outer_binding_digest_v2(
+            &operation.state.collection_id,
+            &state_record_digest,
+            &genesis_slot,
+        )
+        .map_err(private_oram_mutation_authority_corrupt)?;
+        let legacy_wire = DecodedPrivateOramMutationAuthorityWireV2::HistoricalRawLeaseSlotV2(
+            genesis_slot.clone(),
+        );
+        let legacy_authority = canonical_private_oram_mutation_legacy_authority_from_wire_v2(
+            &legacy_wire,
+            &authority_key,
+            &outer_binding_digest,
+        )
+        .map_err(private_oram_mutation_authority_corrupt)?;
+        let floor_applied = format_floor.floor_applied_locator();
+        let activation_context = private_oram_mutation_activation_context_from_barrier_v2(
+            format_floor.consensus_history_id_digest().to_string(),
+            format_floor.raft_group_id_digest().to_string(),
+            floor_applied.term(),
+            floor_applied.index(),
+            format_floor.format_epoch(),
+            format_floor.floor_digest(),
+            &operation.state.collection_id,
+        )
+        .map_err(private_oram_mutation_authority_corrupt)?;
+        let activated_authority = activate_private_oram_mutation_authority_v2(
+            &legacy_authority,
+            &operation.state.collection_id,
+            activation_context,
+        )
+        .map_err(private_oram_mutation_authority_corrupt)?;
+
+        for (key, _, enrolled) in epoch_bindings {
+            self.private_oram_epochs
+                .insert(private_oram_epoch_key_digest(&key), enrolled);
+        }
+        self.private_oram_layouts
+            .insert(layout_key_digest, operation.layout.clone());
+        self.private_oram_mutation_states
+            .insert(key_digest.clone(), operation.state.clone());
+        self.private_oram_mutation_lease_slots.insert(
+            key_digest,
+            DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(activated_authority),
         );
         Ok(())
     }
@@ -977,7 +1186,22 @@ impl<'a> PrivateOramMutationPatchView<'a> {
                     apply_private_oram_mutation_authority_prepare_append_reservation_challenge_v3(
                         &current_authority,
                         challenge_canonical_json.clone(),
-                        context,
+                        if let Some(floor) = self
+                            .private_oram_mutation_format_floor
+                            .as_ref()
+                            .filter(|floor| {
+                                floor.minimum_reader_protocol()
+                                    >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                                    && floor.minimum_writer_protocol()
+                                        >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                            })
+                        {
+                            context
+                                .with_owner_archive_history_floor(floor)
+                                .map_err(private_oram_mutation_authority_invalid)?
+                        } else {
+                            context
+                        },
                     )
                     .map_err(private_oram_mutation_authority_invalid)?;
                 validate_private_oram_material_result_v2(
@@ -1365,7 +1589,22 @@ impl<'a> PrivateOramMutationPatchView<'a> {
                     &current_authority,
                     lease.clone(),
                     recovery_manifest_canonical_json.clone(),
-                    context,
+                    if let Some(floor) =
+                        self.private_oram_mutation_format_floor
+                            .as_ref()
+                            .filter(|floor| {
+                                floor.minimum_reader_protocol()
+                                    >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                                    && floor.minimum_writer_protocol()
+                                        >= OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                            })
+                    {
+                        context
+                            .with_owner_archive_history_floor(floor)
+                            .map_err(private_oram_mutation_authority_invalid)?
+                    } else {
+                        context
+                    },
                 )
                 .map_err(private_oram_mutation_authority_invalid)?;
                 validate_private_oram_material_result_v2(&next_authority, &next_slot, &next_outer)?;
@@ -2427,20 +2666,23 @@ impl Persistent {
             PrivateOramMutationCommand::Initialize(operation) => {
                 PrivateOramMutationPatchView::new(&mut next).apply_initialize(operation)
             }
-            PrivateOramMutationCommand::EnrollV2 {
+            PrivateOramMutationCommand::EnrollCollectionV2 {
                 operation,
                 entry_term,
                 entry_index,
             } => {
                 let format_floor = next.private_oram_mutation_format_floor.clone();
                 let activation_pending = next.private_oram_mutation_activation_pending.is_some();
-                PrivateOramMutationPatchView::new(&mut next).apply_enroll_v2(
+                PrivateOramMutationPatchView::new(&mut next).apply_enroll_collection_v2(
                     operation,
                     format_floor.as_ref(),
                     activation_pending,
                     entry_term,
                     entry_index,
                 )
+            }
+            PrivateOramMutationCommand::EnrollV2(operation) => {
+                PrivateOramMutationPatchView::new(&mut next).apply_enroll_v2(operation)
             }
             PrivateOramMutationCommand::CompareAndSwapLease(operation) => {
                 PrivateOramMutationPatchView::new(&mut next).apply_compare_and_swap_lease(operation)
@@ -2551,6 +2793,10 @@ impl Persistent {
             private_oram_mutation_states,
             private_oram_epochs,
             private_oram_layouts,
+        )?;
+        validate_private_oram_external_recovery_authority_snapshot(
+            private_oram_external_recoveries,
+            private_oram_mutation_states,
         )?;
         validate_private_oram_mutation_lease_slot_snapshot(
             private_oram_mutation_lease_slots,
@@ -2827,6 +3073,8 @@ impl Persistent {
     /// A configured bundle is an immutable startup expectation. A consecutive externally signed
     /// successor may be installed only while no two-phase activation barrier is pending; this is
     /// the operator-controlled capability upgrade path used before gathering a new cluster proof.
+    /// A capability change retains its signed predecessor and exact old floor until the barrier
+    /// catches up, so restarting before Prepare does not discard or bypass the applied floor.
     pub fn load_or_init_with_private_oram_mutation_v2_activation(
         storage_path: impl AsRef<Path>,
         first_peer: bool,
@@ -2949,6 +3197,43 @@ impl Persistent {
                 state.private_oram_activation_authority.as_ref(),
                 None,
             )?,
+        }
+        if trust_anchor.is_some()
+            && let Some(format_floor) = state.private_oram_mutation_format_floor.as_ref()
+        {
+            let authority = state.private_oram_activation_authority_at_configured_read()?;
+            let manifest = authority.manifest().ok_or_else(|| {
+                StorageError::service_error(
+                    "private ORAM mutation format floor has no activation authority",
+                )
+            })?;
+            let required_capability = private_oram_format_floor_required_capability(
+                format_floor,
+                state
+                    .private_oram_activation_authority
+                    .as_ref()
+                    .ok_or_else(|| {
+                        StorageError::service_error(
+                            "private ORAM mutation format floor has no activation authority",
+                        )
+                    })?,
+            )?;
+            if manifest.required_binary_capability_digest != required_capability
+                && !(state.private_oram_capability_upgrade_can_start(format_floor)
+                    && state
+                        .private_oram_activation_authority
+                        .as_ref()
+                        .is_some_and(|authority| {
+                            authority.capability_upgrade_matches_floor(
+                                format_floor.floor_digest(),
+                                required_capability,
+                            )
+                        }))
+            {
+                return Err(StorageError::service_error(
+                    "private ORAM mutation format floor requires a different binary capability",
+                ));
+            }
         }
         if migrate_legacy {
             state.path = path_json.clone();
@@ -3242,6 +3527,19 @@ impl Persistent {
         self.private_oram_activation_authority_at_read(&trust_anchor)
     }
 
+    fn private_oram_capability_upgrade_can_start(
+        &self,
+        floor: &PrivateOramMutationFormatFloorV2,
+    ) -> bool {
+        self.private_oram_mutation_activation_pending.is_none()
+            && floor.activation_enabled()
+            && floor.format_epoch() >= 2
+            && floor.format_epoch().is_multiple_of(2)
+            && floor.snapshot_format_epoch() == floor.format_epoch()
+            && floor.minimum_reader_protocol() == floor.minimum_writer_protocol()
+            && floor.minimum_reader_protocol() < PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
+    }
+
     /// Dormant local CAS primitive. No consensus operation invokes it until mixed-version safety is
     /// established, so successful return must not be treated as cluster-wide activation.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3253,7 +3551,7 @@ impl Persistent {
     ) -> Result<(), StorageError> {
         self.ensure_private_oram_activation_authority_durability_known()?;
         self.configure_private_oram_activation_authority_trust_anchor(trust_anchor)?;
-        let new_state = plan_private_oram_activation_authority_cas_v1(
+        let mut new_state = plan_private_oram_activation_authority_cas_v1(
             self.private_oram_activation_authority.as_ref(),
             expected,
             new_bundle,
@@ -3274,6 +3572,30 @@ impl Persistent {
                 "persisted private ORAM activation authority failed verification",
             ),
         })?;
+        if let Some(current) = &self.private_oram_activation_authority
+            && let Some(floor) = &self.private_oram_mutation_format_floor
+        {
+            let required_capability =
+                private_oram_format_floor_required_capability(floor, current)?;
+            if self.private_oram_mutation_activation_pending.is_some()
+                || self.current_unapplied_entry().is_some()
+                || current.manifest().required_binary_capability_digest != required_capability
+            {
+                return Err(StorageError::PreconditionFailed {
+                    description: "private ORAM activation authority cannot rotate before its capability upgrade completes"
+                        .to_string(),
+                });
+            }
+            if new_state.manifest().required_binary_capability_digest != required_capability {
+                if !self.private_oram_capability_upgrade_can_start(floor) {
+                    return Err(StorageError::PreconditionFailed {
+                        description: "private ORAM activation authority capability upgrade requires an older fully enabled format floor"
+                            .to_string(),
+                    });
+                }
+                new_state.retain_capability_upgrade_predecessor(current, floor.floor_digest());
+            }
+        }
         let previous = self.private_oram_activation_authority.replace(new_state);
         self.save_or_rollback_on_definitive(move |persistent| {
             persistent.private_oram_activation_authority = previous;
@@ -3380,13 +3702,6 @@ impl Persistent {
         {
             return Err(StorageError::bad_request(
                 "private ORAM session lease conflicts with active mutation",
-            ));
-        }
-        if operation.new.is_some()
-            && self.private_oram_mutation_is_enrolled(&operation.key.collection_id)
-        {
-            return Err(StorageError::bad_request(
-                "private ORAM session lease conflicts with enrolled v2 mutation state",
             ));
         }
         if current != operation.expected.as_ref() {
@@ -3505,6 +3820,24 @@ impl Persistent {
             })
     }
 
+    pub(crate) fn private_oram_mutation_owner_new_generation_readiness_expectation_v2(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: PeerId,
+    ) -> Result<PrivateOramOwnerNewGenerationReadinessExpectationV2, StorageError> {
+        self.private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+            .ok_or_else(|| {
+                StorageError::bad_request(
+                    "private ORAM V2 mutation authority is not active for collection",
+                )
+            })?
+            .owner_new_generation_readiness_expectation(&key.collection_id, owner_peer_id)
+            .map_err(private_oram_mutation_authority_corrupt)
+    }
+
     pub(crate) fn private_oram_mutation_v2_append_authority_context(
         &self,
         key: &PrivateOramMutationKey,
@@ -3522,17 +3855,22 @@ impl Persistent {
             .map_err(private_oram_mutation_authority_corrupt)
     }
 
+    #[cfg(test)]
     fn private_oram_mutation_v3_write_floor_active(&self) -> bool {
+        self.private_oram_mutation_v3_write_floor().is_some()
+    }
+
+    fn private_oram_mutation_v3_write_floor(&self) -> Option<&PrivateOramMutationFormatFloorV2> {
         self.private_oram_mutation_format_floor
             .as_ref()
-            .is_some_and(|floor| {
+            .filter(|floor| {
                 floor.activation_enabled()
                     && floor.minimum_reader_protocol()
                         >= PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
                     && floor.minimum_writer_protocol()
                         >= PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION
             })
-            && self.private_oram_mutation_activation_pending.is_none()
+            .filter(|_| self.private_oram_mutation_activation_pending.is_none())
     }
 
     pub(crate) fn private_oram_mutation_v3_floor_upgrade_quiescent(
@@ -3674,6 +4012,41 @@ impl Persistent {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn private_oram_mutation_v2_owner_enrollment_plan(
+        &self,
+        key: &PrivateOramMutationKey,
+        owner_peer_id: u64,
+        owner_signer: PrivateOramOwnerCleanupSignerV1,
+        owner_store_incarnation_digest: String,
+        owner_enrollment_id: String,
+        authority_registry_digest: String,
+        owner_registry_digest: String,
+        enrollment_operation_id: String,
+    ) -> Result<PrivateOramMutationOwnerEnrollmentPlanV2, StorageError> {
+        let authority = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .ok_or_else(|| {
+                StorageError::bad_request(
+                    "private ORAM V2 mutation authority is not active for collection",
+                )
+            })?;
+        private_oram_mutation_owner_enrollment_plan_v2(
+            authority,
+            &key.collection_id,
+            owner_peer_id,
+            owner_signer,
+            owner_store_incarnation_digest,
+            owner_enrollment_id,
+            authority_registry_digest,
+            owner_registry_digest,
+            enrollment_operation_id,
+        )
+        .map_err(private_oram_mutation_authority_invalid)
+    }
+
     pub(crate) fn private_oram_mutation_v2_active_recovery_manifest(
         &self,
         key: &PrivateOramMutationKey,
@@ -3769,10 +4142,127 @@ impl Persistent {
             .map_err(private_oram_mutation_authority_corrupt)
     }
 
+    pub(crate) fn private_oram_mutation_v2_preadmission_recovery_candidates(
+        &self,
+    ) -> Result<Vec<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        let mut candidates = Vec::new();
+        for state in self.private_oram_mutation_states.values() {
+            let key = PrivateOramMutationKey {
+                collection_id: state.collection_id.clone(),
+            };
+            if let Some(candidate) =
+                self.private_oram_mutation_v2_preadmission_recovery_candidate(&key)?
+            {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_unstable_by(|left, right| {
+            left.key().collection_id.cmp(&right.key().collection_id)
+        });
+        if candidates
+            .windows(2)
+            .any(|pair| pair[0].key().collection_id >= pair[1].key().collection_id)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM pre-admission recovery identity is inconsistent",
+            ));
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_preadmission_recovery_candidate(
+        &self,
+        key: &PrivateOramMutationKey,
+    ) -> Result<Option<PrivateOramMutationPreadmissionRecoveryCandidateV2>, StorageError> {
+        let aggregate = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+            .ok_or_else(|| {
+                StorageError::service_error("private ORAM mutation authority state is inconsistent")
+            })?;
+        let candidate = aggregate
+            .preadmission_recovery_candidate()
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        if candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.key() != key)
+        {
+            return Err(StorageError::service_error(
+                "private ORAM pre-admission recovery identity is inconsistent",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    pub(crate) fn private_oram_mutation_v2_rejected_admission_acknowledgement(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+    ) -> Result<Option<PrivateOramMutationRejectedAdmissionAcknowledgementV2>, StorageError> {
+        if key.collection_id != lease.collection_id {
+            return Ok(None);
+        }
+        let Some(aggregate) = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+        else {
+            return Ok(None);
+        };
+        aggregate
+            .rejected_admission_acknowledgement(lease)
+            .map_err(private_oram_mutation_authority_corrupt)
+    }
+
+    /// `Some(true)` is admitted, `Some(false)` is rejected, and `None` is unresolved.
+    pub(crate) fn private_oram_mutation_v2_retained_admission_outcome(
+        &self,
+        key: &PrivateOramMutationKey,
+        lease: &PrivateOramMutationLease,
+        manifest_digest: &str,
+    ) -> Result<Option<bool>, StorageError> {
+        let aggregate = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(key))
+            .and_then(DecodedPrivateOramMutationAuthorityWireV2::tagged_authority)
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+            .ok_or_else(|| {
+                StorageError::bad_request(
+                    "private ORAM V2 mutation authority is not active for collection",
+                )
+            })?;
+        let admitted = aggregate
+            .retains_admission(lease, manifest_digest)
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        let rejected = aggregate
+            .retains_rejected_admission(lease, manifest_digest)
+            .map_err(private_oram_mutation_authority_corrupt)?;
+        match (admitted, rejected) {
+            (true, false) => Ok(Some(true)),
+            (false, true) => Ok(Some(false)),
+            (false, false) => Ok(None),
+            (true, true) => Err(StorageError::service_error(
+                "private ORAM admission has conflicting retained outcomes",
+            )),
+        }
+    }
+
     pub fn has_active_private_oram_mutation(&self) -> bool {
         self.private_oram_mutation_lease_slots
             .values()
             .any(|wire| wire.lease_slot().active.is_some())
+    }
+
+    pub fn has_unsettled_private_oram_mutation(&self) -> Result<bool, StorageError> {
+        if self.has_active_private_oram_mutation() {
+            return Ok(true);
+        }
+        Ok(!self
+            .private_oram_mutation_pending_acknowledgement_keys()?
+            .is_empty())
     }
 
     pub(crate) fn active_private_oram_mutation_keys(
@@ -3877,6 +4367,35 @@ impl Persistent {
         .is_some()
     }
 
+    fn private_oram_mutation_is_unsettled(
+        &self,
+        collection_id: &str,
+    ) -> Result<bool, StorageError> {
+        let key = PrivateOramMutationKey {
+            collection_id: collection_id.to_string(),
+        };
+        let Some(authority) = self
+            .private_oram_mutation_lease_slots
+            .get(&private_oram_mutation_key_digest(&key))
+        else {
+            return Ok(false);
+        };
+        if authority.lease_slot().active.is_some() {
+            return Ok(true);
+        }
+        let Some(aggregate) = authority
+            .tagged_authority()
+            .and_then(PrivateOramMutationAuthorityStateV2::aggregate)
+        else {
+            return Ok(false);
+        };
+        aggregate
+            .lifecycle()
+            .pending_acknowledgement_owner()
+            .map(|pending| pending.is_some())
+            .map_err(private_oram_mutation_authority_corrupt)
+    }
+
     fn private_oram_mutation_is_enrolled(&self, collection_id: &str) -> bool {
         self.private_oram_mutation_state(&PrivateOramMutationKey {
             collection_id: collection_id.to_string(),
@@ -3908,7 +4427,7 @@ impl Persistent {
     ) -> Result<PrivateOramMutationAtEntryOutcome, StorageError> {
         let patch = self.prepare_private_oram_mutation_complete_patch(
             Some(entry_index),
-            PrivateOramMutationCommand::EnrollV2 {
+            PrivateOramMutationCommand::EnrollCollectionV2 {
                 operation,
                 entry_term,
                 entry_index,
@@ -3928,6 +4447,37 @@ impl Persistent {
         let patch = self.prepare_private_oram_mutation_complete_patch(
             Some(entry_index),
             PrivateOramMutationCommand::Initialize(operation),
+        )?;
+        self.commit_private_oram_mutation_complete_patch_with_backend(
+            patch,
+            &FilesystemPersistentSaveBackend,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn enroll_private_oram_mutation_state_v2(
+        &mut self,
+        operation: &EnrollPrivateOramMutationStateV2,
+    ) -> Result<(), StorageError> {
+        let patch = self.prepare_private_oram_mutation_complete_patch(
+            None,
+            PrivateOramMutationCommand::EnrollV2(operation),
+        )?;
+        self.commit_private_oram_mutation_complete_patch_with_backend(
+            patch,
+            &FilesystemPersistentSaveBackend,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn enroll_private_oram_mutation_state_v2_at_applied_entry(
+        &mut self,
+        operation: &EnrollPrivateOramMutationStateV2,
+        entry_index: EntryId,
+    ) -> Result<PrivateOramMutationAtEntryOutcome, StorageError> {
+        let patch = self.prepare_private_oram_mutation_complete_patch(
+            Some(entry_index),
+            PrivateOramMutationCommand::EnrollV2(operation),
         )?;
         self.commit_private_oram_mutation_complete_patch_with_backend(
             patch,
@@ -4106,9 +4656,9 @@ impl Persistent {
     ) -> Result<(), StorageError> {
         self.ensure_persistence_writable()?;
         validate_private_oram_external_recovery_cas(operation)?;
-        if self.private_oram_mutation_is_active(&operation.key.collection_id) {
+        if self.private_oram_mutation_is_unsettled(&operation.key.collection_id)? {
             return Err(StorageError::bad_request(
-                "private ORAM external recovery conflicts with active mutation",
+                "private ORAM external recovery conflicts with unsettled mutation",
             ));
         }
         let key = private_oram_external_recovery_key_digest(&operation.key);
@@ -4163,6 +4713,11 @@ impl Persistent {
     ) -> Result<(), StorageError> {
         validate_private_oram_external_recovery_cas(&operation.recovery)
             .map_err(|_| invalid_private_oram_external_recovery_operation())?;
+        if self.private_oram_mutation_is_unsettled(&operation.recovery.key.collection_id)? {
+            return Err(StorageError::bad_request(
+                "private ORAM external recovery conflicts with unsettled mutation",
+            ));
+        }
         validate_private_oram_consensus_layout(&operation.layout)
             .map_err(|_| invalid_private_oram_external_recovery_operation())?;
         if operation.index_states.is_empty()
@@ -4172,6 +4727,30 @@ impl Persistent {
         }
 
         let collection_id = &operation.recovery.key.collection_id;
+        let authority = operation
+            .recovery
+            .new
+            .as_ref()
+            .and_then(|state| state.active_lease.as_ref())
+            .or_else(|| {
+                operation
+                    .recovery
+                    .expected
+                    .as_ref()
+                    .and_then(|state| state.active_lease.as_ref())
+            })
+            .map(|lease| lease.authority)
+            .ok_or_else(invalid_private_oram_external_recovery_operation)?;
+        let mutation_is_enrolled = self.private_oram_mutation_is_enrolled(collection_id);
+        if !matches!(
+            (authority, mutation_is_enrolled),
+            (PrivateOramExternalRecoveryAuthority::LegacyV1, false)
+                | (PrivateOramExternalRecoveryAuthority::MutationV2, true)
+        ) {
+            return Err(StorageError::bad_request(
+                "private ORAM external recovery authority conflicts with mutation enrollment",
+            ));
+        }
         let layout_key = PrivateOramLayoutKey {
             collection_id: collection_id.clone(),
         };
@@ -4216,6 +4795,7 @@ impl Persistent {
                     && expected.operation_id_hash == new.operation_id_hash
                     && expected.checkpoint_digest == new.checkpoint_digest
                     && expected.backup_generation == new.backup_generation
+                    && expected.authority == new.authority
             });
         let phase_is_valid = match operation.phase {
             PrivateOramExternalRecoveryPhase::Begin => {
@@ -4861,6 +5441,7 @@ impl Persistent {
         let next_checkpoint = plan_private_oram_local_floor_for_persistent_state(
             current_checkpoint.as_ref(),
             self.private_oram_mutation_format_floor.as_ref(),
+            &self.private_oram_mutation_states,
             &self.private_oram_mutation_lease_slots,
             self.private_oram_applied_index(),
         )
@@ -5109,6 +5690,7 @@ impl Persistent {
         validate_private_oram_local_floor_against_persistent_state(
             checkpoint.as_ref(),
             self.private_oram_mutation_format_floor.as_ref(),
+            &self.private_oram_mutation_states,
             &self.private_oram_mutation_lease_slots,
             self.private_oram_applied_index(),
         )
@@ -5151,6 +5733,7 @@ impl Persistent {
     pub(crate) fn validate_private_oram_mutation_floor_for_snapshot(
         &self,
         incoming_format_floor: Option<&PrivateOramMutationFormatFloorV2>,
+        incoming_mutation_states: &HashMap<String, PrivateOramConsensusCollectionStateV2>,
         incoming_authority_wires: &HashMap<String, DecodedPrivateOramMutationAuthorityWireV2>,
         incoming_applied_index: u64,
     ) -> Result<(), StorageError> {
@@ -5159,6 +5742,7 @@ impl Persistent {
         validate_private_oram_local_floor_against_persistent_state(
             checkpoint.as_ref(),
             self.private_oram_mutation_format_floor.as_ref(),
+            &self.private_oram_mutation_states,
             &self.private_oram_mutation_lease_slots,
             self.private_oram_applied_index(),
         )
@@ -5171,6 +5755,7 @@ impl Persistent {
         plan_private_oram_local_floor_for_persistent_state(
             checkpoint.as_ref(),
             incoming_format_floor,
+            incoming_mutation_states,
             incoming_authority_wires,
             incoming_applied_index,
         )
@@ -5201,6 +5786,7 @@ fn persistent_state_file_digest(path: &Path) -> io::Result<[u8; 32]> {
 fn plan_private_oram_local_floor_for_persistent_state(
     current: Option<&PrivateOramMutationLocalFloorCheckpointV2>,
     format_floor: Option<&PrivateOramMutationFormatFloorV2>,
+    mutation_states: &HashMap<String, PrivateOramConsensusCollectionStateV2>,
     authority_wires: &HashMap<String, DecodedPrivateOramMutationAuthorityWireV2>,
     applied_index: u64,
 ) -> Result<Option<PrivateOramMutationLocalFloorCheckpointV2>, PrivateOramMutationJournalError> {
@@ -5214,6 +5800,24 @@ fn plan_private_oram_local_floor_for_persistent_state(
         }
         return Ok(None);
     };
+
+    let mut enrollment_floors = BTreeMap::new();
+    for (collection_key_digest, state) in mutation_states {
+        let current_enrollment_floor =
+            current.and_then(|checkpoint| checkpoint.enrollment_floor(collection_key_digest));
+        let candidate = plan_private_oram_mutation_enrollment_floor_v2(
+            current_enrollment_floor,
+            collection_key_digest,
+            &state.manifest_digest,
+            applied_index,
+        )?;
+        if enrollment_floors
+            .insert(collection_key_digest.clone(), candidate)
+            .is_some()
+        {
+            return Err(PrivateOramMutationJournalError::Corrupt);
+        }
+    }
 
     let mut authority_floors = BTreeMap::new();
     for wire in authority_wires.values() {
@@ -5255,6 +5859,7 @@ fn plan_private_oram_local_floor_for_persistent_state(
     plan_private_oram_mutation_local_floor_checkpoint_v2(
         current,
         format_floor.clone(),
+        enrollment_floors,
         authority_floors,
     )
     .map(Some)
@@ -5263,12 +5868,14 @@ fn plan_private_oram_local_floor_for_persistent_state(
 fn validate_private_oram_local_floor_against_persistent_state(
     current: Option<&PrivateOramMutationLocalFloorCheckpointV2>,
     format_floor: Option<&PrivateOramMutationFormatFloorV2>,
+    mutation_states: &HashMap<String, PrivateOramConsensusCollectionStateV2>,
     authority_wires: &HashMap<String, DecodedPrivateOramMutationAuthorityWireV2>,
     applied_index: u64,
 ) -> Result<(), PrivateOramMutationJournalError> {
     let planned = plan_private_oram_local_floor_for_persistent_state(
         current,
         format_floor,
+        mutation_states,
         authority_wires,
         applied_index,
     )?;
@@ -5276,6 +5883,17 @@ fn validate_private_oram_local_floor_against_persistent_state(
         return Err(PrivateOramMutationJournalError::Corrupt);
     }
     if let Some(checkpoint) = current {
+        for (collection_key_digest, enrollment_floor) in checkpoint.enrollment_floors() {
+            let state = mutation_states
+                .get(collection_key_digest)
+                .ok_or(PrivateOramMutationJournalError::InvalidTransition)?;
+            plan_private_oram_mutation_enrollment_floor_v2(
+                Some(enrollment_floor),
+                collection_key_digest,
+                &state.manifest_digest,
+                applied_index,
+            )?;
+        }
         for (collection_key_digest, authority_floor) in checkpoint.authority_floors() {
             let wire = authority_wires.values().find(|wire| {
                 wire.tagged_authority().is_some_and(|authority| {
@@ -5565,6 +6183,50 @@ fn validate_initialize_private_oram_mutation_state(
     {
         return Err(StorageError::bad_request(
             "private ORAM mutation state initialization is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enroll_private_oram_mutation_state_v2(
+    operation: &EnrollPrivateOramMutationStateV2,
+) -> Result<(), StorageError> {
+    validate_private_oram_mutation_key(&operation.key)?;
+    validate_private_oram_consensus_layout(&operation.layout)?;
+    validate_private_oram_consensus_collection_state(&operation.state)?;
+    let expected_index_state_digest = private_oram_consensus_state_index_digest(&operation.state)?;
+    let hnsw_count = operation
+        .state
+        .indexes
+        .iter()
+        .filter(|index| index.index_kind == PrivateOramIndexKind::Hnsw)
+        .count();
+    let result_count = operation
+        .state
+        .indexes
+        .iter()
+        .filter(|index| index.index_kind == PrivateOramIndexKind::ResultPayload)
+        .count();
+    if operation.state.collection_id != operation.key.collection_id
+        || operation.state.state_sequence != 0
+        || !matches!(
+            operation.state.last_transition,
+            PrivateOramConsensusTransitionV2::Genesis
+        )
+        || operation.layout.generation != 1
+        || operation.state.layout_generation != operation.layout.generation
+        || operation.state.layout_digest != operation.layout.layout_digest
+        || operation.layout.index_state_digest != expected_index_state_digest
+        || operation
+            .state
+            .indexes
+            .iter()
+            .any(|index| index.epoch.writeback_digest.is_none())
+        || hnsw_count != 1
+        || result_count > 1
+    {
+        return Err(StorageError::bad_request(
+            "private ORAM mutation genesis enrollment is invalid",
         ));
     }
     Ok(())
@@ -6465,7 +7127,8 @@ fn validate_private_oram_external_recovery_lease_transition(
     let same_recovery = expected.owner_peer_id == new.owner_peer_id
         && expected.operation_id_hash == new.operation_id_hash
         && expected.checkpoint_digest == new.checkpoint_digest
-        && expected.backup_generation == new.backup_generation;
+        && expected.backup_generation == new.backup_generation
+        && expected.authority == new.authority;
     let valid_renewal = same_recovery
         && new.phase == expected.phase
         && new.install_intent_digest == expected.install_intent_digest
@@ -6818,6 +7481,36 @@ fn validate_private_oram_external_recovery_snapshot(
     Ok(())
 }
 
+fn validate_private_oram_external_recovery_authority_snapshot(
+    recoveries: &HashMap<String, PrivateOramExternalRecoveryState>,
+    mutation_states: &HashMap<String, PrivateOramConsensusCollectionStateV2>,
+) -> Result<(), StorageError> {
+    let enrolled_recovery_keys = mutation_states
+        .values()
+        .map(|state| {
+            private_oram_external_recovery_key_digest(&PrivateOramExternalRecoveryKey {
+                collection_id: state.collection_id.clone(),
+            })
+        })
+        .collect::<HashSet<_>>();
+    for (recovery_key_digest, recovery) in recoveries {
+        let Some(active_lease) = recovery.active_lease.as_ref() else {
+            continue;
+        };
+        let enrolled = enrolled_recovery_keys.contains(recovery_key_digest);
+        if !matches!(
+            (active_lease.authority, enrolled),
+            (PrivateOramExternalRecoveryAuthority::LegacyV1, false)
+                | (PrivateOramExternalRecoveryAuthority::MutationV2, true)
+        ) {
+            return Err(StorageError::bad_request(
+                "private ORAM external recovery authority snapshot is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_private_oram_mutation_state_snapshot(
     states: &HashMap<String, PrivateOramConsensusCollectionStateV2>,
     epochs: &HashMap<String, PrivateOramConsensusEpoch>,
@@ -6917,7 +7610,10 @@ fn validate_private_oram_mutation_lease_slot_snapshot(
             let epoch_key = private_oram_mutation_index_epoch_key(&state.collection_id, index);
             let epoch_key_digest = private_oram_epoch_key_digest(&epoch_key);
             session_leases.contains_key(&epoch_key_digest)
-                || epochs.get(&epoch_key_digest) != Some(&index.epoch)
+        });
+        let has_epoch_mismatch = state.indexes.iter().any(|index| {
+            let epoch_key = private_oram_mutation_index_epoch_key(&state.collection_id, index);
+            epochs.get(&private_oram_epoch_key_digest(&epoch_key)) != Some(&index.epoch)
         });
         if key_digest != &private_oram_mutation_key_digest(&key)
             || slot
@@ -6925,7 +7621,8 @@ fn validate_private_oram_mutation_lease_slot_snapshot(
                 .as_ref()
                 .is_some_and(|lease| !layout.owner_peer_ids.contains(&lease.owner_peer_id))
             || (has_active_recovery && slot.active.is_some())
-            || has_session
+            || has_epoch_mismatch
+            || (has_session && (slot.active.is_some() || has_active_recovery))
         {
             return Err(StorageError::bad_request(
                 "private ORAM mutation lease slot snapshot is invalid",
@@ -6975,8 +7672,14 @@ fn validate_private_oram_mutation_authority_format_snapshot(
         {
             return Err(invalid());
         }
-        if authority.aggregate().is_some() {
-            if !format_floor.activation_enabled() {
+        if let Some(aggregate) = authority.aggregate() {
+            if !format_floor.activation_enabled()
+                || (aggregate.has_compacted_owner_archive_history()
+                    && (format_floor.minimum_reader_protocol()
+                        < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1
+                        || format_floor.minimum_writer_protocol()
+                            < OWNER_ARCHIVE_HISTORY_MIN_PROTOCOL_V1))
+            {
                 return Err(invalid());
             }
             plan_private_oram_mutation_authority_floor_acceptance_v2(
@@ -7203,6 +7906,10 @@ mod tests {
         private_oram_owner_checkpoint_reservation_binding_v1,
         private_oram_owner_checkpoint_reservation_context_v1,
     };
+    use crate::content_manager::consensus::private_oram_mutation_cleanup::{
+        encode_private_oram_mutation_cleanup_expectation_v2,
+        private_oram_cleanup_expectation_for_test,
+    };
     use crate::content_manager::consensus::private_oram_mutation_recovery_capsules::{
         PrivateOramOwnerRecoveryCapsuleInstallEvidenceV2,
         derive_private_oram_mutation_recovery_capsules_ready_v2,
@@ -7357,6 +8064,7 @@ mod tests {
             eligible_peer_set_digest: test_digest(3),
             eligible_process_incarnations_digest: test_digest(4),
             capability_manifest_digest: test_digest(5),
+            required_binary_capability_digest: test_digest(6),
             activation_enabled,
             term: 1,
             index,
@@ -7626,6 +8334,392 @@ mod tests {
             .unwrap();
     }
 
+    fn install_private_oram_unbound_genesis_epochs(
+        persistent: &mut Persistent,
+        fixture: &PrivateOramMutationFixture,
+    ) {
+        for (key, enrolled_epoch) in [
+            (
+                fixture.hnsw_key.clone(),
+                fixture.old_state.indexes[0].epoch.clone(),
+            ),
+            (
+                fixture.result_key.clone(),
+                fixture.old_state.indexes[1].epoch.clone(),
+            ),
+        ] {
+            persistent
+                .compare_and_swap_private_oram_epoch(&CompareAndSwapPrivateOramEpoch {
+                    key,
+                    expected: None,
+                    new: PrivateOramConsensusEpoch {
+                        writeback_digest: None,
+                        ..enrolled_epoch
+                    },
+                })
+                .unwrap();
+        }
+    }
+
+    fn private_oram_mutation_genesis_enrollment(
+        fixture: &PrivateOramMutationFixture,
+    ) -> EnrollPrivateOramMutationStateV2 {
+        EnrollPrivateOramMutationStateV2 {
+            key: fixture.key.clone(),
+            layout: fixture.layout.clone(),
+            state: fixture.old_state.clone(),
+        }
+    }
+
+    fn install_private_oram_mutation_test_capability_floor(persistent: &mut Persistent) {
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            persistent,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+            &test_digest(6),
+        );
+    }
+
+    fn install_private_oram_mutation_test_capability_floor_with_protocol(
+        persistent: &mut Persistent,
+        protocol: u16,
+        required_binary_capability_digest: &str,
+    ) {
+        for format_epoch in 1..=4 {
+            persistent
+                .set_unapplied_entries(format_epoch, format_epoch)
+                .unwrap();
+            persistent.entry_applied().unwrap();
+            persistent.private_oram_mutation_format_floor = Some(
+                private_oram_mutation_format_floor_for_test(
+                    PrivateOramMutationFormatFloorTestInputV2 {
+                        consensus_history_id_digest: test_digest(1),
+                        raft_group_id_digest: test_digest(2),
+                        format_epoch,
+                        minimum_reader_protocol: protocol,
+                        minimum_writer_protocol: protocol,
+                        snapshot_format_epoch: format_epoch,
+                        membership_generation: 1,
+                        eligible_peer_set_digest: test_digest(3),
+                        eligible_process_incarnations_digest: test_digest(4),
+                        capability_manifest_digest: test_digest(5),
+                        required_binary_capability_digest: required_binary_capability_digest
+                            .to_string(),
+                        activation_enabled: format_epoch >= 2,
+                        term: 1,
+                        index: format_epoch,
+                    },
+                )
+                .unwrap(),
+            );
+            persistent.save().unwrap();
+        }
+    }
+
+    fn private_oram_external_recovery_begin_for_fixture(
+        fixture: &PrivateOramMutationFixture,
+        authority: PrivateOramExternalRecoveryAuthority,
+        discriminator: u8,
+    ) -> PrivateOramExternalRecoveryOperation {
+        PrivateOramExternalRecoveryOperation {
+            phase: PrivateOramExternalRecoveryPhase::Begin,
+            recovery: CompareAndSwapPrivateOramExternalRecovery {
+                key: PrivateOramExternalRecoveryKey {
+                    collection_id: fixture.key.collection_id.clone(),
+                },
+                expected: None,
+                new: Some(PrivateOramExternalRecoveryState {
+                    committed_backup_generation: 0,
+                    committed_checkpoint_digest: None,
+                    committed_install_intent_digest: None,
+                    active_lease: Some(PrivateOramExternalRecoveryLease {
+                        owner_peer_id: 7,
+                        operation_id_hash: test_digest(discriminator),
+                        checkpoint_digest: test_digest(discriminator.wrapping_add(1)),
+                        backup_generation: 1,
+                        issued_at_unix: 100,
+                        expires_at_unix: 160,
+                        authority,
+                        install_intent_digest: None,
+                        phase: PrivateOramExternalRecoveryLeasePhase::Staging,
+                    }),
+                }),
+            },
+            layout: fixture.layout.clone(),
+            index_states: vec![
+                PrivateOramLayoutIndexStateBinding {
+                    key: fixture.hnsw_key.clone(),
+                    state: fixture.old_state.indexes[0].epoch.clone(),
+                },
+                PrivateOramLayoutIndexStateBinding {
+                    key: fixture.result_key.clone(),
+                    state: fixture.old_state.indexes[1].epoch.clone(),
+                },
+            ],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_mutation_genesis_enrollment_atomically_binds_unbound_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_test_capability_floor(&mut persistent);
+        install_private_oram_unbound_genesis_epochs(&mut persistent, &fixture);
+        let operation = private_oram_mutation_genesis_enrollment(&fixture);
+
+        persistent
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap();
+        assert_eq!(
+            persistent.private_oram_epoch(&fixture.hnsw_key),
+            Some(fixture.old_state.indexes[0].epoch.clone())
+        );
+        assert_eq!(
+            persistent.private_oram_epoch(&fixture.result_key),
+            Some(fixture.old_state.indexes[1].epoch.clone())
+        );
+        assert_eq!(
+            persistent.private_oram_layout(&fixture.layout_key),
+            Some(fixture.layout.clone())
+        );
+        assert_eq!(
+            persistent.private_oram_mutation_state(&fixture.key),
+            Some(fixture.old_state.clone())
+        );
+        assert_eq!(
+            persistent.private_oram_mutation_lease_slot(&fixture.key),
+            Some(fixture.genesis_slot.clone())
+        );
+        assert!(matches!(
+            persistent
+                .private_oram_mutation_lease_slots
+                .get(&private_oram_mutation_key_digest(&fixture.key)),
+            Some(
+                DecodedPrivateOramMutationAuthorityWireV2::TaggedAuthorityV2(
+                    PrivateOramMutationAuthorityStateV2::Activated(_)
+                )
+            )
+        ));
+
+        persistent
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap();
+        let mut stale = operation;
+        stale.state.signed_state_digest = test_digest(91);
+        let error = persistent
+            .enroll_private_oram_mutation_state_v2(&stale)
+            .unwrap_err();
+        assert!(error.to_string().contains("precondition failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_legacy_recovery_and_v2_enrollment_cross_fence_in_both_orders() {
+        let fixture = private_oram_mutation_fixture();
+        let enrollment = private_oram_mutation_genesis_enrollment(&fixture);
+
+        let recovery_first_dir = tempfile::tempdir().unwrap();
+        let mut recovery_first =
+            Persistent::load_or_init(recovery_first_dir.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_test_capability_floor(&mut recovery_first);
+        install_private_oram_mutation_outer_fixture(&mut recovery_first, &fixture);
+        let legacy_begin = private_oram_external_recovery_begin_for_fixture(
+            &fixture,
+            PrivateOramExternalRecoveryAuthority::LegacyV1,
+            101,
+        );
+        recovery_first
+            .apply_private_oram_external_recovery(&legacy_begin)
+            .unwrap();
+        let enrollment_error = recovery_first
+            .enroll_private_oram_mutation_state_v2(&enrollment)
+            .unwrap_err();
+        assert!(
+            enrollment_error
+                .to_string()
+                .contains("conflicts with active external recovery")
+        );
+        assert!(
+            recovery_first
+                .private_oram_mutation_state(&fixture.key)
+                .is_none()
+        );
+
+        let enrollment_first_dir = tempfile::tempdir().unwrap();
+        let mut enrollment_first =
+            Persistent::load_or_init(enrollment_first_dir.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_test_capability_floor(&mut enrollment_first);
+        install_private_oram_unbound_genesis_epochs(&mut enrollment_first, &fixture);
+        enrollment_first
+            .enroll_private_oram_mutation_state_v2(&enrollment)
+            .unwrap();
+        let legacy_error = enrollment_first
+            .apply_private_oram_external_recovery(&legacy_begin)
+            .unwrap_err();
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("authority conflicts with mutation enrollment")
+        );
+        assert!(
+            enrollment_first
+                .private_oram_external_recovery(&legacy_begin.recovery.key)
+                .is_none()
+        );
+
+        let mutation_v2_begin = private_oram_external_recovery_begin_for_fixture(
+            &fixture,
+            PrivateOramExternalRecoveryAuthority::MutationV2,
+            103,
+        );
+        enrollment_first
+            .apply_private_oram_external_recovery(&mutation_v2_begin)
+            .unwrap();
+        assert_eq!(
+            enrollment_first
+                .private_oram_external_recovery(&mutation_v2_begin.recovery.key)
+                .and_then(|state| state.active_lease)
+                .map(|lease| lease.authority),
+            Some(PrivateOramExternalRecoveryAuthority::MutationV2)
+        );
+    }
+
+    #[test]
+    fn private_oram_snapshot_cross_checks_recovery_authority_and_enrollment() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        let begin = private_oram_external_recovery_begin_for_fixture(
+            &fixture,
+            PrivateOramExternalRecoveryAuthority::LegacyV1,
+            111,
+        );
+        let recovery_key_digest = private_oram_external_recovery_key_digest(&begin.recovery.key);
+        let mut recovery = begin.recovery.new.unwrap();
+        let mut recoveries = HashMap::from([(recovery_key_digest, recovery.clone())]);
+
+        assert!(
+            Persistent::validate_private_oram_snapshot_state(
+                &persistent.private_oram_epochs,
+                &persistent.private_oram_session_leases,
+                &persistent.private_oram_layouts,
+                &recoveries,
+                &persistent.private_oram_mutation_states,
+                &persistent.private_oram_mutation_lease_slots,
+                None,
+            )
+            .is_err()
+        );
+
+        recovery.active_lease.as_mut().unwrap().authority =
+            PrivateOramExternalRecoveryAuthority::MutationV2;
+        recoveries.values_mut().next().unwrap().active_lease = recovery.active_lease.clone();
+        Persistent::validate_private_oram_snapshot_state(
+            &persistent.private_oram_epochs,
+            &persistent.private_oram_session_leases,
+            &persistent.private_oram_layouts,
+            &recoveries,
+            &persistent.private_oram_mutation_states,
+            &persistent.private_oram_mutation_lease_slots,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            Persistent::validate_private_oram_snapshot_state(
+                &persistent.private_oram_epochs,
+                &persistent.private_oram_session_leases,
+                &persistent.private_oram_layouts,
+                &recoveries,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_mutation_genesis_enrollment_rejects_stale_epoch_and_missing_capability_floor() {
+        let fixture = private_oram_mutation_fixture();
+        let operation = private_oram_mutation_genesis_enrollment(&fixture);
+
+        let stale_dir = tempfile::tempdir().unwrap();
+        let mut stale = Persistent::load_or_init(stale_dir.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_test_capability_floor(&mut stale);
+        install_private_oram_unbound_genesis_epochs(&mut stale, &fixture);
+        stale
+            .compare_and_swap_private_oram_epoch(&CompareAndSwapPrivateOramEpoch {
+                key: fixture.hnsw_key.clone(),
+                expected: Some(PrivateOramConsensusEpoch {
+                    writeback_digest: None,
+                    ..fixture.old_state.indexes[0].epoch.clone()
+                }),
+                new: PrivateOramConsensusEpoch {
+                    index_epoch: fixture.old_state.indexes[0].epoch.index_epoch + 1,
+                    root_hash: test_digest(92),
+                    writeback_digest: None,
+                },
+            })
+            .unwrap();
+        let stale_error = stale
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap_err();
+        assert!(stale_error.to_string().contains("precondition failed"));
+        assert!(stale.private_oram_mutation_state(&fixture.key).is_none());
+        assert!(stale.private_oram_layout(&fixture.layout_key).is_none());
+
+        let inactive_dir = tempfile::tempdir().unwrap();
+        let mut inactive =
+            Persistent::load_or_init(inactive_dir.path(), true, false, Some(7)).unwrap();
+        install_private_oram_unbound_genesis_epochs(&mut inactive, &fixture);
+        let inactive_error = inactive
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap_err();
+        assert!(
+            inactive_error
+                .to_string()
+                .contains("requires the active cluster capability floor")
+        );
+        assert!(inactive.private_oram_mutation_state(&fixture.key).is_none());
+        assert!(inactive.private_oram_layout(&fixture.layout_key).is_none());
+
+        install_private_oram_mutation_test_capability_floor(&mut inactive);
+        inactive
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap();
+        assert_eq!(
+            inactive.private_oram_mutation_state(&fixture.key),
+            Some(fixture.old_state.clone())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_mutation_genesis_enrollment_exact_replay_survives_active_capability_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let operation = private_oram_mutation_genesis_enrollment(&fixture);
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(11)).unwrap();
+        install_private_oram_mutation_test_capability_floor(&mut persistent);
+        install_private_oram_unbound_genesis_epochs(&mut persistent, &fixture);
+        persistent
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap();
+        persistent
+            .enroll_private_oram_mutation_state_v2(&operation)
+            .unwrap();
+        let mut changed = operation.clone();
+        changed.state.signed_state_digest = test_digest(93);
+        let error = persistent
+            .enroll_private_oram_mutation_state_v2(&changed)
+            .unwrap_err();
+        assert!(error.to_string().contains("precondition failed"));
+    }
+
     #[test]
     fn private_oram_activation_authority_cas_is_store_bound_stale_safe_and_persistent() {
         let (_, trust_anchor, bundle) = private_oram_activation_authority_fixture_v1_for_test();
@@ -7751,6 +8845,376 @@ mod tests {
                 .unwrap()
                 .bundle(),
             &successor,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_authority_upgrades_an_actual_legacy_wire_7_floor_without_rewriting_it() {
+        use crate::content_manager::consensus::private_oram_mutation_cleanup::format::{
+            LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON, LEGACY_WIRE_7_FORMAT_FLOOR_JSON,
+        };
+        use crate::content_manager::private_oram_mutation_journal::{
+            create_private_directory, secure_open_options,
+        };
+
+        let (key, trust_anchor, mut genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        genesis.manifest.required_binary_capability_digest =
+            PRIVATE_ORAM_LEGACY_WIRE_7_CAPABILITY_DIGEST.to_string();
+        genesis = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            genesis.manifest.authority_key_epoch,
+            genesis.manifest,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = Persistent::load_or_init(temp.path(), true, false, Some(11)).unwrap();
+        state.set_unapplied_entries(1, 4).unwrap();
+        for _ in 0..4 {
+            state.entry_applied().unwrap();
+        }
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        state
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
+        drop(state);
+
+        // Install the independent historical bytes, including the old snapshot-independent
+        // checkpoint. Going through the current constructor would conceal both codec regressions.
+        let state_path = temp.path().join(STATE_FILE_NAME);
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let legacy_floor: serde_json::Value =
+            serde_json::from_str(LEGACY_WIRE_7_FORMAT_FLOOR_JSON).unwrap();
+        encoded["private_oram_mutation_format_floor"] = legacy_floor.clone();
+        fs::write(&state_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        let floor_directory = temp.path().join("private_oram_mutation_floor_v2");
+        create_private_directory(&floor_directory).unwrap();
+        let checkpoint_path = floor_directory.join("stable.json");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        secure_open_options(&mut options, true);
+        options
+            .open(&checkpoint_path)
+            .unwrap()
+            .write_all(LEGACY_WIRE_7_FLOOR_CHECKPOINT_JSON.as_bytes())
+            .unwrap();
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+
+        for _ in 0..2 {
+            let mut loaded = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &genesis,
+            )
+            .unwrap();
+            loaded.save().unwrap();
+            assert_eq!(
+                serde_json::to_value(loaded.private_oram_mutation_format_floor.as_ref().unwrap())
+                    .unwrap(),
+                legacy_floor
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        }
+        let mut successor_manifest = genesis.manifest.clone();
+        successor_manifest.registry_generation += 1;
+        successor_manifest.parent_manifest_digest = Some(
+            qdrant_sec::private_oram_activation_authority_manifest_digest_v1(&genesis.manifest)
+                .unwrap(),
+        );
+        successor_manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            successor_manifest.authority_key_epoch,
+            successor_manifest,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut upgraded = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &successor,
+            )
+            .unwrap();
+            upgraded.save().unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    upgraded
+                        .private_oram_mutation_format_floor
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap(),
+                legacy_floor
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            let authority =
+                serde_json::to_value(upgraded.private_oram_activation_authority.as_ref().unwrap())
+                    .unwrap();
+            assert_eq!(
+                authority["capability_upgrade"]["predecessor"],
+                serde_json::to_value(&genesis).unwrap()
+            );
+            assert_eq!(
+                authority["capability_upgrade"]["format_floor_digest"],
+                legacy_floor["floor_digest"]
+            );
+        }
+        let saved = fs::read(&state_path).unwrap();
+        let mut third_manifest = successor.manifest.clone();
+        third_manifest.registry_generation += 1;
+        third_manifest.parent_manifest_digest = Some(
+            qdrant_sec::private_oram_activation_authority_manifest_digest_v1(&successor.manifest)
+                .unwrap(),
+        );
+        third_manifest.required_binary_capability_digest = test_digest(92);
+        let third = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &key,
+            third_manifest.authority_key_epoch,
+            third_manifest,
+        )
+        .unwrap();
+        assert!(
+            Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+                &third,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot rotate before its capability upgrade completes")
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), saved);
+        let valid: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        let mut missing = valid.clone();
+        missing["private_oram_activation_authority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_upgrade");
+        let mut wrong_floor = valid.clone();
+        wrong_floor["private_oram_activation_authority"]["capability_upgrade"]["format_floor_digest"] =
+            serde_json::json!(test_digest(93));
+        let mut forged = valid.clone();
+        forged["private_oram_activation_authority"]["capability_upgrade"]["predecessor"]["signature"]
+            ["sig"] = serde_json::json!(BASE64URL_NOPAD.encode(&[93; 64]));
+        let mut absent_authority = valid;
+        absent_authority
+            .as_object_mut()
+            .unwrap()
+            .remove("private_oram_activation_authority");
+        for invalid in [missing, wrong_floor, forged, absent_authority] {
+            fs::write(&state_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(
+                Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                    temp.path(),
+                    true,
+                    false,
+                    Some(11),
+                    &trust_anchor,
+                    &successor,
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        }
+        fs::write(&state_path, saved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_authority_capability_upgrade_survives_restart_before_prepare() {
+        let (authority_key, trust_anchor, genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        // This synthetic floor helper has no pending activation proof. Finish its epochs before
+        // installing authority, which makes every incomplete floor require that real proof.
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            &mut first,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION - 1,
+            &genesis.manifest.required_binary_capability_digest,
+        );
+        let expected = first
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        first
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
+        let old_floor = first.private_oram_mutation_format_floor.clone().unwrap();
+        let old_authority = first.private_oram_activation_authority.clone().unwrap();
+        drop(first);
+
+        let mut manifest = genesis.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(old_authority.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let mut previous_authority = None;
+        for _ in 0..2 {
+            let restarted = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                temp.path(),
+                true,
+                false,
+                Some(7),
+                &trust_anchor,
+                &successor,
+            )
+            .unwrap();
+            assert_eq!(
+                restarted.private_oram_mutation_format_floor.as_ref(),
+                Some(&old_floor)
+            );
+            assert!(restarted.private_oram_mutation_activation_pending.is_none());
+            let authority = restarted
+                .private_oram_activation_authority
+                .as_ref()
+                .unwrap();
+            assert_eq!(authority.bundle(), &successor);
+            let encoded = serde_json::to_value(authority).unwrap();
+            assert_eq!(
+                encoded["capability_upgrade"]["predecessor"],
+                serde_json::to_value(&genesis).unwrap()
+            );
+            assert_eq!(
+                encoded["capability_upgrade"]["format_floor_digest"],
+                old_floor.floor_digest()
+            );
+            if let Some(previous) = &previous_authority {
+                assert_eq!(authority, previous);
+            }
+            previous_authority = Some(authority.clone());
+        }
+
+        let installed = previous_authority.unwrap();
+        let mut manifest = successor.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(installed.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(92);
+        let third = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let before = fs::read(temp.path().join(STATE_FILE_NAME)).unwrap();
+        let error = Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &third,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rotate before its capability upgrade completes")
+        );
+        assert_eq!(fs::read(temp.path().join(STATE_FILE_NAME)).unwrap(), before);
+
+        let saved: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let mut missing = saved.clone();
+        missing["private_oram_activation_authority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_upgrade");
+        let mut wrong_floor = saved.clone();
+        wrong_floor["private_oram_activation_authority"]["capability_upgrade"]["format_floor_digest"] =
+            serde_json::json!(test_digest(93));
+        let mut forged_predecessor = saved.clone();
+        forged_predecessor["private_oram_activation_authority"]["capability_upgrade"]["predecessor"]
+            ["signature"]["sig"] = serde_json::json!(BASE64URL_NOPAD.encode(&[93; 64]));
+        for invalid in [missing, wrong_floor, forged_predecessor] {
+            fs::write(
+                temp.path().join(STATE_FILE_NAME),
+                serde_json::to_vec(&invalid).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+                    temp.path(),
+                    true,
+                    false,
+                    Some(7),
+                    &trust_anchor,
+                    &successor,
+                )
+                .is_err()
+            );
+        }
+        fs::write(temp.path().join(STATE_FILE_NAME), &before).unwrap();
+        Persistent::load_or_init_with_private_oram_mutation_v2_activation(
+            temp.path(),
+            true,
+            false,
+            Some(7),
+            &trust_anchor,
+            &successor,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_authority_capability_rotation_requires_an_older_protocol_floor() {
+        let (authority_key, trust_anchor, genesis) =
+            private_oram_activation_authority_fixture_v1_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_test_capability_floor_with_protocol(
+            &mut state,
+            PRIVATE_ORAM_CONSENSUS_WIRE_PROTOCOL_VERSION,
+            &genesis.manifest.required_binary_capability_digest,
+        );
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        state
+            .compare_and_swap_private_oram_activation_authority(expected, &genesis, &trust_anchor)
+            .unwrap();
+        let installed = state.private_oram_activation_authority.clone().unwrap();
+        let mut manifest = genesis.manifest.clone();
+        manifest.registry_generation += 1;
+        manifest.parent_manifest_digest = Some(installed.manifest_digest().to_string());
+        manifest.required_binary_capability_digest = test_digest(91);
+        let successor = qdrant_sec::package_private_oram_activation_authority_manifest_v1(
+            &authority_key,
+            manifest.authority_key_epoch,
+            manifest,
+        )
+        .unwrap();
+        let expected = state
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        let error = state
+            .compare_and_swap_private_oram_activation_authority(expected, &successor, &trust_anchor)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an older fully enabled format floor")
+        );
+        assert_eq!(
+            state.private_oram_activation_authority.as_ref(),
+            Some(&installed)
         );
     }
 
@@ -8393,6 +9857,7 @@ mod tests {
         Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn enrollment_after_activation_initializes_and_activates_the_collection_authority() {
         let fixture = private_oram_mutation_fixture();
@@ -8488,6 +9953,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleting_a_collection_retains_records_pinned_by_an_authority_floor() {
         let temp = tempfile::tempdir().unwrap();
@@ -8562,6 +10028,7 @@ mod tests {
         Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn tagged_mutation_authority_survives_persistence_and_fences_legacy_reducers() {
         let temp = tempfile::tempdir().unwrap();
@@ -8703,6 +10170,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mutation_local_floor_rejects_raft_state_rollback_and_snapshot_downgrade() {
         let temp = tempfile::tempdir().unwrap();
@@ -8745,6 +10213,7 @@ mod tests {
             persistent
                 .validate_private_oram_mutation_floor_for_snapshot(
                     Some(&mutation_format_floor(1, false, 1)),
+                    &persistent.private_oram_mutation_states,
                     &legacy_wires,
                     1,
                 )
@@ -8752,7 +10221,22 @@ mod tests {
         );
         assert!(
             persistent
-                .validate_private_oram_mutation_floor_for_snapshot(None, &HashMap::new(), 0)
+                .validate_private_oram_mutation_floor_for_snapshot(
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    0,
+                )
+                .is_err()
+        );
+        assert!(
+            persistent
+                .validate_private_oram_mutation_floor_for_snapshot(
+                    persistent.private_oram_mutation_format_floor.as_ref(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    11,
+                )
                 .is_err()
         );
 
@@ -8768,6 +10252,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mutation_local_floor_pending_recovers_exact_old_and_new_raft_images() {
         for publish_new_state in [false, true] {
@@ -8786,6 +10271,7 @@ mod tests {
             let checkpoint = plan_private_oram_local_floor_for_persistent_state(
                 None,
                 persistent.private_oram_mutation_format_floor.as_ref(),
+                &persistent.private_oram_mutation_states,
                 &persistent.private_oram_mutation_lease_slots,
                 persistent.private_oram_applied_index(),
             )
@@ -8931,29 +10417,32 @@ mod tests {
     }
 
     #[test]
-    fn private_oram_mutation_enrollment_fences_standalone_index_operations() {
+    fn private_oram_mutation_enrollment_allows_sessions_but_fences_state_changes() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = private_oram_mutation_fixture();
         let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
         install_private_oram_mutation_fixture(&mut persistent, &fixture);
 
-        let session_error = persistent
+        let session_lease = PrivateOramSessionLease {
+            owner_peer_id: 7,
+            lease_id_hash: test_digest(70),
+            issued_at_unix: 100,
+            expires_at_unix: 160,
+        };
+        persistent
             .compare_and_swap_private_oram_session_lease(&CompareAndSwapPrivateOramSessionLease {
                 key: fixture.hnsw_key.clone(),
                 expected: None,
-                new: Some(PrivateOramSessionLease {
-                    owner_peer_id: 7,
-                    lease_id_hash: test_digest(70),
-                    issued_at_unix: 100,
-                    expires_at_unix: 160,
-                }),
+                new: Some(session_lease.clone()),
             })
-            .unwrap_err();
-        assert!(
-            session_error
-                .to_string()
-                .contains("enrolled v2 mutation state")
-        );
+            .unwrap();
+        persistent
+            .compare_and_swap_private_oram_session_lease(&CompareAndSwapPrivateOramSessionLease {
+                key: fixture.hnsw_key.clone(),
+                expected: Some(session_lease),
+                new: None,
+            })
+            .unwrap();
 
         let epoch_error = persistent
             .compare_and_swap_private_oram_epoch(&CompareAndSwapPrivateOramEpoch {
@@ -8998,6 +10487,7 @@ mod tests {
                 backup_generation: 1,
                 issued_at_unix: 100,
                 expires_at_unix: 160,
+                authority: PrivateOramExternalRecoveryAuthority::MutationV2,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),
@@ -9041,7 +10531,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(recovery_error.to_string().contains("active mutation"));
+        assert!(recovery_error.to_string().contains("unsettled mutation"));
     }
 
     #[test]
@@ -9294,6 +10784,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_two_phase_activation_is_atomic_restart_safe_and_irreversible() {
         let temp = tempfile::tempdir().unwrap();
@@ -9496,6 +10987,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_material_admission_manifest_is_one_replayable_patch() {
         let temp = tempfile::tempdir().unwrap();
@@ -9684,6 +11176,31 @@ mod tests {
             .private_oram_mutation_v2_aggregate_digest(&fixture.key)
             .unwrap();
         assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    fixture.preparing_slot.active.as_ref().unwrap(),
+                    expected_recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            Some(true)
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_rejected_admission_acknowledgement(
+                    &fixture.key,
+                    fixture.preparing_slot.active.as_ref().unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
             persistent.private_oram_mutation_state(&fixture.key),
             Some(fixture.old_state.clone())
         );
@@ -9762,6 +11279,7 @@ mod tests {
         assert_eq!(reloaded.last_applied_entry(), Some(barrier.base_index + 7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_rejected_admission_wins_exact_cas_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -9880,6 +11398,33 @@ mod tests {
             lease.clone(),
             recovery_manifest_canonical_json.clone(),
         );
+        let candidate = persistent
+            .private_oram_mutation_v2_preadmission_recovery_candidate(&fixture.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.key(), &fixture.key);
+        assert_eq!(candidate.lease(), &lease);
+        assert_eq!(candidate.manifest(), &recovery_manifest);
+        let snapshot = candidate.prepared_snapshot().unwrap();
+        assert_eq!(snapshot.reservation(), &reservation);
+        assert_eq!(snapshot.prepared(), &recovery_manifest);
+        assert_eq!(snapshot.expected_aggregate_digest(), admission_expected);
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap(),
+            vec![candidate]
+        );
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    &lease,
+                    recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            None
+        );
         let rejection = ApplyPrivateOramMutationMaterialV2::admission_rejected(
             fixture.key.clone(),
             admission_expected.clone(),
@@ -9901,6 +11446,30 @@ mod tests {
             .private_oram_mutation_v2_aggregate_digest(&fixture.key)
             .unwrap();
         assert_ne!(aggregate_after_rejection, admission_expected);
+        assert_eq!(
+            persistent
+                .private_oram_mutation_v2_retained_admission_outcome(
+                    &fixture.key,
+                    &lease,
+                    recovery_manifest.manifest_digest(),
+                )
+                .unwrap(),
+            Some(false)
+        );
+        assert!(
+            persistent
+                .private_oram_mutation_v2_preadmission_recovery_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        // Historical V2 reservations have no signed owner-resolution ACK, so absence of
+        // pending work alone must not authorize local runtime retirement.
+        assert!(
+            persistent
+                .private_oram_mutation_v2_rejected_admission_acknowledgement(&fixture.key, &lease,)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             persistent.private_oram_mutation_lease_slot(&fixture.key),
             Some(fixture.genesis_slot.clone())
@@ -9981,6 +11550,7 @@ mod tests {
         assert_eq!(reloaded.last_applied_entry(), Some(barrier.base_index + 7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v2_reservation_fences_other_transitions_and_abort_replays_after_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -10177,6 +11747,7 @@ mod tests {
         assert_eq!(reloaded.current_unapplied_entry(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_enrollment_steps_walk_the_layout_roster_to_reservable_checkpoints() {
         use qdrant_sec::{
@@ -10347,6 +11918,7 @@ mod tests {
         assert!(private_oram_owner_enrollment_next_step_v1(&table, &[7]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_v3_reservation_challenge_finalizes_after_restart() {
         use qdrant_sec::{
@@ -10700,6 +12272,7 @@ mod tests {
         assert_eq!(durable.last_applied_entry(), Some(barrier.base_index + 8));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_oram_recovery_readiness_apply_requires_authority_pinned_owner_signers() {
         fn apply_readiness_with_peer_11_seed(
@@ -11232,6 +12805,353 @@ mod tests {
         );
         assert_eq!(reloaded.current_unapplied_entry(), None);
         assert_eq!(reloaded.last_applied_entry(), Some(52));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_v2_consensus_commit_publication_fault_never_exposes_a_mixed_pair() {
+        let prepare_commit = || {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = private_oram_mutation_fixture();
+            let barrier = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+            let (_, trust_anchor, bundle) = private_oram_activation_authority_fixture_v1_for_test();
+            let mut persistent =
+                Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                    temp.path(),
+                    true,
+                    false,
+                    Some(11),
+                    &trust_anchor,
+                )
+                .unwrap();
+            let expected = persistent
+                .private_oram_activation_authority_at_read(&trust_anchor)
+                .unwrap();
+            persistent
+                .compare_and_swap_private_oram_activation_authority(
+                    expected,
+                    &bundle,
+                    &trust_anchor,
+                )
+                .unwrap();
+            persistent
+                .set_peer_address_by_id(barrier.peer_addresses.clone())
+                .unwrap();
+            let commit_index = barrier.base_index + 10;
+            persistent
+                .apply_state_update(|state| {
+                    state.conf_state = barrier.conf_state.clone();
+                    state.hard_state.term = barrier.current_term;
+                    state.hard_state.commit = commit_index;
+                })
+                .unwrap();
+            install_private_oram_mutation_fixture(&mut persistent, &fixture);
+            persistent
+                .set_unapplied_entries(barrier.base_index + 1, commit_index)
+                .unwrap();
+
+            for (offset, operation) in [
+                (1, &barrier.prepare_operation),
+                (2, &barrier.enable_operation),
+            ] {
+                assert!(matches!(
+                    persistent
+                        .activate_private_oram_mutation_v2_at_applied_entry(
+                            operation,
+                            barrier.current_term,
+                            barrier.base_index + offset,
+                            barrier.base_entry_term,
+                        )
+                        .unwrap(),
+                    PrivateOramMutationAtEntryOutcome::Applied
+                ));
+            }
+
+            let reservation_context = persistent
+                .private_oram_mutation_v2_append_authority_context(&fixture.key)
+                .unwrap();
+            let reservation_expected = reservation_context.expected_aggregate_digest().to_string();
+            let lease = fixture.preparing_slot.active.clone().unwrap();
+            let (reservation, recovery_manifest) = private_oram_mutation_append_fixture_for_test(
+                &lease,
+                reservation_context,
+                barrier.current_term,
+                &fixture.layout.owner_peer_ids,
+                persistent
+                    .private_oram_activation_authority_locator()
+                    .unwrap(),
+            );
+            let recovery_manifest_canonical_json =
+                encode_private_oram_mutation_admission_recovery_manifest_v2(&recovery_manifest)
+                    .unwrap();
+            let reserve = ApplyPrivateOramMutationMaterialV2::append_reservation(
+                fixture.key.clone(),
+                reservation_expected,
+                encode_private_oram_mutation_append_reservation_v2(&reservation).unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &reserve,
+                        barrier.current_term,
+                        barrier.base_index + 3,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+
+            let prepare = ApplyPrivateOramMutationMaterialV2::append_prepared(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                recovery_manifest_canonical_json.clone(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &prepare,
+                        barrier.current_term,
+                        barrier.base_index + 4,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+
+            let admission = ApplyPrivateOramMutationMaterialV2::admission(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                lease.clone(),
+                recovery_manifest_canonical_json,
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &admission,
+                        barrier.current_term,
+                        barrier.base_index + 5,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+
+            let point_stage = private_oram_mutation_parent_watermark_expectation_for_test(
+                &lease,
+                test_digest(80),
+                vec![test_digest(81), test_digest(82), test_digest(83)],
+            )
+            .unwrap();
+            for sequence in 1..=3 {
+                let watermark =
+                    truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+                        &point_stage,
+                        sequence,
+                    )
+                    .unwrap();
+                let parent_progress = ApplyPrivateOramMutationMaterialV2::parent_progress(
+                    fixture.key.clone(),
+                    persistent
+                        .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                        .unwrap(),
+                    encode_private_oram_mutation_parent_watermark_expectation_v2(&watermark)
+                        .unwrap(),
+                );
+                assert!(matches!(
+                    persistent
+                        .apply_private_oram_mutation_material_v2_at_applied_entry(
+                            &parent_progress,
+                            barrier.current_term,
+                            barrier.base_index + 5 + sequence,
+                        )
+                        .unwrap(),
+                    PrivateOramMutationAtEntryOutcome::Applied
+                ));
+            }
+
+            let activation = persistent
+                .private_oram_activation_authority
+                .as_ref()
+                .unwrap()
+                .locator();
+            let capsule_entries = vec![(7, test_digest(91)), (9, test_digest(93))];
+            let capsule_set_digest =
+                private_oram_owner_capsule_set_digest_v2(&capsule_entries).unwrap();
+            let owner_evidence = capsule_entries
+                .into_iter()
+                .map(|(owner_peer_id, capsule_digest)| {
+                    let receipt = private_oram_owner_recovery_capsule_install_receipt_for_test(
+                        owner_peer_id,
+                        point_stage.watermark().descriptor_digest().to_string(),
+                        capsule_digest,
+                        capsule_set_digest.clone(),
+                        activation.clone(),
+                    )
+                    .unwrap();
+                    owner_capsule_install_evidence_for_test(
+                        &fixture.key.collection_id,
+                        &lease.mutation_id,
+                        receipt,
+                        if owner_peer_id == 7 { 8 } else { 19 },
+                    )
+                })
+                .collect();
+            let readiness = derive_private_oram_mutation_recovery_capsules_ready_v2(
+                &point_stage,
+                activation,
+                owner_evidence,
+            )
+            .unwrap();
+            let recovery_ready = ApplyPrivateOramMutationMaterialV2::recovery_capsules_ready(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                encode_private_oram_mutation_recovery_capsules_ready_v2(&readiness).unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &recovery_ready,
+                        barrier.current_term,
+                        barrier.base_index + 9,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+
+            let commit = ApplyPrivateOramMutationMaterialV2::consensus_commit(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                lease.generation,
+                fixture.new_state.clone(),
+            );
+            assert_eq!(
+                persistent.private_oram_mutation_state(&fixture.key),
+                Some(fixture.old_state.clone())
+            );
+            assert_eq!(
+                persistent.private_oram_mutation_lease_slot(&fixture.key),
+                Some(fixture.preparing_slot.clone())
+            );
+            assert_eq!(persistent.current_unapplied_entry(), Some(commit_index));
+
+            (
+                temp,
+                persistent,
+                fixture,
+                trust_anchor,
+                commit,
+                barrier.current_term,
+                commit_index,
+            )
+        };
+
+        let assert_precommit_pair =
+            |persistent: &Persistent, fixture: &PrivateOramMutationFixture| {
+                assert_eq!(
+                    persistent.private_oram_mutation_state(&fixture.key),
+                    Some(fixture.old_state.clone())
+                );
+                assert_eq!(
+                    persistent.private_oram_mutation_lease_slot(&fixture.key),
+                    Some(fixture.preparing_slot.clone())
+                );
+            };
+        let assert_committed_pair =
+            |persistent: &Persistent, fixture: &PrivateOramMutationFixture| {
+                assert_eq!(
+                    persistent.private_oram_mutation_state(&fixture.key),
+                    Some(fixture.new_state.clone())
+                );
+                assert_eq!(
+                    persistent.private_oram_mutation_lease_slot(&fixture.key),
+                    Some(fixture.committed_slot.clone())
+                );
+            };
+
+        let (temp, mut persistent, fixture, trust_anchor, commit, term, commit_index) =
+            prepare_commit();
+        persistent.path = temp.path().join("missing-parent").join(STATE_FILE_NAME);
+        let patch = persistent
+            .prepare_private_oram_mutation_complete_patch(
+                Some(commit_index),
+                PrivateOramMutationCommand::ApplyMaterialV2 {
+                    operation: &commit,
+                    entry_term: term,
+                    entry_index: commit_index,
+                },
+            )
+            .unwrap();
+        persistent
+            .commit_private_oram_mutation_complete_patch_with_backend(
+                patch,
+                &FilesystemPersistentSaveBackend,
+            )
+            .unwrap_err();
+        assert!(!persistent.save_indeterminate.load(Ordering::Acquire));
+        assert_precommit_pair(&persistent, &fixture);
+        assert_eq!(persistent.current_unapplied_entry(), Some(commit_index));
+        drop(persistent);
+
+        let reloaded_precommit =
+            Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+            )
+            .unwrap();
+        assert_precommit_pair(&reloaded_precommit, &fixture);
+        assert_eq!(
+            reloaded_precommit.current_unapplied_entry(),
+            Some(commit_index)
+        );
+
+        let (temp, mut persistent, fixture, trust_anchor, commit, term, commit_index) =
+            prepare_commit();
+        let patch = persistent
+            .prepare_private_oram_mutation_complete_patch(
+                Some(commit_index),
+                PrivateOramMutationCommand::ApplyMaterialV2 {
+                    operation: &commit,
+                    entry_term: term,
+                    entry_index: commit_index,
+                },
+            )
+            .unwrap();
+        let error = persistent
+            .commit_private_oram_mutation_complete_patch_with_backend(
+                patch,
+                &ParentSyncFaultBackend::new(PERSISTENT_PARENT_SYNC_ATTEMPTS),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(PERSISTENT_SAVE_INDETERMINATE_MESSAGE)
+        );
+        assert!(persistent.save_indeterminate.load(Ordering::Acquire));
+        assert_precommit_pair(&persistent, &fixture);
+        assert_eq!(persistent.current_unapplied_entry(), Some(commit_index));
+        drop(persistent);
+
+        let reloaded_commit =
+            Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+            )
+            .unwrap();
+        assert_committed_pair(&reloaded_commit, &fixture);
+        assert_eq!(reloaded_commit.current_unapplied_entry(), None);
+        assert_eq!(reloaded_commit.last_applied_entry(), Some(commit_index));
     }
 
     #[test]
@@ -12751,6 +14671,7 @@ mod tests {
             backup_generation: 7,
             issued_at_unix: 100,
             expires_at_unix: 160,
+            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
             install_intent_digest: None,
             phase: PrivateOramExternalRecoveryLeasePhase::Staging,
         };
@@ -12980,6 +14901,505 @@ mod tests {
     }
 
     #[test]
+    fn private_oram_external_recovery_unsettled_fence_is_collection_scoped_for_active_leases() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let mut persistent = Persistent::load_or_init(temp.path(), true, false, Some(7)).unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        persistent
+            .compare_and_swap_private_oram_mutation_lease(&private_oram_mutation_acquire(&fixture))
+            .unwrap();
+
+        let recovery = |collection_id: String,
+                        discriminator: u8,
+                        authority: PrivateOramExternalRecoveryAuthority| {
+            CompareAndSwapPrivateOramExternalRecovery {
+                key: PrivateOramExternalRecoveryKey { collection_id },
+                expected: None,
+                new: Some(PrivateOramExternalRecoveryState {
+                    committed_backup_generation: 0,
+                    committed_checkpoint_digest: None,
+                    committed_install_intent_digest: None,
+                    active_lease: Some(PrivateOramExternalRecoveryLease {
+                        owner_peer_id: 7,
+                        operation_id_hash: test_digest(discriminator),
+                        checkpoint_digest: test_digest(discriminator.wrapping_add(1)),
+                        backup_generation: 1,
+                        issued_at_unix: 100,
+                        expires_at_unix: 160,
+                        authority,
+                        install_intent_digest: None,
+                        phase: PrivateOramExternalRecoveryLeasePhase::Staging,
+                    }),
+                }),
+            }
+        };
+
+        let same_collection = recovery(
+            fixture.key.collection_id.clone(),
+            160,
+            PrivateOramExternalRecoveryAuthority::MutationV2,
+        );
+        let conflict = persistent
+            .compare_and_swap_private_oram_external_recovery(&same_collection)
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("conflicts with unsettled mutation"));
+
+        let other_collection = recovery(
+            "collection-uuid-unrelated".to_string(),
+            162,
+            PrivateOramExternalRecoveryAuthority::LegacyV1,
+        );
+        persistent
+            .compare_and_swap_private_oram_external_recovery(&other_collection)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_oram_external_recovery_waits_for_durable_archive_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = private_oram_mutation_fixture();
+        let barrier = private_oram_mutation_activation_barrier_fixture_v2_for_test();
+        let (_, trust_anchor, bundle) = private_oram_activation_authority_fixture_v1_for_test();
+        let mut persistent =
+            Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+            )
+            .unwrap();
+        let expected = persistent
+            .private_oram_activation_authority_at_read(&trust_anchor)
+            .unwrap();
+        persistent
+            .compare_and_swap_private_oram_activation_authority(expected, &bundle, &trust_anchor)
+            .unwrap();
+        persistent
+            .set_peer_address_by_id(barrier.peer_addresses.clone())
+            .unwrap();
+        persistent
+            .apply_state_update(|state| {
+                state.conf_state = barrier.conf_state.clone();
+                state.hard_state.term = barrier.current_term;
+                state.hard_state.commit = barrier.base_index + 18;
+            })
+            .unwrap();
+        install_private_oram_mutation_fixture(&mut persistent, &fixture);
+        persistent
+            .set_unapplied_entries(barrier.base_index + 1, barrier.base_index + 18)
+            .unwrap();
+
+        for (offset, operation) in [
+            (1, &barrier.prepare_operation),
+            (2, &barrier.enable_operation),
+        ] {
+            assert!(matches!(
+                persistent
+                    .activate_private_oram_mutation_v2_at_applied_entry(
+                        operation,
+                        barrier.current_term,
+                        barrier.base_index + offset,
+                        barrier.base_entry_term,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+        }
+
+        let reservation_context = persistent
+            .private_oram_mutation_v2_append_authority_context(&fixture.key)
+            .unwrap();
+        let reservation_expected = reservation_context.expected_aggregate_digest().to_string();
+        let lease = fixture.preparing_slot.active.clone().unwrap();
+        let (reservation, recovery_manifest) = private_oram_mutation_append_fixture_for_test(
+            &lease,
+            reservation_context,
+            barrier.current_term,
+            &fixture.layout.owner_peer_ids,
+            persistent
+                .private_oram_activation_authority_locator()
+                .unwrap(),
+        );
+        let recovery_manifest_canonical_json =
+            encode_private_oram_mutation_admission_recovery_manifest_v2(&recovery_manifest)
+                .unwrap();
+        let reserve = ApplyPrivateOramMutationMaterialV2::append_reservation(
+            fixture.key.clone(),
+            reservation_expected,
+            encode_private_oram_mutation_append_reservation_v2(&reservation).unwrap(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &reserve,
+                    barrier.current_term,
+                    barrier.base_index + 3,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let prepare = ApplyPrivateOramMutationMaterialV2::append_prepared(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            recovery_manifest_canonical_json.clone(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &prepare,
+                    barrier.current_term,
+                    barrier.base_index + 4,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let admission = ApplyPrivateOramMutationMaterialV2::admission(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            lease.clone(),
+            recovery_manifest_canonical_json,
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &admission,
+                    barrier.current_term,
+                    barrier.base_index + 5,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+
+        let terminal = private_oram_mutation_parent_watermark_expectation_for_test(
+            &lease,
+            test_digest(170),
+            (171..=177).map(test_digest).collect(),
+        )
+        .unwrap();
+        for sequence in 1..=3 {
+            let watermark = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+                &terminal, sequence,
+            )
+            .unwrap();
+            let progress = ApplyPrivateOramMutationMaterialV2::parent_progress(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                encode_private_oram_mutation_parent_watermark_expectation_v2(&watermark).unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &progress,
+                        barrier.current_term,
+                        barrier.base_index + 5 + sequence,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+        }
+        let point_stage =
+            truncate_private_oram_mutation_parent_watermark_expectation_for_test(&terminal, 3)
+                .unwrap();
+        let activation = persistent
+            .private_oram_activation_authority
+            .as_ref()
+            .unwrap()
+            .locator();
+        let capsule_entries = vec![(7, test_digest(178)), (9, test_digest(179))];
+        let capsule_set_digest =
+            private_oram_owner_capsule_set_digest_v2(&capsule_entries).unwrap();
+        let owner_evidence = capsule_entries
+            .into_iter()
+            .map(|(owner_peer_id, capsule_digest)| {
+                let receipt = private_oram_owner_recovery_capsule_install_receipt_for_test(
+                    owner_peer_id,
+                    point_stage.watermark().descriptor_digest().to_string(),
+                    capsule_digest,
+                    capsule_set_digest.clone(),
+                    activation.clone(),
+                )
+                .unwrap();
+                owner_capsule_install_evidence_for_test(
+                    &fixture.key.collection_id,
+                    &lease.mutation_id,
+                    receipt,
+                    if owner_peer_id == 7 { 8 } else { 19 },
+                )
+            })
+            .collect();
+        let readiness = derive_private_oram_mutation_recovery_capsules_ready_v2(
+            &point_stage,
+            activation,
+            owner_evidence,
+        )
+        .unwrap();
+        let recovery_ready = ApplyPrivateOramMutationMaterialV2::recovery_capsules_ready(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            encode_private_oram_mutation_recovery_capsules_ready_v2(&readiness).unwrap(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &recovery_ready,
+                    barrier.current_term,
+                    barrier.base_index + 9,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let commit = ApplyPrivateOramMutationMaterialV2::consensus_commit(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            lease.generation,
+            fixture.new_state.clone(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &commit,
+                    barrier.current_term,
+                    barrier.base_index + 10,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        for sequence in 4..=7 {
+            let watermark = truncate_private_oram_mutation_parent_watermark_expectation_for_test(
+                &terminal, sequence,
+            )
+            .unwrap();
+            let progress = ApplyPrivateOramMutationMaterialV2::parent_progress(
+                fixture.key.clone(),
+                persistent
+                    .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                    .unwrap(),
+                encode_private_oram_mutation_parent_watermark_expectation_v2(&watermark).unwrap(),
+            );
+            assert!(matches!(
+                persistent
+                    .apply_private_oram_mutation_material_v2_at_applied_entry(
+                        &progress,
+                        barrier.current_term,
+                        barrier.base_index + 7 + sequence,
+                    )
+                    .unwrap(),
+                PrivateOramMutationAtEntryOutcome::Applied
+            ));
+        }
+
+        let committed_lease = fixture.committed_slot.active.clone().unwrap();
+        let committed_record_digest = match &committed_lease.phase {
+            PrivateOramMutationLeasePhase::ConsensusCommitted {
+                committed_record_digest,
+                ..
+            } => committed_record_digest.clone(),
+            _ => unreachable!(),
+        };
+        let cleanup = private_oram_cleanup_expectation_for_test(
+            persistent.private_oram_mutation_lease_slots
+                [&private_oram_mutation_key_digest(&fixture.key)]
+                .tagged_authority()
+                .unwrap()
+                .aggregate()
+                .unwrap()
+                .lifecycle(),
+            &committed_lease,
+            PrivateOramMutationClearOutcome::FinalizedOrReconciledAfterConsensusCommit,
+            committed_record_digest,
+            test_digest(180),
+            test_digest(181),
+        )
+        .unwrap();
+        let cleanup_witness = ApplyPrivateOramMutationMaterialV2::cleanup_witness(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            encode_private_oram_mutation_cleanup_expectation_v2(&cleanup).unwrap(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &cleanup_witness,
+                    barrier.current_term,
+                    barrier.base_index + 15,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let clear_pending = ApplyPrivateOramMutationMaterialV2::clear_pending(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+            test_digest(182),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &clear_pending,
+                    barrier.current_term,
+                    barrier.base_index + 16,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        let clear = ApplyPrivateOramMutationMaterialV2::clear(
+            fixture.key.clone(),
+            persistent
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+        );
+        assert!(matches!(
+            persistent
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &clear,
+                    barrier.current_term,
+                    barrier.base_index + 17,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        assert_eq!(
+            persistent
+                .private_oram_mutation_pending_acknowledgement_keys()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(persistent);
+
+        let mut reloaded =
+            Persistent::load_or_init_with_private_oram_activation_authority_trust_anchor(
+                temp.path(),
+                true,
+                false,
+                Some(11),
+                &trust_anchor,
+            )
+            .unwrap();
+        assert!(
+            reloaded
+                .private_oram_mutation_is_unsettled(&fixture.key.collection_id)
+                .unwrap()
+        );
+        assert!(reloaded.has_unsettled_private_oram_mutation().unwrap());
+
+        let acquired = PrivateOramExternalRecoveryState {
+            committed_backup_generation: 0,
+            committed_checkpoint_digest: None,
+            committed_install_intent_digest: None,
+            active_lease: Some(PrivateOramExternalRecoveryLease {
+                owner_peer_id: 7,
+                operation_id_hash: test_digest(183),
+                checkpoint_digest: test_digest(184),
+                backup_generation: 1,
+                issued_at_unix: 100,
+                expires_at_unix: 160,
+                authority: PrivateOramExternalRecoveryAuthority::MutationV2,
+                install_intent_digest: None,
+                phase: PrivateOramExternalRecoveryLeasePhase::Staging,
+            }),
+        };
+        let recovery = CompareAndSwapPrivateOramExternalRecovery {
+            key: PrivateOramExternalRecoveryKey {
+                collection_id: fixture.key.collection_id.clone(),
+            },
+            expected: None,
+            new: Some(acquired),
+        };
+        let layout = reloaded.private_oram_layout(&fixture.layout_key).unwrap();
+        let index_states = vec![
+            PrivateOramLayoutIndexStateBinding {
+                key: fixture.hnsw_key.clone(),
+                state: reloaded.private_oram_epoch(&fixture.hnsw_key).unwrap(),
+            },
+            PrivateOramLayoutIndexStateBinding {
+                key: fixture.result_key.clone(),
+                state: reloaded.private_oram_epoch(&fixture.result_key).unwrap(),
+            },
+        ];
+        let recovery_operation = PrivateOramExternalRecoveryOperation {
+            phase: PrivateOramExternalRecoveryPhase::Begin,
+            recovery: recovery.clone(),
+            layout,
+            index_states,
+        };
+        for conflict in [
+            reloaded
+                .compare_and_swap_private_oram_external_recovery(&recovery)
+                .unwrap_err(),
+            reloaded
+                .apply_private_oram_external_recovery(&recovery_operation)
+                .unwrap_err(),
+        ] {
+            assert!(
+                conflict
+                    .to_string()
+                    .contains("conflicts with unsettled mutation")
+            );
+        }
+
+        let mut unrelated_state = recovery.new.clone().unwrap();
+        unrelated_state.active_lease.as_mut().unwrap().authority =
+            PrivateOramExternalRecoveryAuthority::LegacyV1;
+        let unrelated_recovery = CompareAndSwapPrivateOramExternalRecovery {
+            key: PrivateOramExternalRecoveryKey {
+                collection_id: "collection-uuid-unrelated-pending".to_string(),
+            },
+            expected: None,
+            new: Some(unrelated_state),
+        };
+        reloaded
+            .compare_and_swap_private_oram_external_recovery(&unrelated_recovery)
+            .unwrap();
+
+        let acknowledgement = ApplyPrivateOramMutationMaterialV2::clear_acknowledgement(
+            fixture.key.clone(),
+            reloaded
+                .private_oram_mutation_v2_aggregate_digest(&fixture.key)
+                .unwrap(),
+        );
+        assert!(matches!(
+            reloaded
+                .apply_private_oram_mutation_material_v2_at_applied_entry(
+                    &acknowledgement,
+                    barrier.current_term,
+                    barrier.base_index + 18,
+                )
+                .unwrap(),
+            PrivateOramMutationAtEntryOutcome::Applied
+        ));
+        assert!(
+            !reloaded
+                .private_oram_mutation_is_unsettled(&fixture.key.collection_id)
+                .unwrap()
+        );
+        assert!(!reloaded.has_unsettled_private_oram_mutation().unwrap());
+        reloaded
+            .apply_private_oram_external_recovery(&recovery_operation)
+            .unwrap();
+        reloaded
+            .compare_and_swap_private_oram_external_recovery(&recovery)
+            .unwrap();
+    }
+
+    #[test]
     fn private_oram_external_recovery_lease_requires_expiry_for_takeover() {
         let key = PrivateOramExternalRecoveryKey {
             collection_id: "collection-uuid-1".to_string(),
@@ -12998,6 +15418,10 @@ mod tests {
             legacy_lease.phase,
             PrivateOramExternalRecoveryLeasePhase::Staging
         );
+        assert_eq!(
+            legacy_lease.authority,
+            PrivateOramExternalRecoveryAuthority::LegacyV1
+        );
         assert_eq!(legacy_lease.install_intent_digest, None);
 
         let lease = PrivateOramExternalRecoveryLease {
@@ -13007,6 +15431,7 @@ mod tests {
             backup_generation: 7,
             issued_at_unix: 100,
             expires_at_unix: 160,
+            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
             install_intent_digest: None,
             phase: PrivateOramExternalRecoveryLeasePhase::Staging,
         };
@@ -13024,6 +15449,7 @@ mod tests {
                 backup_generation: 8,
                 issued_at_unix: 159,
                 expires_at_unix: 219,
+                authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),
@@ -13054,6 +15480,26 @@ mod tests {
             new: Some(renewed),
         })
         .unwrap();
+
+        let authority_switch = PrivateOramExternalRecoveryState {
+            active_lease: Some(PrivateOramExternalRecoveryLease {
+                issued_at_unix: 120,
+                expires_at_unix: 220,
+                authority: PrivateOramExternalRecoveryAuthority::MutationV2,
+                ..lease.clone()
+            }),
+            ..acquired.clone()
+        };
+        let authority_switch_error = validate_private_oram_external_recovery_cas(
+            &CompareAndSwapPrivateOramExternalRecovery {
+                key: key.clone(),
+                expected: Some(acquired.clone()),
+                new: Some(authority_switch),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(authority_switch_error.contains("external recovery transition is invalid"));
 
         let installing = PrivateOramExternalRecoveryState {
             active_lease: Some(PrivateOramExternalRecoveryLease {
@@ -13089,6 +15535,7 @@ mod tests {
                 backup_generation: 8,
                 issued_at_unix: 160,
                 expires_at_unix: 220,
+                authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),
@@ -13141,6 +15588,7 @@ mod tests {
                 backup_generation: 1,
                 issued_at_unix: 100,
                 expires_at_unix: 160,
+                authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),
@@ -13227,6 +15675,7 @@ mod tests {
                 backup_generation: 7,
                 issued_at_unix: 100,
                 expires_at_unix: 160,
+                authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                 install_intent_digest: None,
                 phase: PrivateOramExternalRecoveryLeasePhase::Staging,
             }),
@@ -13548,6 +15997,7 @@ mod tests {
                     backup_generation: 1,
                     issued_at_unix: 100,
                     expires_at_unix: 160,
+                    authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
                     install_intent_digest: None,
                     phase: PrivateOramExternalRecoveryLeasePhase::Staging,
                 }),
@@ -13567,6 +16017,7 @@ mod tests {
             backup_generation: 9,
             issued_at_unix: 200,
             expires_at_unix: 260,
+            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
             install_intent_digest: Some(BASE64URL_NOPAD.encode(&[60; 32])),
             phase: PrivateOramExternalRecoveryLeasePhase::Installing,
         };
@@ -13744,6 +16195,7 @@ mod tests {
             backup_generation: 9,
             issued_at_unix: 100,
             expires_at_unix: 160,
+            authority: PrivateOramExternalRecoveryAuthority::LegacyV1,
             install_intent_digest: Some(BASE64URL_NOPAD.encode(&[83; 32])),
             phase: PrivateOramExternalRecoveryLeasePhase::Installing,
         };

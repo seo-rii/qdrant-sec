@@ -1846,6 +1846,26 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_platform_rejects_staging_before_creating_collection_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let collection = temp.path().join("missing-collection");
+        let store = PrivateOramPointStagingStore::new(&collection);
+        let (parent, frame) = bound_parent_and_frame(1);
+        assert_eq!(
+            store.prepare_bound(&frame, &parent).unwrap_err(),
+            PrivateOramPointStagingError::Unsupported
+        );
+        assert_eq!(
+            store.load_bound(&parent).unwrap_err(),
+            PrivateOramPointStagingError::Unsupported
+        );
+        assert!(!store.root.exists());
+        assert!(!collection.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn descriptor_state_and_point_id_digests_have_known_answers() {
         let (parent, frame_bytes) = bound_parent_and_frame(1);

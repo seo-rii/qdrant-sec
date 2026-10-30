@@ -692,10 +692,15 @@ mod tests {
         let mut holder = SegmentHolder::default();
         let dim = 256;
 
-        let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+        // Graph files require real directory ancestors, including the platform temp root.
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let segments_dir = Builder::new()
+            .prefix("segments_dir")
+            .tempdir_in(&temp_root)
+            .unwrap();
         let segments_temp_dir = Builder::new()
             .prefix("segments_temp_dir")
-            .tempdir()
+            .tempdir_in(&temp_root)
             .unwrap();
 
         let mut segment = random_segment(segments_dir.path(), 101, 200, dim);
