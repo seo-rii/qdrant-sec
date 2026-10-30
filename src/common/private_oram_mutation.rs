@@ -97,27 +97,27 @@ const PRIVATE_ORAM_PARENT_PROGRESS_MAX_STEPS: usize = 8;
 const PRIVATE_ORAM_OWNER_ENROLLMENT_MAX_STEPS: usize = 2 * 1_024 + 1;
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PRIVATE_ORAM_ADMISSION_OUTCOME_POLL_ATTEMPTS: usize = 240;
-#[cfg(debug_assertions)]
+const PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE_ENV: &str =
+    "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE";
 const PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV: &str =
     "QDRANT_STAGING_PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE";
 
 #[cfg(debug_assertions)]
-async fn private_oram_mutation_pause_after_admission_v2() {
-    let Some(pause_file) = std::env::var_os(PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV)
-    else {
+async fn private_oram_mutation_pause_v2(variable: &str, message: &str) {
+    let Some(pause_file) = std::env::var_os(variable) else {
         return;
     };
     if pause_file.is_empty() {
         return;
     }
-    log::warn!("Private ORAM staging mutation append post-admission pause reached");
+    log::warn!("{message}");
     while Path::new(&pause_file).exists() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
 #[cfg(not(debug_assertions))]
-async fn private_oram_mutation_pause_after_admission_v2() {}
+async fn private_oram_mutation_pause_v2(_variable: &str, _message: &str) {}
 
 fn private_oram_owner_reservation_resolution_input_v1(
     challenge: &PrivateOramOwnerReservationPrepareChallengeV1,
@@ -1362,6 +1362,11 @@ pub(crate) async fn run_private_oram_mutation_append_v2(
             return Err(error);
         }
     };
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_POST_PREPARED_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation append post-prepared pause reached",
+    )
+    .await;
     let key = PrivateOramMutationKey {
         collection_id: detached.collection_id().to_string(),
     };
@@ -1583,7 +1588,11 @@ async fn complete_private_oram_admitted_handoff_v2(
     // the sole replacement for reservation retention.
     detached.mark_admitted_ack_pending()?;
     storage::dispatcher::private_oram_crash_point("mutation_v2_after_admission");
-    private_oram_mutation_pause_after_admission_v2().await;
+    private_oram_mutation_pause_v2(
+        PRIVATE_ORAM_MUTATION_POST_ADMISSION_PAUSE_FILE_ENV,
+        "Private ORAM staging mutation append post-admission pause reached",
+    )
+    .await;
     let parent =
         materialize_private_oram_admitted_parent_v2(dispatcher, settings, detached, coordinated)
             .await?;
