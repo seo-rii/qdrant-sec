@@ -637,12 +637,37 @@ def _private_oram_activation_fixture(
         identity["binary_capability_digest"] == binary_capability_digest
         for identity in identities
     )
+    if p2p_tls:
+        from .test_private_oram_v2_activation import PEER_IDS, _activation_bundle
+
+        assert peer_ids[0] == PEER_IDS[0]
+        activation = _activation_bundle(
+            [
+                {
+                    "peer_id": peer_id,
+                    "host": "127.0.0.1",
+                    "p2p_port": port_base,
+                    "public_key": identity["public_key"],
+                    "tls": True,
+                }
+                for peer_id, port_base, identity in zip(
+                    peer_ids, peer_port_bases, identities, strict=True
+                )
+            ],
+            binary_capability_digest,
+        )
+        return {
+            "authority_public_key": activation["authority"],
+            "cluster_identity_digest": activation["cluster_identity_digest"],
+            "cluster_first_voter_peer_id": peer_ids[0],
+            "bundle_canonical_json": activation["bundle_canonical_json"],
+        }
     request = {
         "cluster_first_voter_peer_id": peer_ids[0],
         "peers": [
             {
                 "peer_id": peer_id,
-                "p2p_uri": get_p2p_uri(port_base, p2p_tls),
+                "p2p_uri": get_uri(port_base),
                 "signer": identity["public_key"],
             }
             for peer_id, port_base, identity in zip(
