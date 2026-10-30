@@ -1924,7 +1924,13 @@ def test_private_oram_mutation_v2_production_bootstrap_opens_encrypted_session(
 def test_private_oram_mutation_v2_append_commits_and_cleans_up(
     tmp_path: pathlib.Path,
 ):
-    prepared = _prepare_private_oram_mutation_v2_collection(tmp_path)
+    # Recovery material can take longer than the default election floor to apply
+    # in debug CI. Keep this successful-append case on its original coordinator.
+    consensus_env = {"QDRANT__CLUSTER__CONSENSUS__TICK_PERIOD_MS": "1000"}
+    prepared = _prepare_private_oram_mutation_v2_collection(
+        tmp_path,
+        [consensus_env, consensus_env, consensus_env],
+    )
     peer_urls = prepared["peer_urls"]
     peer_dirs = prepared["peer_dirs"]
     leader_url = prepared["leader_url"]
