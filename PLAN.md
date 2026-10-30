@@ -1801,6 +1801,9 @@ Signed fields:
   deserialize, UTF-8 검사와 hash에 쓰이고, Raft state 저장마다 private ORAM state 전체 검증(0.2-0.6 s)과
   650 KB state file 재기록이 든다. CI는 실패한 test의 peer warning과 traceback 위치를
   annotation으로 남긴다.
+- 2026-10-30 통합 검증: retained owner prepare를 재검증할 때 새 signed state의 서명 시각을
+  사용하도록 교정한 후보에서 parent materialization 직후의 crash/restart가 164.33초에
+  통과했다. 해당 사례의 expected failure 표시를 제거해 여섯 crash 경계를 모두 실행한다.
 
 완료 조건:
 

@@ -757,23 +757,7 @@ def test_private_oram_paired_append_commits_through_repeated_leader_changes(
     os.environ.get("QDRANT_PRIVATE_ORAM_CRASH_TESTS") != "1",
     reason="needs a qdrant binary built with --features private-oram-crash-points",
 )
-@pytest.mark.parametrize(
-    "crash_point",
-    [
-        pytest.param(
-            point,
-            marks=pytest.mark.xfail(
-                run=False,
-                reason="after a restart following the parent materialization, the admitted "
-                "reconcile's re-validation of the retained owner prepare fails (mutation "
-                "contract), so the supervisor never commits",
-            ),
-        )
-        if point == "mutation_v2_after_parent_materialized"
-        else point
-        for point in ADMITTED_HANDOFF_POINTS
-    ],
-)
+@pytest.mark.parametrize("crash_point", ADMITTED_HANDOFF_POINTS)
 def test_private_oram_paired_append_commits_after_the_coordinator_restarts(
     tmp_path: pathlib.Path, append_client: AppendClient, crash_point: str
 ):

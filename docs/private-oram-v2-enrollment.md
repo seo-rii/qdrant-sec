@@ -286,12 +286,10 @@ return an error once per process, as a timed-out proposal or a leader change
 does. `test_private_oram_paired_append_recovers_a_failed_live_handoff` fails
 the handoff at every point and the supervisor commits in the same process each
 time. `test_private_oram_paired_append_commits_after_the_coordinator_restarts`
-kills the coordinator at every point and restarts it; every point but one
-commits. After a restart that follows the parent materialization, the admitted
-reconcile's re-validation of the retained owner prepare
-(`validate_private_oram_append_owner_prepare_from_durable_recovery_v2`) fails
-with a mutation contract error on every supervisor pass, so the append stays
-blocked; that case is marked as an expected failure until it is fixed.
+kills the coordinator at every point and verifies that it commits after restart,
+including a restart immediately after the parent materialization. Re-validation
+of the retained owner prepare uses the signed new state's timestamp, so a state
+signed after the mutation was issued remains valid when replayed from recovery.
 `test_private_oram_paired_append_commits_through_repeated_leader_changes`
 freezes whichever peer leads four times while the handoff and the recovery run.
 
