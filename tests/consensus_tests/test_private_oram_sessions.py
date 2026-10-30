@@ -27,6 +27,7 @@ from .test_resharding import (
 )
 from .utils import (
     PROJECT_ROOT,
+    all_nodes_cluster_info_consistent,
     get_cluster_info,
     get_collection_cluster_info,
     get_collection_info,
@@ -8411,7 +8412,7 @@ def test_private_oram_resharding_source_crash_automatically_repreinstalls_and_re
         "QDRANT__CLUSTER__RESHARDING_ENABLED": "true",
         "QDRANT_STAGING_SHARD_TRANSFER_DELAY_SEC": "5",
     }
-    peer_urls, peer_dirs, fixture, leader, _ = _start_private_oram_cluster(
+    peer_urls, peer_dirs, fixture, _, _ = _start_private_oram_cluster(
         tmp_path,
         2,
         1,
@@ -8479,7 +8480,14 @@ def test_private_oram_resharding_source_crash_automatically_repreinstalls_and_re
     source_url = restarted_url
     peer_urls[source_index] = restarted_url
     wait_for_peer_online(restarted_url, path="/cluster")
-    wait_for_uniform_cluster_status(peer_urls, leader)
+    # Restarting the source can elect either peer, so follow the current leader.
+    wait_for(
+        lambda: (
+            current_leader := get_cluster_info(source_url)["raft_info"]["leader"]
+        )
+        in (source_peer_id, target_peer_id)
+        and all_nodes_cluster_info_consistent(peer_urls, current_leader)
+    )
 
     wait_for_collection_resharding_operations_count(source_url, COLLECTION, 1)
     restarted_log_path = pathlib.Path(init_pytest_log_folder()) / restarted_log
