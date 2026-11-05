@@ -4473,7 +4473,7 @@ async fn try_ckks_vector_recommend_batch_points(
                 offset: request.offset.unwrap_or_default(),
                 with_payload: request.with_payload.clone(),
                 with_vector: request.with_vector.clone(),
-                score_threshold: None,
+                score_threshold: request.score_threshold,
                 shard_selection: shard_selection.clone(),
             }));
         } else if recommend_request_needs_sidecar_resolution(request) {
