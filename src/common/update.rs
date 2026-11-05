@@ -9321,7 +9321,7 @@ esac
                 for filter_at_root in [false, true] {
                     let mut plain_leaf = leaf("plain");
                     plain_leaf.filter = Some(filter_for("a", 1));
-                    let mut plain_subtree = leaf("plain");
+                    let mut plain_subtree = leaf(DEFAULT_VECTOR_NAME);
                     plain_subtree.query = Some(Query::Fusion(FusionInternal::Rrf {
                         k: 2,
                         weights: None,
