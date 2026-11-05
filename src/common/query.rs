@@ -55,7 +55,7 @@ use segment::index::hnsw_index::ckks_ciphertext_graph::{
 };
 use segment::json_path::JsonPath;
 use segment::types::{
-    Distance, EncryptedPayloadReadMode, Filter, Order, Payload, PayloadContainer,
+    Condition, Distance, EncryptedPayloadReadMode, Filter, Order, Payload, PayloadContainer,
     PayloadEncryptedReadPolicy, PayloadSelector, PointIdType, ScoredPoint, SearchParams, ShardKey,
     WithPayloadInterface, WithVector,
 };
@@ -6784,6 +6784,7 @@ async fn ckks_resolve_query_prefetches(
     toc: &TableOfContent,
     collection_name: &str,
     prefetches: &[CollectionPrefetch],
+    parent_filter: Option<&Filter>,
     read_consistency: Option<ReadConsistency>,
     shard_selection: &ShardSelectorInternal,
     auth: &Auth,
@@ -6797,7 +6798,22 @@ async fn ckks_resolve_query_prefetches(
             prefetch: prefetch.prefetch.clone(),
             query: prefetch.query.clone(),
             using: prefetch.using.clone(),
-            filter: prefetch.filter.clone(),
+            // Preserve each should/min_should group before limiting candidates.
+            // Wrap single filters too, so native descendants cannot flatten them
+            // into their own should/min_should groups.
+            filter: match (parent_filter, prefetch.filter.as_ref()) {
+                (Some(parent), Some(child)) => Some(Filter {
+                    must: Some(vec![
+                        Condition::Filter(parent.clone()),
+                        Condition::Filter(child.clone()),
+                    ]),
+                    ..Filter::default()
+                }),
+                (Some(filter), None) | (None, Some(filter)) => {
+                    Some(Filter::new_must(Condition::Filter(filter.clone())))
+                }
+                (None, None) => None,
+            },
             score_threshold: prefetch
                 .score_threshold
                 .as_ref()
@@ -6969,6 +6985,7 @@ pub async fn do_query_batch_points(
                             toc,
                             collection_name,
                             &request.prefetch,
+                            request.filter.as_ref(),
                             read_consistency,
                             shard_selection,
                             &auth,
@@ -7025,6 +7042,7 @@ pub async fn do_query_batch_points(
                         toc,
                         collection_name,
                         &request.prefetch,
+                        request.filter.as_ref(),
                         read_consistency,
                         shard_selection,
                         &auth,
@@ -7706,6 +7724,7 @@ async fn try_ckks_vector_query_groups(
                 toc,
                 collection_name,
                 &request.prefetch,
+                request.filter.as_ref(),
                 read_consistency,
                 shard_selection,
                 auth,
@@ -7780,6 +7799,7 @@ async fn try_ckks_vector_query_groups(
                 toc,
                 collection_name,
                 &request.prefetch,
+                request.filter.as_ref(),
                 read_consistency,
                 shard_selection,
                 auth,
