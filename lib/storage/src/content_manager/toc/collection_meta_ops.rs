@@ -574,6 +574,7 @@ impl TableOfContent {
                             new_alias_name,
                         },
                 }) => {
+                    collection_lock.validate_collection_not_exists(&new_alias_name)?;
                     alias_lock.rename_alias(&old_alias_name, new_alias_name)?;
                 }
             };
