@@ -14,6 +14,7 @@ use storage::content_manager::collection_meta_ops::{
     CreateCollectionOperation, DeleteAlias, RenameAlias,
 };
 use storage::content_manager::consensus::operation_sender::OperationSender;
+use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::{Access, AccessRequirements, Auth};
@@ -99,39 +100,41 @@ fn test_alias_operation() {
     );
     let dispatcher = Dispatcher::new(toc);
 
-    handle
-        .block_on(
-            dispatcher.submit_collection_meta_op(
-                CollectionMetaOperations::CreateCollection(
-                    CreateCollectionOperation::new(
-                        "test".to_string(),
-                        CreateCollection {
-                            vectors: VectorParamsBuilder::new(10, Distance::Cosine)
-                                .build()
-                                .into(),
-                            sparse_vectors: None,
-                            hnsw_config: None,
-                            wal_config: None,
-                            optimizers_config: None,
-                            shard_number: Some(1),
-                            on_disk_payload: None,
-                            replication_factor: None,
-                            write_consistency_factor: None,
-                            quantization_config: None,
-                            sharding_method: None,
-                            encryption: None,
-                            strict_mode_config: None,
-                            uuid: None,
-                            metadata: None,
-                        },
-                    )
-                    .unwrap(),
+    for collection_name in ["test", "other"] {
+        handle
+            .block_on(
+                dispatcher.submit_collection_meta_op(
+                    CollectionMetaOperations::CreateCollection(
+                        CreateCollectionOperation::new(
+                            collection_name.to_string(),
+                            CreateCollection {
+                                vectors: VectorParamsBuilder::new(10, Distance::Cosine)
+                                    .build()
+                                    .into(),
+                                sparse_vectors: None,
+                                hnsw_config: None,
+                                wal_config: None,
+                                optimizers_config: None,
+                                shard_number: Some(1),
+                                on_disk_payload: None,
+                                replication_factor: None,
+                                write_consistency_factor: None,
+                                quantization_config: None,
+                                sharding_method: None,
+                                encryption: None,
+                                strict_mode_config: None,
+                                uuid: None,
+                                metadata: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                    FULL_ACCESS,
+                    None,
                 ),
-                FULL_ACCESS,
-                None,
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
+    }
 
     handle
         .block_on(dispatcher.submit_collection_meta_op(
@@ -146,6 +149,40 @@ fn test_alias_operation() {
             None,
         ))
         .unwrap();
+
+    // Neither the alias target nor an unrelated collection may become an alias name.
+    for new_alias_name in ["test", "other"] {
+        let error = handle
+            .block_on(dispatcher.submit_collection_meta_op(
+                CollectionMetaOperations::ChangeAliases(ChangeAliasesOperation {
+                    actions: vec![RenameAlias {
+                        old_alias_name: "test_alias".to_string(),
+                        new_alias_name: new_alias_name.to_string(),
+                    }
+                    .into()],
+                }),
+                FULL_ACCESS,
+                None,
+            ))
+            .expect_err("renaming an alias to an existing collection must fail");
+        assert!(matches!(error, StorageError::AlreadyExists { .. }));
+
+        let pass = new_unchecked_verification_pass();
+        for (name, expected_collection) in
+            [("test_alias", "test"), ("test", "test"), ("other", "other")]
+        {
+            let collection = handle
+                .block_on(
+                    dispatcher.toc(&FULL_ACCESS, &pass).get_collection(
+                        &FULL_ACCESS
+                            .check_collection_access(name, AccessRequirements::new(), "test")
+                            .unwrap(),
+                    ),
+                )
+                .unwrap();
+            assert_eq!(collection.name(), expected_collection);
+        }
+    }
 
     handle
         .block_on(dispatcher.submit_collection_meta_op(
@@ -172,10 +209,10 @@ fn test_alias_operation() {
         ))
         .unwrap();
 
-    // Nothing to verify here.
+    // A non-conflicting rename still resolves to the original collection.
     let pass = new_unchecked_verification_pass();
 
-    let _ = handle
+    let collection = handle
         .block_on(
             dispatcher.toc(&FULL_ACCESS, &pass).get_collection(
                 &FULL_ACCESS
@@ -184,4 +221,5 @@ fn test_alias_operation() {
             ),
         )
         .unwrap();
+    assert_eq!(collection.name(), "test");
 }
