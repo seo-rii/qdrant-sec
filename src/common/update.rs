@@ -11618,23 +11618,24 @@ esac
                 common::math::scaled_fast_sigmoid(0.5)
             );
 
+            let point_id_recommend_request = RecommendRequestInternal {
+                positive: vec![RecommendExample::PointId(1.into())],
+                negative: Vec::new(),
+                strategy: Some(api::rest::RecommendStrategy::AverageVector),
+                filter: None,
+                params: None,
+                limit: 1,
+                offset: None,
+                with_payload: Some(WithPayloadInterface::Bool(false)),
+                with_vector: Some(WithVector::Bool(false)),
+                score_threshold: None,
+                using: Some(DEFAULT_VECTOR_NAME.to_string().into()),
+                lookup_from: None,
+            };
             let point_id_recommend = crate::common::query::do_recommend_points(
                 &toc,
                 "vector_groups",
-                RecommendRequestInternal {
-                    positive: vec![RecommendExample::PointId(1.into())],
-                    negative: Vec::new(),
-                    strategy: Some(api::rest::RecommendStrategy::AverageVector),
-                    filter: None,
-                    params: None,
-                    limit: 1,
-                    offset: None,
-                    with_payload: Some(WithPayloadInterface::Bool(false)),
-                    with_vector: Some(WithVector::Bool(false)),
-                    score_threshold: None,
-                    using: Some(DEFAULT_VECTOR_NAME.to_string().into()),
-                    lookup_from: None,
-                },
+                point_id_recommend_request.clone(),
                 None,
                 ShardSelectorInternal::All,
                 auth.clone(),
@@ -11647,6 +11648,65 @@ esac
             assert_eq!(point_id_recommend.len(), 1);
             assert_eq!(point_id_recommend[0].id, 1.into());
             assert_eq!(point_id_recommend[0].score, 10.0);
+
+            // Stored point-ID recommendations must keep the same threshold semantics
+            // in the single and batch routes, including the default strategy.
+            let threshold_cases = [
+                (None, vec![10.0, 8.0]),
+                (Some(9.0), vec![10.0]),
+                (Some(10.0), Vec::new()),
+                (Some(11.0), Vec::new()),
+            ];
+            let mut threshold_requests = Vec::new();
+            for (score_threshold, expected_scores) in &threshold_cases {
+                let request = RecommendRequestInternal {
+                    limit: 2,
+                    strategy: None,
+                    score_threshold: *score_threshold,
+                    ..point_id_recommend_request.clone()
+                };
+                let result = crate::common::query::do_recommend_points(
+                    &toc,
+                    "vector_groups",
+                    request.clone(),
+                    None,
+                    ShardSelectorInternal::All,
+                    auth.clone(),
+                    None,
+                    HwMeasurementAcc::disposable(),
+                    Some(&vector_settings),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.iter().map(|point| point.score).collect::<Vec<_>>(),
+                    *expected_scores,
+                    "single recommendation threshold {score_threshold:?}",
+                );
+                threshold_requests.push((request, ShardSelectorInternal::All));
+            }
+            let threshold_results = crate::common::query::do_recommend_batch_points(
+                &toc,
+                "vector_groups",
+                threshold_requests,
+                None,
+                auth.clone(),
+                None,
+                HwMeasurementAcc::disposable(),
+                Some(&vector_settings),
+            )
+            .await
+            .unwrap();
+            assert_eq!(threshold_results.len(), threshold_cases.len());
+            for (result, (threshold, expected_scores)) in
+                threshold_results.iter().zip(&threshold_cases)
+            {
+                assert_eq!(
+                    result.iter().map(|point| point.score).collect::<Vec<_>>(),
+                    *expected_scores,
+                    "batch recommendation threshold {threshold:?}",
+                );
+            }
 
             let mixed_point_id_recommend = crate::common::query::do_recommend_points(
                 &toc,
