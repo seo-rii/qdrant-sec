@@ -9056,6 +9056,326 @@ esac
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn ckks_prefetch_inherits_ancestor_filters_before_limits() {
+        let runtime = Runtime::new().unwrap();
+        let storage_dir = Builder::new()
+            .prefix("ckks-prefetch-filter")
+            .tempdir()
+            .unwrap();
+        let toc = update_test_toc(&update_test_storage_config(storage_dir.path()));
+        let dispatcher = Dispatcher::new(toc.clone());
+        let auth = Auth::new_internal(Access::full("For test"));
+        let bridge = fake_openfhe_bridge();
+        let settings = vector_runtime_settings(&bridge.path().join("openfhe-bridge"));
+
+        runtime.block_on(async {
+            let mut params = encrypted_vector_params();
+            let collection::operations::types::VectorsConfig::Multi(vectors) = &mut params.vectors
+            else {
+                panic!("the fixture must use named vectors");
+            };
+            vectors.insert(
+                "plain".to_string(),
+                VectorParamsBuilder::new(2, Distance::Dot).build(),
+            );
+            dispatcher
+                .submit_collection_meta_op(
+                    CollectionMetaOperations::CreateCollection(
+                        CreateCollectionOperation::new(
+                            "prefetch_filters".to_string(),
+                            CreateCollection {
+                                vectors: params.vectors,
+                                encryption: params.encryption,
+                                shard_number: Some(1),
+                                sparse_vectors: None,
+                                hnsw_config: None,
+                                wal_config: None,
+                                optimizers_config: None,
+                                on_disk_payload: None,
+                                replication_factor: None,
+                                write_consistency_factor: None,
+                                quantization_config: None,
+                                sharding_method: None,
+                                strict_mode_config: None,
+                                uuid: None,
+                                metadata: None,
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                    auth.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Both vector kinds rank the excluded point first. Filtering only after a
+            // prefetch limit of one would therefore discard the only eligible point.
+            do_upsert_points(
+                UncheckedTocProvider::new_unchecked(&toc),
+                "prefetch_filters".to_string(),
+                PointInsertOperations::PointsList(api::rest::schema::PointsList {
+                    points: [(1_u64, "a", 1.0), (2, "b", 0.5)]
+                        .into_iter()
+                        .map(|(id, group, score)| api::rest::PointStruct {
+                            id: id.into(),
+                            vector: api::rest::VectorStruct::Named(HashMap::from([
+                                (
+                                    "embedding".to_string(),
+                                    api::rest::Vector::Dense(vec![score, 0.0]),
+                                ),
+                                (
+                                    "plain".to_string(),
+                                    api::rest::Vector::Dense(vec![score, 0.0]),
+                                ),
+                            ])),
+                            payload: Some(segment::types::Payload(
+                                json!({ "group": group }).as_object().unwrap().clone(),
+                            )),
+                        })
+                        .collect(),
+                    shard_key: None,
+                    update_filter: None,
+                    update_mode: None,
+                }),
+                InternalUpdateParams::default(),
+                UpdateParams {
+                    wait: true,
+                    ordering: WriteOrdering::default(),
+                    timeout: None,
+                },
+                auth.clone(),
+                InferenceParams::default(),
+                HwMeasurementAcc::disposable(),
+                Some(&settings),
+            )
+            .await
+            .unwrap();
+
+            let nearest = || {
+                Query::Vector(VectorQuery::Nearest(VectorInputInternal::Vector(
+                    VectorInternal::Dense(vec![1.0, 0.0]),
+                )))
+            };
+            let leaf = |using: &str| CollectionPrefetch {
+                prefetch: Vec::new(),
+                query: Some(nearest()),
+                using: using.to_string(),
+                filter: None,
+                score_threshold: None,
+                limit: 1,
+                params: None,
+                lookup_from: None,
+            };
+            let eligible: Filter = serde_json::from_value(json!({
+                "must": [{ "key": "group", "match": { "value": "b" } }],
+            }))
+            .unwrap();
+            let request = |query, prefetch, filter| CollectionQueryRequest {
+                prefetch,
+                query: Some(query),
+                using: "embedding".to_string(),
+                filter,
+                score_threshold: None,
+                limit: 2,
+                offset: 0,
+                params: None,
+                with_vector: WithVector::Bool(false),
+                with_payload: WithPayloadInterface::Bool(false),
+                lookup_from: None,
+            };
+            let query_points = |request| {
+                crate::common::query::do_query_points(
+                    &toc,
+                    "prefetch_filters",
+                    request,
+                    None,
+                    ShardSelectorInternal::All,
+                    auth.clone(),
+                    None,
+                    HwMeasurementAcc::disposable(),
+                    Some(&settings),
+                )
+            };
+            let query_groups = |request: CollectionQueryRequest| {
+                crate::common::query::do_query_point_groups(
+                    &toc,
+                    "prefetch_filters",
+                    CollectionQueryGroupsRequest {
+                        prefetch: request.prefetch,
+                        query: request.query,
+                        using: request.using,
+                        filter: request.filter,
+                        params: request.params,
+                        score_threshold: request.score_threshold,
+                        with_vector: request.with_vector,
+                        with_payload: request.with_payload,
+                        lookup_from: request.lookup_from,
+                        group_by: "group".parse().unwrap(),
+                        group_size: 1,
+                        limit: request.limit,
+                        with_lookup: None,
+                    },
+                    None,
+                    ShardSelectorInternal::All,
+                    auth.clone(),
+                    None,
+                    HwMeasurementAcc::disposable(),
+                    Some(&settings),
+                )
+            };
+
+            for fusion in [
+                FusionInternal::Rrf {
+                    k: 2,
+                    weights: None,
+                },
+                FusionInternal::Dbsf,
+            ] {
+                let unfiltered = request(
+                    Query::Fusion(fusion.clone()),
+                    vec![leaf("embedding"), leaf("plain")],
+                    None,
+                );
+                let result = query_points(unfiltered.clone()).await.unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].id, 1.into());
+
+                let mut filtered = unfiltered.clone();
+                filtered.filter = Some(eligible.clone());
+                let result = query_points(filtered.clone()).await.unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].id, 2.into());
+                let groups = query_groups(filtered.clone()).await.unwrap();
+                assert_eq!(groups.groups.len(), 1);
+                assert_eq!(groups.groups[0].id, GroupId::from("b"));
+                assert_eq!(groups.groups[0].hits[0].id, 2.into());
+
+                // An ancestor predicate must reach a nested fusion's encrypted and
+                // ordinary leaves, not just the immediate prefetch request.
+                let mut nested = leaf("embedding");
+                nested.prefetch = unfiltered.prefetch;
+                nested.query = Some(Query::Fusion(fusion));
+                filtered.prefetch = vec![nested];
+                let result = query_points(filtered.clone()).await.unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].id, 2.into());
+
+                // Parent and child filters are conjunctive; inheritance must not
+                // replace the child's predicate with the parent's predicate.
+                filtered.prefetch[0].filter = Some(Filter::new().with_point_ids([1.into()]));
+                assert!(query_points(filtered).await.unwrap().is_empty());
+            }
+
+            // Flattening two should or min_should groups would change their
+            // intersection into a union. Exercise both conflicting and compatible
+            // groups through points and grouped fusion, with mixed vector leaves.
+            for use_min_should in [false, true] {
+                let filter_for = |group: &str, id: u64| -> Filter {
+                    let condition = json!({ "key": "group", "match": { "value": group } });
+                    serde_json::from_value(if use_min_should {
+                        json!({ "min_should": {
+                            "conditions": [condition, { "has_id": [id] }],
+                            "min_count": 2,
+                        } })
+                    } else {
+                        json!({ "should": [condition] })
+                    })
+                    .unwrap()
+                };
+                for (child_group, child_id) in [("a", 1_u64), ("b", 2)] {
+                    let mut filtered = request(
+                        Query::Fusion(FusionInternal::Rrf {
+                            k: 2,
+                            weights: None,
+                        }),
+                        vec![leaf("embedding"), leaf("plain")],
+                        Some(filter_for("b", 2)),
+                    );
+                    for child in &mut filtered.prefetch {
+                        child.filter = Some(filter_for(child_group, child_id));
+                    }
+                    let expected_ids = if child_id == 2 {
+                        vec![2.into()]
+                    } else {
+                        Vec::new()
+                    };
+                    let result = query_points(filtered.clone()).await.unwrap();
+                    assert_eq!(
+                        result.iter().map(|point| point.id).collect::<Vec<_>>(),
+                        expected_ids
+                    );
+                    let groups = query_groups(filtered).await.unwrap();
+                    assert_eq!(
+                        groups
+                            .groups
+                            .iter()
+                            .flat_map(|group| group.hits.iter().map(|hit| hit.id))
+                            .collect::<Vec<_>>(),
+                        expected_ids,
+                    );
+                }
+
+                // A plain-only subtree uses the native planner. Preserve a lone
+                // root or child filter when it merges with a deeper leaf filter.
+                for filter_at_root in [false, true] {
+                    let mut plain_leaf = leaf("plain");
+                    plain_leaf.filter = Some(filter_for("a", 1));
+                    let mut plain_subtree = leaf(DEFAULT_VECTOR_NAME);
+                    plain_subtree.query = Some(Query::Fusion(FusionInternal::Rrf {
+                        k: 2,
+                        weights: None,
+                    }));
+                    plain_subtree.prefetch = vec![plain_leaf];
+                    plain_subtree.filter = (!filter_at_root).then(|| filter_for("b", 2));
+                    let mut encrypted_leaf = leaf("embedding");
+                    encrypted_leaf.filter = Some(filter_for("b", 2));
+                    let filtered = request(
+                        Query::Fusion(FusionInternal::Rrf {
+                            k: 2,
+                            weights: None,
+                        }),
+                        vec![encrypted_leaf, plain_subtree],
+                        filter_at_root.then(|| filter_for("b", 2)),
+                    );
+                    let result = query_points(filtered.clone()).await.unwrap();
+                    assert_eq!(
+                        result.iter().map(|point| point.id).collect::<Vec<_>>(),
+                        vec![2.into()],
+                    );
+                    let groups = query_groups(filtered).await.unwrap();
+                    assert_eq!(
+                        groups
+                            .groups
+                            .iter()
+                            .flat_map(|group| group.hits.iter().map(|hit| hit.id))
+                            .collect::<Vec<_>>(),
+                        vec![2.into()],
+                    );
+                }
+            }
+
+            let rerank = request(nearest(), vec![leaf("embedding")], Some(eligible));
+            let result = query_points(rerank.clone()).await.unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].id, 2.into());
+            let groups = query_groups(rerank.clone()).await.unwrap();
+            assert_eq!(groups.groups.len(), 1);
+            assert_eq!(groups.groups[0].id, GroupId::from("b"));
+            assert_eq!(groups.groups[0].hits[0].id, 2.into());
+
+            // The same candidate rule applies when an encrypted prefetch is
+            // rescored by an ordinary vector at the root.
+            let mut plain_rerank = rerank;
+            plain_rerank.using = "plain".to_string();
+            let result = query_points(plain_rerank).await.unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].id, 2.into());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn ckks_vector_search_groups_uses_sidecar_scores() {
         let runtime = Runtime::new().unwrap();
         let storage_dir = Builder::new().prefix("vector-groups").tempdir().unwrap();
